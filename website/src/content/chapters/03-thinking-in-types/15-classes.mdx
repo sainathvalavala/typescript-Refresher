@@ -1,0 +1,633 @@
+> 📖 **The problem.** TaskFlow's billing module has a `BankAccount` object: `{ owner: "Ada", balance: 100 }`. Any function in the codebase can write `account.balance = -1000`, and one did, in a script that "just fixed the numbers". Now there's a debate in the team: should we wrap this in a class with a protected balance? Should we use classes at all, when half the team writes React with plain functions and the other half comes from Java?
+
+Classes are JavaScript's built-in way to bundle **data and behavior** and to create many objects with the same shape. TypeScript layers compile-time access control and contracts on top. This chapter teaches both halves, what each keyword actually buys you (and what it silently does *not* protect), how to build error hierarchies, and, just as important, when a plain object and a few functions are the better design.
+
+> 🧠 **Mental model.** **A class is a factory for objects that bundles data and behavior, plus a type of the same name.** TypeScript adds *compile-time* access control (`private`) and contracts (`implements`, `abstract`); JavaScript itself adds *runtime* privacy (`#field`). Know which one you are using, because only one is real at runtime.
+
+## 15.1 Classes and constructors
+
+A class declares **fields** (the data each object holds) and a **constructor** (the code that sets them up). `new` runs the constructor and returns an instance. The class name is also a type, the type of its instances:
+
+```ts
+class Task {
+  id: string;
+  title: string;
+  done = false;                     // a field with an initializer
+
+  constructor(id: string, title: string) {
+    this.id = id;
+    this.title = title;
+  }
+
+  complete(): void {
+    this.done = true;
+  }
+}
+
+const task = new Task("t1", "Write docs");   // task: Task
+task.complete();
+const copy: Task = task;                      // the class name works as a type
+```
+
+With `strict` on, TypeScript enforces **`strictPropertyInitialization`**: every field must be given a value by its initializer or by the constructor. Otherwise an instance could exist with a field that is actually `undefined`:
+
+```ts
+class Project {
+  name: string;      // ❌ Property 'name' has no initializer and is not definitely assigned in the constructor.
+  tasks: Task[] = [];
+  owner?: string;    // ✅ optional fields may stay unset
+
+  constructor() {}   // forgot to set name
+}
+```
+
+Fix it by assigning in the constructor, giving a default, or making the field optional. In the rare case where something else initializes the field (a framework, for example), `name!: string` promises it will be set. That's the same `!` smell as in [Chapter 9](/chapter/9).
+
+Compare with a plain object. If you only need *one* of something, or just data, you don't need a class:
+
+```ts
+const task = { id: "t1", title: "Write docs", done: false };   // no class needed
+```
+
+Classes earn their place when you need many instances **with behavior and invariants**, which the next sections build.
+
+## 15.2 Access modifiers
+
+TypeScript has three access modifiers that control who may touch a member: `public` (the default), `protected` (this class and its subclasses), and `private` (this class only).
+
+```ts
+class BankAccount {
+  private balance = 0;          // only BankAccount's own methods can touch this
+  protected readonly id = "acc-1";   // subclasses can read it too
+  public owner: string;         // public is the default; writing it is optional
+
+  constructor(owner: string) {
+    this.owner = owner;
+  }
+
+  deposit(amount: number): void {
+    if (amount <= 0) throw new RangeError("Deposit must be positive");
+    this.balance += amount;
+  }
+
+  getBalance(): number {
+    return this.balance;
+  }
+}
+
+const account = new BankAccount("Ada");
+account.deposit(50);
+account.balance = -1000;   // ❌ Property 'balance' is private and only accessible within class 'BankAccount'.
+account.id;                // ❌ Property 'id' is protected and only accessible within class 'BankAccount' and its subclasses.
+```
+
+That fixes the opening problem, at compile time. Now the catch: **`private` is erased.** It exists only for the compiler, and the emitted JavaScript has an ordinary property that anyone can read or write:
+
+```ts
+account["balance"] = -1000;       // ✅ compiles: bracket access is a deliberate escape hatch
+(account as any).balance = -1000; // ✅ compiles
+console.log(JSON.stringify(account));   // {"balance":-1000,"owner":"Ada","id":"acc-1"}: the "private" field is in there
+```
+
+If you need privacy that exists at *runtime*, JavaScript has its own: the `#` prefix, part of the language since 2022:
+
+```ts
+class SafeAccount {
+  #balance = 0;                    // truly private: part of JavaScript itself
+
+  deposit(amount: number): void {
+    this.#balance += amount;
+  }
+  getBalance(): number {
+    return this.#balance;
+  }
+}
+
+const safe = new SafeAccount();
+safe.#balance;   // ❌ Property '#balance' is not accessible outside class 'SafeAccount' because it has a private identifier.
+JSON.stringify(safe);   // "{}": it doesn't appear, and no cast or bracket reaches it
+```
+
+| | `private` | `#field` |
+|---|---|---|
+| Enforced by | The compiler only | The JavaScript engine |
+| Survives compile to JS | No (erased) | Yes |
+| Reachable via `obj["x"]` or `as any` | Yes | No |
+| Shows up in `JSON.stringify` | Yes | No |
+
+> ⚠️ **Common mistake.** Treating `private` as security. It is a *design* tool, a statement to other developers that they shouldn't depend on this. For secrets, use `#` and keep sensitive data out of the objects you serialize.
+
+## 15.3 readonly and parameter properties
+
+A `readonly` field can be assigned only where it's declared or inside the constructor, and nowhere afterward. It's ideal for identity:
+
+```ts
+class Task {
+  readonly id: string;
+  title: string;
+
+  constructor(id: string, title: string) {
+    this.id = id;          // ✅ allowed in the constructor
+    this.title = title;
+  }
+
+  rename(title: string) {
+    this.title = title;    // ✅
+    this.id = "other";     // ❌ Cannot assign to 'id' because it is a read-only property.
+  }
+}
+```
+
+Declaring a field, taking a constructor argument, and assigning it is a lot of repetition. TypeScript offers a shorthand called **parameter properties**: put a modifier on a constructor parameter, and it becomes a field automatically:
+
+```ts
+class Task {
+  constructor(
+    public readonly id: string,     // declares AND assigns this.id
+    public title: string,
+    private tags: string[] = [],    // declares AND assigns this.tags
+  ) {}
+}
+
+const t = new Task("t1", "Write docs");
+t.id;      // string
+```
+
+It's very compact, and you'll see it throughout Angular and NestJS code. But it has a cost: it is not just types. The compiler has to **generate assignment code** (`this.id = id`), which means it isn't erasable. Tools that only strip types, like Node's built-in type stripping from [Chapter 5](/chapter/5), can't run it. The compiler flag `erasableSyntaxOnly` forbids it:
+
+```ts
+class Task {
+  constructor(public id: string) {}
+  // ❌ This syntax is not allowed when 'erasableSyntaxOnly' is enabled.
+}
+```
+
+The erasable alternative is the verbose version from the start of this section, with the fields declared and assigned by hand. Many modern projects choose it for exactly that reason (as they do for avoiding `enum`, [Chapter 8](/chapter/8)). Both forms are valid TypeScript; pick based on whether your toolchain needs the erasable subset.
+
+> 🆕 **Modern note.** If you turn on `erasableSyntaxOnly`, you also lose `enum`, runtime `namespace`s, and the `import x = require()` form. Everything left is "types you can delete and get valid JavaScript", which keeps the TypeScript–JavaScript relationship simple.
+
+## 15.4 Getters and setters
+
+A **getter** looks like a property when you read it but runs a function. A **setter** runs a function when you assign to it. They let you offer computed values and validate writes while keeping a simple `obj.prop` syntax:
+
+```ts
+class Temperature {
+  #celsius = 0;
+
+  get fahrenheit(): number {
+    return (this.#celsius * 9) / 5 + 32;      // computed on every read
+  }
+
+  set fahrenheit(value: number) {
+    this.#celsius = ((value - 32) * 5) / 9;   // converts on write
+  }
+
+  get celsius(): number {
+    return this.#celsius;
+  }
+  set celsius(value: number) {
+    if (value < -273.15) throw new RangeError("Below absolute zero");   // validation
+    this.#celsius = value;
+  }
+}
+
+const t = new Temperature();
+t.celsius = 100;
+t.fahrenheit;         // 212
+t.celsius = -500;     // 💥 RangeError: Below absolute zero
+```
+
+A getter with **no setter** is read-only, which makes it a clean way to expose derived data that can't drift out of sync with its source:
+
+```ts
+class Project {
+  tasks: Task[] = [];
+
+  get openCount(): number {
+    return this.tasks.filter((t) => !t.done).length;
+  }
+}
+
+const p = new Project();
+p.openCount;        // 0
+p.openCount = 5;    // ❌ Cannot assign to 'openCount' because it is a read-only property.
+```
+
+Use accessors sparingly. A getter that quietly does expensive work or throws is surprising, since property reads feel free. If the operation is costly or can fail, a method (`calculateOpenCount()`) tells the truth about what's happening.
+
+> 💡 **Tip.** The getter and setter of a property may have different types as long as the getter's type is assignable to the setter's, but keep them the same unless you have a specific reason.
+
+## 15.5 Static members
+
+`static` members belong to the **class itself**, not to instances. They are the home for factory methods, shared constants, and registries:
+
+```ts
+class Task {
+  static #nextId = 1;                          // private, shared state
+  static readonly DEFAULT_TITLE = "Untitled";  // a constant
+
+  private constructor(
+    readonly id: string,
+    readonly title: string,
+  ) {}
+
+  static create(title = Task.DEFAULT_TITLE): Task {   // a factory
+    return new Task(`t${Task.#nextId++}`, title);
+  }
+}
+
+const a = Task.create("Write docs");   // ✅ the way to build one
+const b = Task.create();
+a.id; b.id;                            // "t1", "t2"
+new Task("x", "y");                    // ❌ Constructor of class 'Task' is private and only accessible within the class declaration.
+```
+
+A **private constructor plus a static factory** is a useful idiom. It lets you validate input, assign IDs, or return cached instances, and prevents anyone from constructing the object in some other, unchecked way.
+
+Statics are accessed on the class, not on instances (`Task.DEFAULT_TITLE`, not `a.DEFAULT_TITLE`). A `static { ... }` block runs once when the class is defined, for setup that needs more than an initializer.
+
+```ts
+class Config {
+  static readonly defaults: Record<string, string> = {};
+  static {
+    Config.defaults.theme = "dark";   // one-time initialization
+  }
+}
+```
+
+> 🚫 **When not to.** A class that has *only* static members is just a namespace of functions. Export plain functions from a module instead ([Chapter 25](/chapter/25)).
+
+## 15.6 implements
+
+A class can promise to satisfy an interface with `implements`. The compiler then verifies that every member exists with a compatible type:
+
+```ts
+interface TaskRepository {
+  get(id: string): Task | undefined;
+  save(task: Task): void;
+}
+
+class InMemoryTaskRepository implements TaskRepository {
+  private tasks = new Map<string, Task>();
+
+  get(id: string): Task | undefined {
+    return this.tasks.get(id);
+  }
+  save(task: Task): void {
+    this.tasks.set(task.id, task);
+  }
+}
+
+class BrokenRepository implements TaskRepository {
+  get(id: string) { return undefined; }
+  // ❌ Class 'BrokenRepository' incorrectly implements interface 'TaskRepository'.
+  //    Property 'save' is missing in type 'BrokenRepository' but required in type 'TaskRepository'.
+}
+```
+
+When a signature is wrong rather than missing, the error reads (bottom-up as always):
+
+```ts
+class Mem2 implements TaskRepository {
+  get(id: number) { return undefined; }
+  save(task: Task) {}
+  // ❌ Property 'get' in type 'Mem2' is not assignable to the same property in base type 'TaskRepository'.
+  //      Type '(id: number) => undefined' is not assignable to type '(id: string) => Task | undefined'.
+  //        Types of parameters 'id' and 'id' are incompatible.
+  //          Type 'string' is not assignable to type 'number'.
+}
+```
+
+The real benefit is **programming to an interface**: code that *uses* a repository depends only on `TaskRepository`, never on a concrete class.
+
+```ts
+function completeTask(repo: TaskRepository, id: string): void {
+  const task = repo.get(id);
+  if (task) repo.save({ ...task, done: true });
+}
+```
+
+`completeTask` works with the in-memory repository in tests and a database-backed one in production, without changing a line. Two notes: `implements` is checked once and then **erased**, so it adds nothing at runtime. And TypeScript is *structural*: a class doesn't even need to say `implements`, since any object with a matching shape is accepted. The keyword just makes the intent explicit and gives errors at the class instead of at the call site.
+
+## 15.7 Inheritance
+
+`extends` creates a subclass that inherits everything from a parent. The subclass constructor must call `super(...)` before touching `this`, and a subclass may replace a parent's method:
+
+```ts
+class Notice {
+  constructor(protected message: string) {}
+
+  describe(): string {
+    return `Notice: ${this.message}`;
+  }
+}
+
+class UrgentNotice extends Notice {
+  constructor(message: string, private level: number) {
+    super(message);                 // must come first
+  }
+
+  override describe(): string {     // `override` states the intent
+    return `URGENT (${this.level}): ${super.describe()}`;
+  }
+}
+```
+
+The `override` keyword is not decoration. It makes a silent mistake loud. With **`noImplicitOverride`** on (recommended), you must write it, and the compiler checks that the method really exists in the parent:
+
+```ts
+class Child extends Notice {
+  describe() { return "x"; }
+  // ❌ This member must have an 'override' modifier because it overrides a member in the base class 'Notice'.
+
+  override descirbe() { return "x"; }
+  // ❌ This member cannot have an 'override' modifier because it is not declared in the base class 'Notice'.
+}
+```
+
+The second error catches a typo that would otherwise create a *new* method and quietly never run. It also protects you when the parent changes: if someone renames `describe` in the base class, every overriding method becomes an error instead of a dead method.
+
+Prefer **shallow** inheritance (one level, rarely two). Deep trees couple every class to every ancestor, so a change at the top ripples through everything. Often, composition (a class that *holds* another object) is a better tool.
+
+```text
+✅ Notice → UrgentNotice            (one level, clear "is-a")
+😬 Base → Entity → Auditable → Task → BugTask   (a change in Entity breaks four classes)
+```
+
+## 15.8 Abstract classes
+
+An **abstract class** is a partial blueprint: it can contain real, working methods *and* declarations of methods that subclasses must supply. You can't instantiate it directly:
+
+```ts
+abstract class Exporter {
+  abstract format(tasks: Task[]): string;       // subclasses must implement this
+
+  export(tasks: Task[]): string {               // shared algorithm: the "template method"
+    const header = `Exported ${tasks.length} tasks`;
+    return `${header}\n${this.format(tasks)}`;
+  }
+}
+
+class CsvExporter extends Exporter {
+  format(tasks: Task[]): string {
+    return tasks.map((t) => `${t.id},${t.title}`).join("\n");
+  }
+}
+
+const e = new Exporter();
+// ❌ Cannot create an instance of an abstract class.
+
+class Incomplete extends Exporter {}
+// ❌ Non-abstract class 'Incomplete' does not implement inherited abstract member format from class 'Exporter'.
+
+const csv = new CsvExporter().export(tasks);   // ✅
+```
+
+This is the **template method** pattern: the base class fixes the overall steps (`export`), and subclasses fill in the variable part (`format`).
+
+**Abstract class or interface?** An interface is *only* a contract, and it is erased. An abstract class gives you a contract **plus** shared code and runtime existence (you can use `instanceof` with it). If you only need the contract, use an interface. If subclasses should share real behavior, consider an abstract class. And ask yourself first whether the shared behavior would be simpler as a plain function that takes the variable part as an argument:
+
+```ts
+// The same idea without inheritance: pass the varying part in
+function exportTasks(tasks: Task[], format: (tasks: Task[]) => string): string {
+  return `Exported ${tasks.length} tasks\n${format(tasks)}`;
+}
+exportTasks(tasks, (ts) => ts.map((t) => `${t.id},${t.title}`).join("\n"));
+```
+
+## 15.9 Polymorphism
+
+**Polymorphism** means "many forms": code that works with an interface (or base type) and doesn't care which concrete implementation it's handed. You have already seen the ingredients; here they come together.
+
+```ts
+interface TaskRepository {
+  get(id: string): Promise<Task | undefined>;
+  save(task: Task): Promise<void>;
+}
+
+class InMemoryTaskRepository implements TaskRepository {
+  private store = new Map<string, Task>();
+  async get(id: string) { return this.store.get(id); }
+  async save(task: Task) { this.store.set(task.id, task); }
+}
+
+class HttpTaskRepository implements TaskRepository {
+  constructor(private baseUrl: string) {}
+  async get(id: string) {
+    const res = await fetch(`${this.baseUrl}/tasks/${id}`);
+    return res.ok ? ((await res.json()) as Task) : undefined;
+  }
+  async save(task: Task) {
+    await fetch(`${this.baseUrl}/tasks/${task.id}`, { method: "PUT", body: JSON.stringify(task) });
+  }
+}
+```
+
+Now a service is written **once**, against the interface, and works with either:
+
+```ts
+class TaskService {
+  constructor(private repo: TaskRepository) {}
+
+  async complete(id: string): Promise<void> {
+    const task = await this.repo.get(id);
+    if (!task) throw new Error(`No task ${id}`);
+    await this.repo.save({ ...task, done: true });
+  }
+}
+
+const inTests = new TaskService(new InMemoryTaskRepository());     // fast, no network
+const inProd = new TaskService(new HttpTaskRepository("/api"));     // real server
+```
+
+This is **dependency injection** at its simplest: the service receives its collaborator instead of creating it. It's how you test code without a server and swap storage without touching business logic. Notice that no inheritance was needed, just an interface and `implements`. In TypeScript, polymorphism through interfaces is more common than through base classes.
+
+> 💡 **Tip.** In tests ([Chapter 67](/chapter/67)), the in-memory implementation is the fake you reach for first. It's also a small, honest specification of what the interface means.
+
+## 15.10 Custom error classes
+
+Throwing plain `Error("...")` everywhere forces callers to parse messages to tell failures apart. A custom error class gives each failure a **name, a type, and structured data**:
+
+```ts
+class AppError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);       // options carries `cause`
+    this.name = new.target.name;   // "AppError", "NotFoundError", etc.
+  }
+}
+
+class NotFoundError extends AppError {
+  constructor(public readonly resource: string, public readonly id: string) {
+    super(`${resource} "${id}" was not found`);
+  }
+}
+
+class ValidationError extends AppError {
+  constructor(public readonly field: string, message: string) {
+    super(message);
+  }
+}
+```
+
+(Using parameter properties here, as in the sketch above, needs `erasableSyntaxOnly` off. Otherwise, declare the fields by hand.) Since each is a real class, `instanceof` narrows to it ([Chapter 14](/chapter/14)), and subclasses are `instanceof` their parents too:
+
+```ts
+const error = new NotFoundError("Task", "t9");
+error instanceof NotFoundError;   // true
+error instanceof AppError;        // true (a NotFoundError is an AppError)
+error instanceof Error;           // true
+error.resource;                   // "Task"
+error.stack;                      // a real stack trace
+
+function messageFor(error: unknown): string {
+  if (error instanceof ValidationError) return `Fix "${error.field}": ${error.message}`;
+  if (error instanceof NotFoundError) return `We couldn't find that ${error.resource.toLowerCase()}.`;
+  if (error instanceof Error) return error.message;
+  return "Unknown error";
+}
+```
+
+Use the **`cause`** option to wrap a lower-level error without losing it:
+
+```ts
+try {
+  await fetch("/api/tasks");
+} catch (error) {
+  throw new AppError("Could not load tasks", { cause: error });   // error.cause keeps the original
+}
+```
+
+> ⚠️ **Common mistake.** Forgetting to set `name`. Without it, every stack trace and log line says `Error`, even though the class is `NotFoundError`. (`new.target.name`, as above, sets it automatically.)
+
+> 🕰 **Legacy note.** Targeting very old JavaScript (ES5) broke `instanceof` for classes that extend `Error`, and old tutorials add `Object.setPrototypeOf(this, NotFoundError.prototype)` as a workaround. With a modern target (`es2015` and above) you don't need it. [Chapter 33](/chapter/33) designs full error hierarchies.
+
+## 15.11 Classes vs functions and types
+
+Everything above is a *capability*. The real question is when to use it. TypeScript, unlike Java, doesn't require classes, since plain objects, functions, and types do most of the work.
+
+Compare two designs of the same feature:
+
+```ts
+// Class version
+class TaskCounter {
+  private tasks: Task[] = [];
+  add(task: Task) { this.tasks.push(task); }
+  get openCount() { return this.tasks.filter((t) => !t.done).length; }
+}
+
+// Plain data + function version
+function countOpen(tasks: readonly Task[]): number {
+  return tasks.filter((t) => !t.done).length;
+}
+```
+
+The function version has no hidden state, no `this`, no lifecycle, and it's trivially testable and reusable with any array. In React, the same preference holds: component state lives in hooks, not in class fields, and objects in state must stay plain and serializable.
+
+Classes shine in a few situations:
+
+- **Stateful services** with a lifecycle and private state: a connection pool, a cache, a repository holding a database handle.
+- **Error types**, because `instanceof` and stack traces are first-class there (15.10).
+- **SDKs and libraries** that expose an object with methods to be configured and reused.
+- **Frameworks that expect classes** (Angular, NestJS).
+
+Use plain objects and functions for: data (use a type), stateless transformations, event handlers, and nearly all React code.
+
+> 🚫 **When not to.** Don't wrap stateless functions in a class "for organization". A module already groups functions, and a `static`-only class adds ceremony without behavior. Don't put UI state in class fields, and don't build inheritance trees to share three lines of code.
+
+## 15.12 Decorators (orientation)
+
+> ⏭ **Safe to skip.** Decorators are a specialist feature. You can finish this book without them.
+
+A **decorator** is a function that wraps a class or class member to add behavior, written with `@`. Standard (ECMAScript) decorators are supported by TypeScript, and you'll see them in Angular (`@Component`) and NestJS (`@Controller`, `@Get`).
+
+```ts
+function logCalls(method: Function, context: ClassMethodDecoratorContext) {
+  return function (this: unknown, ...args: unknown[]) {
+    console.log(`Calling ${String(context.name)}`, args);
+    return method.apply(this, args);
+  };
+}
+
+class Api {
+  @logCalls
+  loadTasks(projectId: string): string[] {
+    return [];
+  }
+}
+
+new Api().loadTasks("p1");   // logs: Calling loadTasks [ 'p1' ]
+```
+
+Know two things. First, decorators are runtime code, so (like `enum`) they sit outside the "erasable" subset. Second, an older, different system called *experimental decorators* (enabled by `experimentalDecorators`) powers much existing Angular and NestJS code, and its behavior differs from the standard. If you work on such a project, follow its documentation. For React and the rest of this book, you won't need them.
+
+## Common mistakes
+
+> ⚠️ **Deep inheritance trees.** Each level couples to all the levels above it. Prefer one level, or composition.
+
+> ⚠️ **`private` mistaken for runtime security.** TypeScript's `private` is erased and bypassable (`obj["field"]`, `as any`, `JSON.stringify`). Use `#field` for real privacy.
+
+> ⚠️ **Classes holding React UI state.** React components and state are function- and hook-based, and objects held in state must be copied, not mutated ([Chapter 41](/chapter/41)).
+
+> ⚠️ **Losing `this`.** A method passed as a callback (`button.onclick = obj.handle`) loses its `this`. Use an arrow-function field or `.bind`, or avoid the pattern.
+
+> ⚠️ **Skipping `override` and `name`.** Without `noImplicitOverride`, a renamed parent method silently orphans the child's override, and without a `name`, every error logs as plain `Error`.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** you have stateful services, custom errors, SDK-style objects, or a framework that expects classes. Use `implements` for contracts that several implementations (real and fake) satisfy.
+
+> 🚫 **When not to.** Don't wrap stateless functions in a class "for organization", and don't use inheritance where a function parameter or an interface would do. For data, use a type; for behavior without state, use functions; for UI, use components and hooks.
+
+## How it connects
+
+> 🔗 **Connection.** `instanceof` narrowing ([Chapter 14](/chapter/14)) pairs with error classes, and the error taxonomy in [Chapter 33](/chapter/33) builds on them. `erasableSyntaxOnly` returns with enums ([Chapter 8](/chapter/8)) and in the toolchain ([Chapter 26](/chapter/26)). Generic classes (`Stack<T>`) come in [Chapter 18](/chapter/18), and the repository you wrote here is used in [P02](/projects/p02).
+
+> 🌍 **Real world.** Class-heavy designs dominate Angular, NestJS, and database ORMs. React and most modern front-end code avoid them. TypeScript supports both, and professional engineers choose per problem, not per habit.
+
+## Exercises
+
+### Level 1 — Recall
+
+Convert this constructor function to a class with proper modifiers: `id` must be read-only, `tags` must be private, and `title` must be public and mutable. Use the erasable form (no parameter properties).
+
+```js
+function Task(id, title) {
+  this.id = id;
+  this.title = title;
+  this.tags = [];
+}
+Task.prototype.addTag = function (tag) { this.tags.push(tag); };
+Task.prototype.hasTag = function (tag) { return this.tags.includes(tag); };
+```
+
+### Level 2 — Application
+
+Define a `TaskRepository` interface with `get`, `list`, `save`, and `delete`, and implement `InMemoryTaskRepository` with a `Map`. Write a function `archiveDone(repo: TaskRepository)` that depends only on the interface, and call it with your class. Show that a second class (a stub that just records calls) also works.
+
+### Level 3 — Challenge
+
+Build an error hierarchy: `AppError` at the root, with `ValidationError` (field name) and `NotFoundError` (resource and id) as subclasses. Write `toUserMessage(error: AppError): string` that handles every subclass **exhaustively**, so adding a third subclass produces a compile error in the function.
+
+*Hint: exhaustiveness checks like `assertNever` need a union type. Think about how you could give the subclasses a literal `kind` discriminant, since `instanceof` alone isn't enough.*
+
+### Level 4 — Real-world
+
+**Ticket TF-015: Break up the god class.** `TaskManager` is a 200-line class that loads tasks, validates them, sends notifications, formats reports, and caches results, with a dozen private fields.
+
+- Split it into small pieces: plain functions for validation and formatting, a `TaskRepository` interface with one implementation, and (only if it needs private state) a small class for the cache.
+- The public behavior is unchanged, and the existing tests still pass.
+- Write a one-paragraph summary: which parts stayed classes and why, and what got simpler (testing, reading, replacing a piece).
+- No inheritance in the result.
+
+## Key takeaways
+
+- A class is a factory for objects plus a type of the same name. `strictPropertyInitialization` makes sure every field is set.
+- `private` and `protected` are compile-time only. `#field` is real runtime privacy.
+- Parameter properties are compact but not erasable, so `erasableSyntaxOnly` forbids them.
+- Use `implements` to program to an interface, and `override` (with `noImplicitOverride`) to avoid orphaned overrides.
+- Custom `Error` subclasses give failures a name, a type, and data. Use `instanceof` to narrow, and `cause` to wrap.
+- Classes are right for stateful services, errors, and SDKs. Plain functions and types are simpler for most other code, and for nearly all of React.
+
+## What comes next
+
+You have now met `Array<T>`, `Map<K, V>`, and `Promise<T>` all through the book, and probably wondered how a *single* class like `Map` can hold any type of value. In Part IV you'll learn to write code that is reusable *without* throwing away what TypeScript knows. [Chapter 16: Why Generics?](/chapter/16) starts with three identical functions and one dangerous `any`.

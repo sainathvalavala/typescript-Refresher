@@ -1,0 +1,319 @@
+> 📖 **The problem.** You open three TaskFlow components written by three different teammates. `TaskTitle` is annotated to return `JSX.Element`, `TaskBadge` returns `ReactElement`, and `EmptyState` returns `ReactNode`. All three compile, and nobody can explain the difference. Then you write a `Card` whose `children` prop is typed `ReactElement`, use it as `<Card>No tasks yet</Card>`, and TypeScript refuses: *'Card' components don't accept text as child elements.* Plain text is the most ordinary child there is. What are these types, and which one did you actually mean?
+
+Part VIII taught you what React does. This chapter shows you what TypeScript *sees* when it reads your React code. Once you understand that JSX is checked like any other function call, the error messages stop being mysterious. By the end, you'll know where React's types come from, the difference between "something React can render" and "a JSX element", how to type a function component without `React.FC`, how to borrow the full prop list of a native element, and how to read the type definitions yourself when this book isn't open.
+
+> 🧠 **Mental model.** **JSX type-checking is ordinary type-checking.** `<Button kind="x" />` is a function call in disguise. TypeScript checks the attributes against the component's props type exactly as it checks arguments against a parameter type. Every JSX error you'll ever see is an "argument doesn't match parameter" error dressed up in angle brackets.
+
+## 49.1 How JSX is type-checked
+
+Before TypeScript can check JSX, it has to know what JSX *means*. Under the hood, every JSX tag compiles to a function call. With the modern transform, `<Button kind="primary" label="Save" />` becomes roughly `jsx(Button, { kind: "primary", label: "Save" })`. The attributes turn into a props object, and that object is checked against the type of `Button`'s first parameter.
+
+The `jsx` setting in `tsconfig.json` tells TypeScript which transform you use and where to find the JSX types. Every modern React project, including the Vite templates, uses `"react-jsx"`. That setting is also why you no longer need `import React from "react"` at the top of every file: the compiler imports the `jsx` function from `react/jsx-runtime` for you.
+
+```json
+{
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "strict": true,
+    "noEmit": true
+  }
+}
+```
+
+TypeScript then sorts tags into two kinds. A **lowercase** tag such as `<button>` is an **intrinsic element**, a built-in HTML or SVG element. Its props are looked up in an interface called `React.JSX.IntrinsicElements`, which maps every tag name to its allowed attributes. A **capitalized** tag such as `<Button>` must be a value in scope, and TypeScript checks the attributes against that component's props type.
+
+```tsx
+type ButtonProps = { kind: "primary" | "secondary"; label: string };
+
+function Button({ kind, label }: ButtonProps) {
+  return <button className={kind}>{label}</button>;
+}
+
+<Button kind="primary" label="Save" />; // ✅
+<Button kind="x" label="Save" />;       // ❌ Type '"x"' is not assignable to type '"primary" | "secondary"'.
+<Button kind="primary" />;              // ❌ Property 'label' is missing in type '{ kind: "primary"; }' but required in type 'ButtonProps'.
+<buton>Save</buton>;                    // ❌ Property 'buton' does not exist on type 'JSX.IntrinsicElements'.
+```
+
+Read those errors with the mental model in mind. The first two are the same errors you'd get calling `Button({ kind: "x", label: "Save" })`. The last one is TypeScript looking up the key `"buton"` in the `IntrinsicElements` interface and not finding it, exactly like a typo in an object property.
+
+## 49.2 Where React's types come from
+
+React is written in JavaScript, and its npm package ships no TypeScript types. The types live in a separate package, `@types/react`, maintained by the community on DefinitelyTyped ([Chapter 28](/chapter/28) covers how that ecosystem works). Its sibling `@types/react-dom` covers `createRoot`, portals, and the other DOM-specific APIs. Both are development dependencies, because types disappear at build time.
+
+```json
+{
+  "dependencies": {
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0"
+  }
+}
+```
+
+Because the runtime and the types are separate packages, they can drift apart, and both directions of drift hurt. React 19 at runtime with `@types/react` 18 means TypeScript rejects things that work, such as reading context with `use` or passing `ref` as a plain prop. Old runtime with new types means TypeScript accepts things that crash. The rule is simple: **keep the major versions of `react` and `@types/react` the same, and upgrade them together.**
+
+```sh
+$ npm ls react @types/react
+taskflow-web@1.0.0
+├── @types/react@19.1.8
+└── react@19.1.0
+```
+
+> 💡 **Tip.** When a type error appears right after an upgrade, check this pairing first. A version mismatch produces errors that look like your fault but aren't.
+
+## 49.3 ReactNode vs ReactElement vs JSX.Element
+
+These three names describe two different ideas, so start with the ideas.
+
+A **React element** is the plain object that JSX produces: a description of what to render, with a `type` (a tag name or a component), `props`, and a `key`. `ReactElement` is the type of that object. `React.JSX.Element` is the type TypeScript gives to every JSX expression, and it's defined as an interface that extends `ReactElement`. For everyday purposes, those two are the same thing: *a JSX element*.
+
+A **React node** is a much bigger idea: *anything React knows how to render*. That includes elements, but also strings, numbers, bigints, booleans, `null`, `undefined`, arrays (any iterable) of nodes, portals, and, in React 19, promises of nodes. `ReactNode` is the union of all of them.
+
+```tsx
+import type { ReactElement, ReactNode } from "react";
+
+const a: ReactNode = "Write docs";       // ✅ text
+const b: ReactNode = 3;                  // ✅ number
+const c: ReactNode = null;               // ✅ renders nothing
+const d: ReactNode = [<li key="1" />];   // ✅ array of nodes
+const e: ReactNode = <TaskCard />;       // ✅ an element is a node
+
+const f: ReactElement = <TaskCard />;    // ✅
+const g: ReactElement = "Write docs";    // ❌ Type 'string' is not assignable to type 'ReactElement<unknown, string | JSXElementConstructor<any>>'.
+```
+
+| Type | Means | Use it for |
+|---|---|---|
+| `ReactNode` | anything renderable | `children`, slot props, a component's return value |
+| `ReactElement` | a JSX element object | rare cases that need an element, like `cloneElement` |
+| `React.JSX.Element` | the type of a JSX expression | almost never written by hand |
+
+Now the opening `Card` bug makes sense. `children: ReactElement` says "exactly one JSX element", so text is rejected. The fix is the type that means "anything renderable":
+
+```tsx
+function Card({ children }: { children: ReactElement }) {
+  return <div className="card">{children}</div>;
+}
+<Card>No tasks yet</Card>; // ❌ 'Card' components don't accept text as child elements. Text in JSX has the type 'string', but the expected type of 'children' is 'ReactElement<unknown, string | JSXElementConstructor<any>>'.
+
+function Card2({ children }: { children: ReactNode }) {
+  return <div className="card">{children}</div>;
+}
+<Card2>No tasks yet</Card2>; // ✅
+```
+
+## 49.4 Typing function components
+
+A function component is a function that takes one props object and returns something renderable. So type it like any other function ([Chapter 11](/chapter/11)): annotate the parameter, and let TypeScript infer the return type.
+
+```tsx
+type Task = { id: string; title: string; status: "todo" | "doing" | "done" };
+
+type TaskCardProps = {
+  task: Task;
+  onComplete: (id: string) => void;
+};
+
+function TaskCard({ task, onComplete }: TaskCardProps) {
+  return (
+    <article>
+      <h3>{task.title}</h3>
+      {task.status !== "done" && (
+        <button onClick={() => onComplete(task.id)}>Complete</button>
+      )}
+    </article>
+  );
+}
+```
+
+That's the whole pattern. There's no special component type. If the function returns something React can't render, such as a plain object, TypeScript rejects it the moment you use it in JSX, so you rarely need a return annotation. When you want one for documentation, `ReactNode` is the honest choice.
+
+You'll also see the other style, `React.FC` (short for `FunctionComponent`), which annotates the *variable* instead of the parameter:
+
+```tsx
+import type { FC } from "react";
+
+const TaskTitle: FC<{ title: string }> = ({ title }) => <h3>{title}</h3>; // works
+
+const Generic: FC<ListProps<T>> = (props) => null; // ❌ Cannot find name 'T'.
+```
+
+This book doesn't use `React.FC`, for three reasons. First, it can't express a **generic component**: there's nowhere to declare `T`, and generic components ([Chapter 57](/chapter/57)) are some of the most valuable components you'll write. Second, it only works with `const` arrow functions, so it splits your codebase into two styles. Third, it adds nothing that a typed parameter doesn't already give you, and for years it carried surprising behavior (see 49.7). It isn't *wrong* in React 19, and you'll read plenty of it, but a plain function with typed props is simpler and works everywhere.
+
+## 49.5 Intrinsic element props
+
+Sooner or later you'll want "everything a `<button>` accepts". Writing that by hand would mean hundreds of props: `onClick`, `type`, `disabled`, `form`, every `aria-*` attribute, every event handler. React's types already contain that list, and `ComponentProps` lets you borrow it.
+
+```tsx
+import type { ComponentProps } from "react";
+
+type ButtonProps = ComponentProps<"button">;
+
+const p: ButtonProps = {
+  type: "submit",          // ✅ "submit" | "reset" | "button"
+  disabled: true,          // ✅
+  "aria-label": "Save",    // ✅
+  onClick: (e) => {},      // ✅ e: React.MouseEvent<HTMLButtonElement>
+  variant: "primary",      // ❌ Object literal may only specify known properties, and 'variant' does not exist in type 'DetailedHTMLProps<ButtonHTMLAttributes<HTMLButtonElement>, HTMLButtonElement>'.
+};
+```
+
+There are three variants, and they differ only in whether `ref` is included:
+
+| Type | Includes `ref`? |
+|---|---|
+| `ComponentProps<"button">` | yes, for native elements in React 19 |
+| `ComponentPropsWithRef<"button">` | yes, and says so explicitly |
+| `ComponentPropsWithoutRef<"button">` | no |
+
+```tsx
+import type { ComponentProps, ComponentPropsWithoutRef } from "react";
+
+type R1 = ComponentProps<"button">["ref"];        // Ref<HTMLButtonElement> | undefined
+type R2 = ComponentPropsWithoutRef<"button">["ref"];
+// ❌ Property 'ref' does not exist on type 'Omit<DetailedHTMLProps<ButtonHTMLAttributes<HTMLButtonElement>, HTMLButtonElement>, "ref">'.
+```
+
+Because `ref` is now a regular prop for function components ([Chapter 53](/chapter/53)), a wrapper that should accept a `ref` simply uses `ComponentProps<"button">`. Reach for `ComponentPropsWithoutRef` when your component deliberately does **not** forward a ref. `ComponentProps` also works on your own components: `ComponentProps<typeof TaskCard>` recovers the props type of a component whose props type was never exported.
+
+## 49.6 Reading React's type definitions
+
+This book can't cover every hook and attribute, but `@types/react` can, and it's just a TypeScript file you can read. Put your cursor on `useState`, `onClick`, or `<input` and press **F12** (Go to Definition), or Ctrl/Cmd-click it. Your editor opens `node_modules/@types/react/index.d.ts` at the right line. Here's a real excerpt:
+
+```ts
+function useState<S>(initialState: S | (() => S)): [S, Dispatch<SetStateAction<S>>];
+
+type SetStateAction<S> = S | ((prevState: S) => S);
+type Dispatch<A> = (value: A) => void;
+
+interface ButtonHTMLAttributes<T> extends HTMLAttributes<T> {
+  disabled?: boolean | undefined;
+  form?: string | undefined;
+  name?: string | undefined;
+  type?: "submit" | "reset" | "button" | undefined;
+  value?: string | readonly string[] | number | undefined;
+}
+```
+
+Read it with the tools from Book One. `useState` is a generic function: `S` is inferred from the initial value, and the setter accepts either a new `S` or an updater function from `S` to `S`. `ButtonHTMLAttributes` extends `HTMLAttributes`, so a button accepts every global attribute plus these. The `| undefined` on each optional prop is there so the types also work with the `exactOptionalPropertyTypes` compiler option.
+
+A few things look strange the first time. Names like `bivarianceHack` are a trick to make handler parameters less strict; ignore them. Types named `DO_NOT_USE_OR_YOU_WILL_BE_FIRED_…` are extension points for experimental React builds; ignore those too. Focus on the parameter types and the return type, the same way you'd read any function signature.
+
+> 💡 **Tip.** Hovering is faster than jumping. Hover `onChange` on an `<input>` and you'll see `ChangeEventHandler<HTMLInputElement, HTMLInputElement> | undefined`, which tells you exactly how to type an extracted handler ([Chapter 51](/chapter/51)).
+
+## 49.7 🕰 Legacy types you'll meet
+
+Most React code in the world was written before React 19, so you'll read these patterns long after you've stopped writing them. Recognize them, and know what replaced each one.
+
+**`React.FC` with implicit children.** Before `@types/react` 18, `FC` silently added `children` to every component's props, so components "accepted" children they ignored. That was removed in version 18, which is why old `FC` code breaks on upgrade.
+
+**`defaultProps` on function components.** React 19 ignores `defaultProps` on function components (class components still honor it). Default values now go in parameter destructuring ([Chapter 50](/chapter/50)).
+
+**`PropTypes`.** Runtime prop checking from the pre-TypeScript era. React 19 no longer checks them at all, so they're dead code. Your props type replaces them.
+
+**`forwardRef`.** Needed before React 19 to let a function component receive a `ref`. Now `ref` is an ordinary prop ([Chapter 53](/chapter/53)).
+
+**The global `JSX` namespace.** Old code writes `JSX.Element` with no import. `@types/react` 19 removed the global, so use `React.JSX` or import the `JSX` type from `"react"`.
+
+```tsx
+// 🕰 React 17-era file
+import React from "react";
+
+const Badge: React.FC<{ count: number }> = ({ count, children }) => ( // ❌ Property 'children' does not exist on type '{ count: number; }'.
+  <span>{count}{children}</span>
+);
+Badge.defaultProps = { count: 0 }; // ❌ Property 'defaultProps' does not exist on type 'FC<{ count: number; }>'.
+function title(): JSX.Element { return <h1 />; } // ❌ Cannot find namespace 'JSX'.
+
+// ✅ The same component today
+import type { JSX, ReactNode } from "react";
+
+function Badge2({ count = 0, children }: { count?: number; children?: ReactNode }) {
+  return <span>{count}{children}</span>;
+}
+function title2(): JSX.Element { return <h1 />; }
+```
+
+## Common mistakes
+
+> ⚠️ **Typing `children` as `ReactElement` or `JSX.Element`.** That rejects text, numbers, `null`, and arrays, which are the most common children of all. Use `ReactNode`.
+
+> ⚠️ **Mismatched `react` and `@types/react` versions.** Errors after an upgrade often come from the pairing, not your code. Keep the majors equal and upgrade both together.
+
+> ⚠️ **Hand-copying native props.** Writing `disabled?: boolean; type?: string;` yourself is incomplete and drifts from the real list (and `type?: string` is *looser* than the real `"submit" | "reset" | "button"`). Borrow them with `ComponentProps<"button">`.
+
+> ⚠️ **Annotating every component's return type as `JSX.Element`.** It adds noise and it's wrong as soon as the component returns `null` for an empty state:
+
+```tsx
+function EmptyState({ count }: { count: number }): JSX.Element {
+  if (count > 0) return null; // ❌ Type 'null' is not assignable to type 'Element'.
+  return <p>No tasks yet</p>;
+}
+```
+
+## When to use it, and when not to
+
+> ✅ **Use it when** you need to name a type: `ReactNode` for anything a caller renders through your component (`children`, `icon`, `header`), `ComponentProps<"input">` when your component *is* an input with extras, and `ComponentProps<typeof X>` to reuse another component's props.
+
+> 🚫 **When not to.** Don't annotate component return types by default; inference is correct and shorter. Don't reach for `ReactElement` unless you'll inspect or clone the element. And don't add `React.FC` to new code just because the code around it uses it; a typed parameter does the same job.
+
+## How it connects
+
+> 🔗 **Connection.** This chapter is [Chapter 38](/chapter/38) (JSX as JavaScript) seen through the type checker. The props-as-parameter idea comes from [Chapter 11](/chapter/11), lookups like `ComponentProps<"button">["ref"]` are indexed access types from [Chapter 20](/chapter/20), and `@types/react` is a declaration package of the kind you studied in [Chapter 28](/chapter/28). Next, [Chapter 50](/chapter/50) uses all of it to *design* props.
+
+> 🌍 **Real world.** Component libraries such as Radix UI, Headless UI, and MUI build their prop types from `ComponentProps<"button">` and friends, so their components accept every native attribute you'd expect. Their source is a good place to practice reading React types.
+
+## Exercises
+
+### Level 1 — Recall
+
+Classify each value as a valid `ReactNode`, a valid `ReactElement`, both, or neither. Check your answers by assigning each to a typed variable in your editor.
+
+```tsx
+"Fix login bug";
+42;
+<TaskCard task={task} />;
+null;
+undefined;
+false;
+[<li key="a">A</li>, "B"];
+{ title: "Write docs" };
+() => <p />;
+new Date();
+```
+
+### Level 2 — Application
+
+Take every component in your P10 Component Gallery ([P10](/projects/p10)) that uses `React.FC` and rewrite it as a plain function with a typed props parameter. Components that render `children` must declare `children` explicitly with the right type. The gallery must compile with no new errors and look identical.
+
+### Level 3 — Challenge
+
+Use Go to Definition to find the props type of `<input>` in `@types/react` (start from `IntrinsicElements`, then follow `InputHTMLAttributes`). List five props you didn't know existed, and for each one write a single line of JSX that uses it correctly.
+
+*Hint: look at what `InputHTMLAttributes` extends, not only at its own members.*
+
+### Level 4 — Real-world
+
+**Ticket TF-310: Modernize the legacy badge components.** The file `src/legacy/badges.tsx` was written for React 17. Bring it up to React 19 and `@types/react` 19.
+
+- No `React.FC`, `defaultProps`, `PropTypes`, or global `JSX` remain; behavior is unchanged.
+- Every component's props type is declared explicitly, with `children` typed where it's used.
+- Any component that wraps a native element accepts all of that element's native props.
+- The pull request description lists each change and the reason for it, one line per change.
+
+## Key takeaways
+
+- JSX is a function call: attributes are checked against the component's props type like arguments against a parameter.
+- Lowercase tags are looked up in `React.JSX.IntrinsicElements`; capitalized tags are components in scope.
+- React's types come from `@types/react`. Keep its major version equal to `react`'s.
+- `ReactNode` means "anything renderable" and is the right type for `children` and slots. `ReactElement` and `JSX.Element` mean "a JSX element".
+- Type components as plain functions with typed props. `React.FC` can't express generics and adds nothing.
+- `ComponentProps<"button">` borrows every native prop; the `WithRef` and `WithoutRef` variants control whether `ref` is included.
+
+## What comes next
+
+You can now read what TypeScript sees. The next question is what it *should* see: when a teammate's `Button` accepts `onClick` but not `type="submit"`, the fix isn't `[key: string]: any`, it's a well-designed props type. That's [Chapter 50: Typing Props & Component APIs](/chapter/50).

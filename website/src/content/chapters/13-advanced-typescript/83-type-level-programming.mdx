@@ -1,0 +1,349 @@
+> 📖 **The problem.** You write `const TaskSchema = s.object({ id: s.string(), tags: s.array(s.string()) })` and nothing else. No `interface`, no annotation. Yet hovering `parse(data)` shows `{ id: string; tags: string[] }`, exactly right. The same happens with a typed API client: you call `client.tasks.list({ projectId })`, and the result type comes from a function on a server you never imported. Where did those types *come from*?
+
+This chapter explains how. It opens the hood on the techniques behind Zod, tRPC, and typed query builders, so you can read their types, debug them, and decide whether to write any yourself.
+
+> ⏭ **Specialist chapter.** Most application developers never need to write the types in this chapter, only to *use* libraries that do. Read it to understand how the tools you use work, or when you're building a shared library. If you're short on time, read the mental model and sections 83.4, 83.5, and 83.8, then skip the rest.
+
+> 🧠 **Mental model.** The type system is a **small, pure, functional programming language that runs inside the compiler.** Tuples are lists, conditional types are `if`, and recursion is the only loop. Treat it like code: name things, test things, and know its costs.
+
+## 83.1 Types as a programming language
+
+Look at the pieces you already know and notice they form a language. **Conditional types** are `if` expressions. **Generics** are functions from types to types. **`infer`** is pattern matching. **Object and tuple types** are the data structures. There are no variables to mutate and no loops, so repetition must be **recursion**.
+
+```ts
+type IsString<T> = T extends string ? "yes" : "no"; // if, as a type
+
+type A = IsString<"todo">; // "yes"
+type B = IsString<42>;     // "no"
+```
+
+For counting or walking a list, we need a loop. The standard trick is a recursive type with an **accumulator** parameter, which is a tuple we grow one element at a time:
+
+```ts
+type Count<N extends number, Acc extends unknown[] = []> =
+  Acc["length"] extends N
+    ? Acc                         // base case: the accumulator reached the target length
+    : Count<N, [...Acc, unknown]>; // recursive case: add one element, try again
+
+type ThreeSlots = Count<3>; // [unknown, unknown, unknown]
+```
+
+Read it like a function: "If the accumulator's length equals `N`, return it; otherwise call myself with one more element." The tuple's `length` property is a *numeric literal type*, which is why this works as a counter.
+
+> 💡 **Tip.** Debug type-level code the way you'd debug any code: with small examples. Write `type Test = Count<3>;` and hover. Or force the value into view with `const x: Test = 0` and read the error.
+
+## 83.2 Tuple manipulation
+
+Tuples are the list data structure of this language. With `infer` and the spread operator `...` we get the classic list operations:
+
+```ts
+type Head<T extends unknown[]> = T extends [infer H, ...unknown[]] ? H : never;
+type Tail<T extends unknown[]> = T extends [unknown, ...infer R] ? R : [];
+type Last<T extends unknown[]> = T extends [...unknown[], infer L] ? L : never;
+type Length<T extends readonly unknown[]> = T["length"];
+
+type H = Head<[1, 2, 3]>;   // 1
+type T = Tail<[1, 2, 3]>;   // [2, 3]
+type L = Last<[1, 2, 3]>;   // 3
+type N = Length<[1, 2, 3]>; // 3
+type E = Head<[]>;          // never (no head of an empty list)
+type S = Length<string[]>;  // number (an array has no fixed length)
+```
+
+`Head` and `Tail` are pattern matches: "does this tuple have the shape *one thing, then the rest*?" Recursion over `Head` and `Tail` is how you write every other list function. **Reverse** takes the head and puts it at the *end* of the reversed tail:
+
+```ts
+type Reverse<T extends unknown[]> =
+  T extends [infer H, ...infer R] ? [...Reverse<R>, H] : [];
+
+type R1 = Reverse<[1, "a", true]>; // [true, "a", 1]
+
+type Concat<A extends unknown[], B extends unknown[]> = [...A, ...B];
+type C1 = Concat<[1, 2], ["a"]>;   // [1, 2, "a"]
+```
+
+This isn't an academic game. Variadic tuples power typed `Promise.all`, `zip`, `pipe`, and route-segment parsers (like `Split` in [Chapter 81](/chapter/81)). Anywhere a library takes "a list of things, each with its own type", tuple manipulation is underneath.
+
+## 83.3 Type-level arithmetic
+
+> ⏭ **Safe to skip.** This is a curiosity. It shows what the language can do, and why you should not use it for real work.
+
+There are no number operations in types. But a tuple's `length` *is* a number, and tuples can be built and spliced, so we can do arithmetic by **counting with tuples**:
+
+```ts
+type BuildTuple<N extends number, Acc extends unknown[] = []> =
+  Acc["length"] extends N ? Acc : BuildTuple<N, [...Acc, unknown]>;
+
+type Add<A extends number, B extends number> =
+  [...BuildTuple<A>, ...BuildTuple<B>]["length"];
+
+type Sub<A extends number, B extends number> =
+  BuildTuple<A> extends [...BuildTuple<B>, ...infer Rest] ? Rest["length"] : never;
+
+type Five = Add<2, 3>;       // 5
+type Three = Sub<5, 2>;      // 3
+type Negative = Sub<2, 5>;   // never (no negative numbers in this scheme)
+```
+
+It works, and it's slow in proportion to the numbers: `Add<500, 600>` builds two tuples of hundreds of elements just to read a length. Negative numbers, multiplication, and division get hairy fast. Real uses are tiny: "a tuple of exactly N items" (`FixedArray<T, 3>`) or the `Length` of a known tuple. If you ever find yourself reaching for type-level math, compute the value at runtime and keep the types simple.
+
+## 83.4 How schema libraries infer types
+
+The answer to the opening mystery is a **phantom type**: a type parameter that exists only in the type system. Each schema object carries, as a generic argument, the TypeScript type it will produce when it parses.
+
+```ts
+class Schema<T> {
+  declare readonly _type: T; // phantom: never assigned, never read at runtime
+  constructor(readonly parse: (input: unknown) => T) {}
+}
+
+type Infer<S extends Schema<unknown>> = S["_type"];
+```
+
+The `declare` field costs nothing at runtime. It's a hook for the type system: `Infer<Schema<string>>` is `string`. Each builder function returns a `Schema<SomeType>`; composite builders compute their `T` from their children:
+
+```ts
+const s = {
+  string: () => new Schema<string>((x) => { if (typeof x !== "string") throw new Error("expected string"); return x; }),
+  number: () => new Schema<number>((x) => { if (typeof x !== "number") throw new Error("expected number"); return x; }),
+  array: <T,>(item: Schema<T>) => new Schema<T[]>((x) => (x as unknown[]).map(item.parse)),
+  object: <Shape extends Record<string, Schema<unknown>>>(shape: Shape) =>
+    new Schema<{ [K in keyof Shape]: Infer<Shape[K]> }>((x) => {
+      const out: Record<string, unknown> = {};
+      for (const key in shape) out[key] = shape[key]!.parse((x as Record<string, unknown>)[key]);
+      return out as { [K in keyof Shape]: Infer<Shape[K]> };
+    }),
+};
+
+const TaskSchema = s.object({ id: s.string(), tags: s.array(s.string()), priority: s.number() });
+
+type TaskT = Infer<typeof TaskSchema>;
+// { id: string; tags: string[]; priority: number }
+
+const task = TaskSchema.parse(JSON.parse(raw)); // task: TaskT, and *earned*: parse validated it
+```
+
+Notice what the generics do. `object` captures the **whole shape** as `Shape`, then maps over its keys, asking each child for its inferred type. The value you wrote (`s.object({...})`) is a runtime validator and a type, from one source of truth. This is the fix promised in [Chapter 16](/chapter/16): the type isn't asserted, it's *derived from the code that checks it*.
+
+> 🌍 **Real world.** Zod's `z.infer<typeof schema>`, Valibot's `InferOutput`, and ArkType all use this pattern at scale. [P18](/projects/p18) has you build a runtime validation library in this style.
+
+## 83.5 How end-to-end typed APIs work
+
+tRPC-style libraries let a client call server procedures with full types and no code generation. The trick is that **types are erased at build time, so they can be shared for free**: the client imports the server's *type*, never its code.
+
+First, the server defines procedures that carry their input and output types, then exports the router's *type*:
+
+```ts
+type Procedure<I, O> = { input: I; output: O; handler: (input: I) => Promise<O> };
+const proc = <I, O>(handler: (input: I) => Promise<O>) => ({ handler }) as Procedure<I, O>;
+
+const router = {
+  tasks: {
+    list: proc(async (input: { projectId: string }) => loadTasks(input.projectId)), // Procedure<{ projectId: string }, Task[]>
+    byId: proc(async (input: { id: string }) => findTask(input.id)),                // Procedure<{ id: string }, Task | null>
+  },
+  health: proc(async (_: void) => "ok" as const),
+};
+
+export type AppRouter = typeof router; // only a type leaves this file
+```
+
+Second, the client turns that tree of procedures into a tree of async functions, recursively:
+
+```ts
+type Client<R> = {
+  [K in keyof R]: R[K] extends Procedure<infer I, infer O>
+    ? (input: I) => Promise<O>  // a leaf: a callable function
+    : Client<R[K]>;             // a branch: recurse into the namespace
+};
+
+declare const client: Client<AppRouter>; // in the web app: import type { AppRouter } from "server"
+
+const tasks = await client.tasks.list({ projectId: "p1" }); // tasks: Task[]
+client.tasks.list({ project: "p1" });
+// ❌ Object literal may only specify known properties, but 'project' does not exist in type '{ projectId: string; }'. Did you mean to write 'projectId'?
+client.tasks.nope; // ❌ Property 'nope' does not exist on type 'Client<{ list: …; byId: … }>'.
+```
+
+Change the server handler's return type, and every client call site updates on the next type-check, in the same monorepo, with no schema file in between. At *runtime* the client is a `Proxy` that sends HTTP requests; the types are only an overlay on it.
+
+> ⚠️ **Common mistake.** This gives you types, not safety. The network can still return anything. Real libraries also run a runtime schema (83.4) on both sides.
+
+## 83.6 How typed query builders work
+
+A SQL builder like Kysely or Drizzle infers **result rows** from the query: `select("id", "title")` returns rows with only those columns. The recipe is a table-type map plus a mapped type over the selection.
+
+```ts
+type Tables = {
+  tasks: { id: string; title: string; priority: number; done: boolean };
+  users: { id: string; name: string };
+};
+
+type ColumnSpec<Row> = (keyof Row & string) | `${keyof Row & string} as ${string}`;
+
+// Build the result row: rename "col as alias" keys, look up each column's type.
+type RowOf<Row, S extends string> = {
+  [Item in S as Item extends `${string} as ${infer Alias}` ? Alias : Item]:
+    Item extends `${infer Col} as ${string}`
+      ? Col extends keyof Row ? Row[Col] : never
+      : Item extends keyof Row ? Row[Item] : never;
+};
+
+const db = {
+  from<Name extends keyof Tables>(table: Name) {
+    return {
+      select<const S extends ColumnSpec<Tables[Name]>>(...cols: S[]): Promise<RowOf<Tables[Name], S>[]> {
+        return runQuery(table, cols);
+      },
+    };
+  },
+};
+
+const rows = await db.from("tasks").select("id", "title as name");
+// rows: { id: string; name: string }[]
+
+db.from("tasks").select("nope"); // ❌ Argument of type '"nope"' is not assignable to parameter of type 'ColumnSpec<{ id: string; title: string; priority: number; done: boolean; }>'.
+db.from("people");               // ❌ Argument of type '"people"' is not assignable to parameter of type 'keyof Tables'.
+```
+
+Three techniques combine here: the table name picks a row type (an indexed access), the `const` type parameter keeps the selected column names as literals, and **key remapping** with a template literal parses `"title as name"` at the type level (the `as` in the mapped type is a key-renaming clause, not the SQL keyword). Joins, `where`, and aggregates stack the same ideas, with a type that grows as you chain, the builder pattern of [Chapter 82](/chapter/82).
+
+## 83.7 Designing a small type-safe DSL
+
+A **DSL** (domain-specific language) is a small notation for one job. Here's a state-machine DSL for a task's lifecycle where `send(event)` accepts **only the events valid in the current state**. The configuration is plain data; the types read it.
+
+```ts
+type MachineConfig = { initial: string; states: Record<string, { on?: Record<string, string> }> };
+function defineMachine<const C extends MachineConfig>(config: C): C { return config; }
+
+const machine = defineMachine({
+  initial: "todo",
+  states: {
+    todo: { on: { START: "doing" } },
+    doing: { on: { COMPLETE: "done", PAUSE: "todo" } },
+    done: {},
+  },
+});
+```
+
+Now the actor. To know the current state at the type level, each `send` returns a **new actor whose type records the next state**, like the accumulating builders of [Chapter 82](/chapter/82):
+
+```ts
+type Events<C extends MachineConfig, S extends keyof C["states"]> =
+  C["states"][S] extends { on: infer On } ? keyof On & string : never;
+
+type Next<C extends MachineConfig, S extends keyof C["states"], E extends string> =
+  C["states"][S] extends { on: infer On }
+    ? E extends keyof On ? On[E] & keyof C["states"] : never
+    : never;
+
+class Actor<C extends MachineConfig, S extends keyof C["states"]> {
+  constructor(readonly config: C, readonly state: S) {}
+
+  send<E extends Events<C, S>>(event: E): Actor<C, Next<C, S, E>> {
+    const on = this.config.states[this.state as string]!.on as Record<string, string>;
+    return new Actor(this.config, on[event]! as never);
+  }
+}
+
+function createActor<const C extends MachineConfig>(config: C) {
+  return new Actor(config, config.initial as never) as Actor<C, C["initial"] & keyof C["states"]>;
+}
+
+const a0 = createActor(machine);   // state: "todo"
+const a1 = a0.send("START");       // state: "doing"
+const a2 = a1.send("COMPLETE");    // state: "done"
+
+a0.send("COMPLETE"); // ❌ Argument of type '"COMPLETE"' is not assignable to parameter of type '"START"'.
+a2.send("START");    // ❌ Argument of type '"START"' is not assignable to parameter of type 'never'.
+```
+
+An impossible transition is now a compile error, with the *legal* events named in the message for any non-final state. The type of the machine config is the single source of truth; add a transition and the whole API updates.
+
+> 🚫 **When not to.** This works because the event sequence is known at compile time. In a real UI, events arrive from clicks at runtime, so the current state is a *runtime* value and you can't track it in a type. For that, the discriminated-union reducers of [Chapter 55](/chapter/55) are the right tool: the compiler checks every state-event pair, not a chain of calls.
+
+## 83.8 The cost of cleverness
+
+Every technique in this chapter has a bill, and you pay it in three currencies.
+
+**Compile time.** Type-level code runs on every check and every keystroke in the editor. Measure it instead of guessing:
+
+```sh
+npx tsc --noEmit --extendedDiagnostics
+# Look at: Instantiations, Types, Check time. Compare before and after your change.
+```
+
+**Error messages.** When a call fails, the message prints your *computed* types. `Type '"START"' is not assignable to type 'never'` tells a newcomer nothing. Every cleverness must be paid for by reading error messages in the failure cases you expect, and fixing the worst ones with better constraints.
+
+**Maintainability.** A recursive conditional type is code that few teammates can debug. Treat it as code: give each helper a name, put it in one file with tests (`@ts-expect-error` for what must fail, assignments for what must pass), and write a comment that shows an example input and output.
+
+Before shipping a type-level feature, ask these questions in order:
+
+```text
+1. Can a plain interface or union express this?               → use that
+2. Can a code generator produce the types from the source?    → generate them
+3. Can a runtime check at the boundary give the same safety?  → validate there
+4. Only then: write the type-level code, with tests and a size budget.
+```
+
+> 🔗 **Connection.** [Chapter 95](/chapter/95) covers measuring and fixing compiler performance, and [Chapter 91](/chapter/91) covers designing public type APIs that keep this machinery on the *inside*.
+
+## Common mistakes
+
+> ⚠️ **Writing a language instead of an API.** If callers must understand a type-level concept to use your function, the abstraction is leaking.
+
+> ⚠️ **Skipping the base case.** A recursive type without a terminating branch fails with `Type instantiation is excessively deep and possibly infinite`.
+
+> ⚠️ **Confusing types with trust.** Phantom types and shared router types describe what *should* arrive. Over the network, validate with a runtime schema.
+
+> ⚠️ **No tests.** Type-level code regresses silently when the compiler is upgraded or a neighbor changes. Pin behavior with passing and `@ts-expect-error` assertions.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** you're building a **shared library or SDK** where one investment in types pays off in many call sites, or when the *only* alternative is a code generator you'd have to maintain.
+
+> 🚫 **When not to.** Application code owned by a team of mixed experience; a feature used in one or two places; anything where a plain `interface`, a union, or a runtime check does the job. Using Zod is not an excuse to write a Zod.
+
+## How it connects
+
+> 🔗 **Connection.** Everything here stands on [Chapter 23](/chapter/23) (conditional types and `infer`), [Chapter 79](/chapter/79), [Chapter 80](/chapter/80), and [Chapter 81](/chapter/81). Runtime validation is [Chapter 32](/chapter/32), and [P18](/projects/p18) builds a validator you can compare against 83.4.
+
+> 🌍 **Real world.** Zod, tRPC, Kysely, Drizzle, and XState v5 are all libraries whose value is largely their types. They also publish performance guidance, because users hit the compile-time cost described in 83.8.
+
+## Exercises
+
+### Level 1 — Recall
+
+Implement `Length<T>` and `Reverse<T>` for tuples (no peeking at this chapter). Test them with `Length<[1, 2, 3]>` and `Reverse<["a", "b", "c"]>`.
+
+### Level 2 — Application
+
+Implement a minimal `Infer<Schema>` for object and string schemas: a `Schema<T>` class with a phantom `_type`, `s.string()`, `s.object({...})`, and `Infer<typeof schema>`.
+
+### Level 3 — Challenge
+
+Type a state-machine DSL where `send(event)` only accepts events valid in the current state, and the final state accepts no events at all.
+
+*Hint: return a new `Actor` type from every `send`, with the next state as a type argument.*
+
+### Level 4 — Real-world
+
+**Ticket TF-530: Decision note on a type-level DSL.** Pick one feature of your capstone project that might benefit from a type-level DSL (typed routes, a filter language, form schemas, a workflow engine).
+
+- Write a one-page design note comparing three options: a plain-types solution, a code-generated solution, and the type-level DSL.
+- For the DSL option, measure `tsc --extendedDiagnostics` before and after on a realistic number of call sites, and include the numbers.
+- Include the three error messages a developer is most likely to see, and rate each as helpful or confusing.
+- End with a recommendation and the conditions under which you'd change it.
+
+## Key takeaways
+
+- The type system is a small functional language: conditionals are `if`, `infer` is pattern matching, tuples are lists, recursion is the loop.
+- `Head`, `Tail`, `Length`, and `Reverse` are the vocabulary of tuple programming, and variadic tuples are how libraries type "a list of different things".
+- Type-level arithmetic is possible by counting with tuples, and it is almost never worth it.
+- Schema libraries carry a **phantom type** on each schema object, so `Infer` can read what `parse` will produce.
+- End-to-end typed APIs work because types are erased: the client imports the router's *type*, never its code.
+- Typed query builders and DSLs accumulate types through chained calls, and cleverness has real costs: compile time, error messages, and maintainability.
+
+## What comes next
+
+That completes Part XIII's tour of the type system as a language. Next, [Part XIV](/part/xiv) brings these ideas back to the UI, starting with [Chapter 84](/chapter/84) on advanced generic components. Chapters 87 to 89 then ask the question this chapter ends on, for component APIs: is the complexity worth it?

@@ -1,0 +1,373 @@
+> 📖 **The problem.** Somewhere in TaskFlow, a form component starts life with `function handleChange(e: any)`. It works, so the signature gets copied into forty more handlers. Months later someone attaches one of those handlers to a wrapper `div` that contains the input, and `e.target.value` quietly reads from the *wrong element*: `undefined` instead of the text. Nothing flagged it, because `any` turned off the only tool that could have.
+
+Event handlers are where user input enters your program, so they're where wrong assumptions hurt most. This chapter shows how React's event types work, when you don't need to write them at all, and exactly which type to reach for when you do. By the end, you'll be able to type every common handler (clicks, keys, inputs, forms, focus), explain the difference between `target` and `currentTarget`, and find the right type for any event by hovering.
+
+> 🧠 **Mental model.** **React events are typed wrappers around DOM events.** `React.ChangeEvent<HTMLInputElement>` means "a change event whose `currentTarget` is an input". Inline handlers get these types for free through contextual typing, so you only write them when you *extract* a handler.
+
+## 51.1 Synthetic events
+
+React doesn't hand your handlers the browser's raw events. It wraps them in a **synthetic event**: an object with the same interface as the native one (`preventDefault()`, `stopPropagation()`, `key`, `clientX`, …) that behaves the same in every browser. The types for these wrappers live in the `React` namespace of `@types/react`, and every one of them follows the same shape: `React.<Kind>Event<Element>`.
+
+```tsx
+import type { MouseEvent, KeyboardEvent, ChangeEvent } from "react";
+// or, without importing, via the global namespace: React.MouseEvent, React.KeyboardEvent, …
+
+//   the kind of event ──┐          ┌── the element the handler is attached to
+type ClickOnButton = MouseEvent<HTMLButtonElement>;
+type KeyInInput = KeyboardEvent<HTMLInputElement>;
+type ChangeInSelect = ChangeEvent<HTMLSelectElement>;
+```
+
+The element in angle brackets is the important part. It tells TypeScript what `e.currentTarget` is, which is how you get `e.currentTarget.value` on an input without a cast. The kind of event decides what *else* exists: a `MouseEvent` has `clientX`, a `KeyboardEvent` has `key`, and neither has the other's fields.
+
+There's one more thing to know about the wrappers: since React 17, they are no longer pooled, so reading `e.currentTarget` after an `await` works. The old advice to call `e.persist()` is obsolete.
+
+> 🔗 **Connection.** The DOM event types underneath (`MouseEvent`, `KeyboardEvent`, `EventTarget`) were introduced in [Chapter 35](/chapter/35). React's versions add the generic element parameter on top.
+
+## 51.2 Inline handlers and contextual typing
+
+The most common case needs no event type at all. When you write an arrow function directly in a JSX attribute, TypeScript already knows which attribute it is, and therefore what the function must look like. That's **contextual typing**: the parameter's type is supplied by where the function appears.
+
+```tsx
+function TitleField() {
+  const [title, setTitle] = useState("");
+  return (
+    <input
+      value={title}
+      onChange={(e) => setTitle(e.currentTarget.value)} // e: ChangeEvent<HTMLInputElement>
+      onKeyDown={(e) => e.key === "Escape" && setTitle("")} // e: KeyboardEvent<HTMLInputElement>
+    />
+  );
+}
+```
+
+Hover `e` in your editor: you'll see the exact event type, derived from the `<input>` element and the `onChange` prop. Annotating it yourself would only repeat what TypeScript already knows. The same holds for every intrinsic element: `onClick` on a `button` gives `MouseEvent<HTMLButtonElement>`, `onSubmit` on a `form` gives a submit event for `HTMLFormElement`, and so on.
+
+> 💡 **Tip.** If the handler is a one-liner, write it inline and annotate nothing. Extract it only when it grows, or when several elements share it. That's the next section.
+
+## 51.3 Extracted handlers
+
+Once you pull a handler out of the JSX, the context is gone, and the parameter becomes implicitly `any` (an error under `strict`). Now you must supply the type yourself. There are two equivalent ways: annotate the parameter, or annotate the whole function with a React **handler type**.
+
+```tsx
+import type { MouseEvent, MouseEventHandler } from "react";
+
+function DeleteButton({ onDelete }: { onDelete: (id: string) => void }) {
+  // 1. Annotate the parameter:
+  function handleClick(e: MouseEvent<HTMLButtonElement>) {
+    onDelete(e.currentTarget.dataset.id ?? "");
+  }
+
+  // 2. Annotate the variable with a handler type (the parameter is then contextually typed):
+  const handleClick2: MouseEventHandler<HTMLButtonElement> = (e) => {
+    onDelete(e.currentTarget.dataset.id ?? "");
+  };
+
+  return <button data-id="t1" onClick={handleClick}>Delete</button>;
+}
+```
+
+`MouseEventHandler<T>` is simply `(event: MouseEvent<T>) => void`. Every event kind has a matching `…EventHandler<T>` alias: `ChangeEventHandler`, `KeyboardEventHandler`, `FocusEventHandler`, and so on. Use the parameter form for function declarations, and the handler form when you're declaring a `const` or typing a *prop*:
+
+```tsx
+type TaskRowProps = {
+  onSelect: MouseEventHandler<HTMLLIElement>; // callers must pass something compatible
+};
+```
+
+If the element and the handler disagree, TypeScript tells you:
+
+```tsx
+function onNameChange(e: React.ChangeEvent<HTMLInputElement>) {}
+
+<button onClick={onNameChange} />;
+// ❌ Type '(e: ChangeEvent<HTMLInputElement>) => void' is not assignable to type 'MouseEventHandler<HTMLButtonElement>'.
+```
+
+## 51.4 Mouse and pointer events
+
+Clicks are `React.MouseEvent<T>`. Beyond `preventDefault()`, the fields you'll use most are the modifier flags (`shiftKey`, `metaKey`, `ctrlKey`, `altKey`) and the coordinates (`clientX`, `clientY`). **Pointer events** (`React.PointerEvent<T>`) extend mouse events with `pointerType` (`"mouse" | "touch" | "pen"` in practice) and work for touch and stylus too, so prefer them for drag-and-drop or drawing.
+
+```tsx
+function TaskCard({ task, onOpen }: { task: Task; onOpen: (id: string, inNewTab: boolean) => void }) {
+  function handleClick(e: React.MouseEvent<HTMLElement>) {
+    const wantsNewTab = e.metaKey || e.ctrlKey; // Cmd/Ctrl-click, like a link
+    onOpen(task.id, wantsNewTab);
+  }
+
+  function handlePointerDown(e: React.PointerEvent<HTMLElement>) {
+    if (e.pointerType === "touch") {
+      // show larger drag handles for touch users
+    }
+  }
+
+  return (
+    <article onClick={handleClick} onPointerDown={handlePointerDown}>
+      {task.title}
+    </article>
+  );
+}
+```
+
+Typing the element as `HTMLElement` (rather than `HTMLDivElement` or `HTMLButtonElement`) is a good habit for a handler that works on any element: a handler that accepts the *wider* element type is assignable to a prop that supplies a narrower one.
+
+## 51.5 Keyboard events
+
+`React.KeyboardEvent<T>` gives you `e.key`, the *meaning* of the key press (`"Enter"`, `"Escape"`, `"n"`), which is what you want for shortcuts. (`e.code` is the physical key position, useful for games.) TypeScript types `e.key` as plain `string`, so a typo like `"Escpae"` compiles silently. The fix is to define your own union of the keys you support and check against it once.
+
+```tsx
+const SHORTCUT_KEYS = ["n", "/", "Escape"] as const;
+type ShortcutKey = (typeof SHORTCUT_KEYS)[number]; // "n" | "/" | "Escape"
+
+function isShortcutKey(key: string): key is ShortcutKey {
+  return (SHORTCUT_KEYS as readonly string[]).includes(key);
+}
+
+const shortcutActions: Record<ShortcutKey, () => void> = {
+  n: () => console.log("new task"),
+  "/": () => console.log("focus search"),
+  Escape: () => console.log("close panel"),
+};
+
+function handleKeyDown(e: React.KeyboardEvent<HTMLElement>) {
+  if (e.metaKey || e.ctrlKey || e.altKey) return; // leave browser shortcuts alone
+  if (isShortcutKey(e.key)) {
+    e.preventDefault();
+    shortcutActions[e.key](); // e.key narrowed to ShortcutKey, so the lookup is safe
+  }
+}
+```
+
+Because `shortcutActions` is a `Record<ShortcutKey, …>`, adding `"?"` to the list without adding an action is a compile error: the same exhaustiveness idea as in [Chapter 55](/chapter/55). Attach handlers like this to a container with `tabIndex={0}` or to an input; plain `div`s don't receive key events unless they can take focus.
+
+## 51.6 Change events
+
+`onChange` is where input values come from. The type is `React.ChangeEvent<T>`, and `T` must match the element: `HTMLInputElement`, `HTMLSelectElement`, or `HTMLTextAreaElement`. Which properties you read depends on the control: `value` for text, selects, and textareas; `checked` for checkboxes.
+
+```tsx
+function TaskFilters() {
+  const [query, setQuery] = useState("");
+  const [status, setStatus] = useState<TaskStatus | "all">("all");
+  const [onlyMine, setOnlyMine] = useState(false);
+  const [notes, setNotes] = useState("");
+
+  return (
+    <>
+      <input value={query} onChange={(e) => setQuery(e.currentTarget.value)} />
+
+      <select
+        value={status}
+        onChange={(e) => setStatus(e.currentTarget.value as TaskStatus | "all")}
+        // e.currentTarget.value is string; the cast is a promise about your <option> values
+      >
+        <option value="all">All</option>
+        <option value="todo">To do</option>
+        <option value="doing">Doing</option>
+        <option value="done">Done</option>
+      </select>
+
+      <input type="checkbox" checked={onlyMine} onChange={(e) => setOnlyMine(e.currentTarget.checked)} />
+
+      <textarea value={notes} onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) => setNotes(e.currentTarget.value)} />
+    </>
+  );
+}
+```
+
+The `as` on the select is unavoidable, because the DOM reports `value` as `string`. Keep it honest by validating instead of asserting when the stakes are higher:
+
+```ts
+function isStatusFilter(value: string): value is TaskStatus | "all" {
+  return value === "all" || value === "todo" || value === "doing" || value === "done";
+}
+```
+
+> ⚠️ **Common mistake.** Passing a handler typed for one element to another. A `ChangeEvent<HTMLSelectElement>` handler on an `<input>` fails with `Type 'ChangeEvent<HTMLInputElement, HTMLInputElement>' is not assignable to type 'ChangeEvent<HTMLSelectElement, Element>'`, and that error is correct: the two have different properties.
+
+## 51.7 Form and submit events
+
+A form's `onSubmit` fires when the user presses Enter in a field or clicks a submit button. In the DOM that's a `SubmitEvent`. In recent `@types/react` 19 releases (19.3 has it), the matching React type is `React.SubmitEvent<HTMLFormElement>`, which also exposes `submitter` (the button that was clicked). Older code, and a lot of tutorials, use `React.FormEvent<HTMLFormElement>`: it works, but newer type versions mark it deprecated because "FormEvent doesn't actually exist" as a distinct DOM event. Both give you `preventDefault()` and a correctly typed `currentTarget`.
+
+```tsx
+function NewTaskForm({ onCreate }: { onCreate: (title: string) => void }) {
+  function handleSubmit(e: React.SubmitEvent<HTMLFormElement>) {
+    e.preventDefault(); // stop the browser's full-page form post
+    const data = new FormData(e.currentTarget); // currentTarget is the <form>
+    const title = data.get("title"); // FormDataEntryValue | null: string | File | null
+    if (typeof title === "string" && title.trim() !== "") {
+      onCreate(title.trim());
+      e.currentTarget.reset();
+    }
+  }
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <input name="title" />
+      <button type="submit">Add</button>
+    </form>
+  );
+}
+```
+
+`FormData.get` returns `string | File | null`, so you narrow with `typeof` before using the value, which is the type system correctly reminding you that file inputs exist. This "uncontrolled" approach avoids a `useState` per field. If you're on an older `@types/react` that lacks `SubmitEvent`, swap in `React.FormEvent<HTMLFormElement>` and nothing else changes.
+
+> 🆕 **Modern note.** React 19 also lets `<form action={fn}>` take a function that receives the `FormData` directly, so many forms no longer need an `onSubmit` handler at all.
+
+## 51.8 Focus events
+
+`onFocus` and `onBlur` receive `React.FocusEvent<T>`. Its extra field is `relatedTarget`: the element *losing* focus (for `onFocus`) or *gaining* it (for `onBlur`), or `null` when focus moves outside the page or to nothing. Because of that `null`, TypeScript makes you check before using it.
+
+```tsx
+function InlineTitleEditor({ title, onSave }: { title: string; onSave: (title: string) => void }) {
+  const [draft, setDraft] = useState(title);
+
+  function handleBlur(e: React.FocusEvent<HTMLDivElement>) {
+    // blur bubbles in React, so it also fires when focus moves between children.
+    // Only save when focus leaves the whole editor:
+    if (e.relatedTarget === null || !e.currentTarget.contains(e.relatedTarget)) {
+      onSave(draft);
+    }
+  }
+
+  return (
+    <div onBlur={handleBlur}>
+      <input value={draft} onChange={(e) => setDraft(e.currentTarget.value)} />
+      <button type="button" onClick={() => setDraft(title)}>Reset</button>
+    </div>
+  );
+}
+```
+
+Here `e.currentTarget` is the wrapper `div` that owns the handler, and `contains` takes a `Node | null`. The `relatedTarget` is typed as an `EventTarget` mixed with an `Element`, so it's accepted. If you wrote `e.relatedTarget.id` without the null check, you'd get `'e.relatedTarget' is possibly 'null'`, which is right: tabbing out of the window produces exactly that.
+
+> 💡 **Tip.** Prefer `onFocus` and `onBlur` over the DOM's `focusin`/`focusout` in React: React's versions bubble, which is what makes the "focus left the whole group" check above possible.
+
+## 51.9 target vs currentTarget in React
+
+This is the bug from the opening. Every event has two references. **`currentTarget`** is the element your handler is attached to, and it is the one TypeScript types precisely (`EventTarget & HTMLInputElement`). **`target`** is the element that was *actually* clicked or typed into, which might be a descendant, so TypeScript can only call it a plain `EventTarget`.
+
+```tsx
+function handleClick(e: React.MouseEvent<HTMLDivElement>) {
+  e.currentTarget.id;    // ✅ HTMLDivElement: the div I attached this to
+  e.target.id;           // ❌ Property 'id' does not exist on type 'EventTarget'.
+
+  // To use target, narrow it first:
+  if (e.target instanceof HTMLButtonElement) {
+    e.target.disabled;   // ✅ now it's known to be a button
+  }
+}
+
+<div onClick={handleClick}>
+  <button>Ok</button> {/* click here: target is the button, currentTarget is the div */}
+</div>;
+```
+
+For `ChangeEvent`, the library types `target` as the same element as `currentTarget` for convenience, so `e.target.value` happens to compile on an input. But that convenience is exactly what hid the bug in the opening story: move the handler to a wrapper and `target` is still *typed* as the input while *really* being something else. Reading `currentTarget` is always the safer habit.
+
+| Property | What it is | Typed as |
+|---|---|---|
+| `currentTarget` | Element the handler is attached to | The `T` in `Event<T>` |
+| `target` | Element the user interacted with | `EventTarget` (narrow it before use) |
+
+> 🔗 **Connection.** The same distinction exists in the raw DOM ([Chapter 35](/chapter/35)). React's types simply bake the handler's element into `currentTarget`.
+
+## 51.10 Discovering event types
+
+You don't have to memorize any of this. The prop itself always knows its own type, so ask the editor. Hover the `onChange` attribute and you'll see its type; or extract it programmatically with `ComponentProps`, which is the most reliable method for custom components and unusual elements:
+
+```tsx
+import type { ComponentProps } from "react";
+
+type InputChange = ComponentProps<"input">["onChange"];
+// ChangeEventHandler<HTMLInputElement, HTMLInputElement> | undefined
+
+type InputChangeEvent = Parameters<NonNullable<InputChange>>[0];
+// ChangeEvent<HTMLInputElement, HTMLInputElement>
+
+type ButtonClick = NonNullable<ComponentProps<"button">["onClick"]>;
+// MouseEventHandler<HTMLButtonElement>
+
+type CardProps = ComponentProps<typeof TaskCard>;
+// …works for your own components too
+```
+
+A reliable workflow: write the handler **inline** first, hover the parameter to read its type, then extract the function and paste that type in. When a prop on a third-party component takes an event, `ComponentProps<typeof ThatComponent>["onSomething"]` gives you its exact type without reading its source.
+
+> 🌍 **Real world.** Design-system wrappers often declare `onChange: ComponentProps<"input">["onChange"]` so the wrapper accepts exactly what a native input would. [Chapter 50](/chapter/50) showed the more general `ComponentProps<"input">` extension.
+
+## Common mistakes
+
+> ⚠️ **Typing events as `any`.** `(e: any)` turns off all checking and lets `e.targt.value` through. Remove the annotation and let inline contextual typing work, or write the correct event type.
+
+> ⚠️ **Reading `target` when you mean `currentTarget`.** On bubbled events, `target` may be a child. If you need the element your handler is on, use `currentTarget`.
+
+> ⚠️ **Forgetting `preventDefault()` on forms.** TypeScript can't catch this, but a missing call reloads the page on submit. Make it the first line of every `onSubmit` handler.
+
+> ⚠️ **Over-annotating inline handlers.** `onChange={(e: React.ChangeEvent<HTMLInputElement>) => …}` repeats what TypeScript already knows, and if you ever change the element, the annotation lies.
+
+> ⚠️ **Casting `e.target as HTMLInputElement`.** It silences the error without checking anything. Use `currentTarget`, or narrow with `instanceof`.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** a handler is extracted from JSX, shared across elements, or passed as a prop. Annotate with the specific `React.<Kind>Event<Element>` type, or use the `…EventHandler<Element>` alias for variables and props.
+
+> 🚫 **When not to.** Don't annotate inline handlers; contextual typing does it for you. And don't build generic "any event" handler types (`(e: React.SyntheticEvent) => void`) when the specific type is available. You lose `e.key`, `e.currentTarget.value`, and the rest.
+
+## How it connects
+
+> 🔗 **Connection.** Event types are the bridge between the DOM chapters ([Chapter 35](/chapter/35)) and props design ([Chapter 50](/chapter/50)): a callback prop like `onSelect` is just a handler type. Next, [Chapter 52](/chapter/52) types the state those handlers update, and [Chapter 55](/chapter/55) shows how to replace many small handlers with dispatched actions.
+
+> 🌍 **Real world.** Libraries such as React Hook Form and Formik wrap these same event types. When their docs say `register` returns `onChange: ChangeHandler`, that's a thin layer over what you've just learned.
+
+## Exercises
+
+### Level 1 — Recall
+
+Write the type of the handler parameter for each of these (the element in the JSX and the event are given):
+
+1. `onClick` on a `<button>`
+2. `onChange` on a `<select>`
+3. `onChange` on a checkbox `<input>` (and which property do you read?)
+4. `onKeyDown` on a `<textarea>`
+5. `onSubmit` on a `<form>`
+6. `onBlur` on an `<input>`
+7. `onPointerDown` on a `<div>`
+8. `onChange` on a `<textarea>`
+
+### Level 2 — Application
+
+Implement keyboard shortcuts for TaskFlow's board: `n` opens the new-task form, `/` focuses the search box, and `Escape` closes the open panel. Use a `const` tuple of keys, a derived `ShortcutKey` union, a type guard, and a `Record<ShortcutKey, () => void>`. Adding a key without an action must not compile. Shortcuts must be ignored while an input has focus.
+
+### Level 3 — Challenge
+
+Write **one** change handler that serves several inputs of a settings form, using each input's `name` to update a typed state object:
+
+```ts
+type Settings = { displayName: string; email: string; itemsPerPage: number };
+```
+
+The handler must reject a `name` that isn't a key of `Settings`, and must not use `any`. Think about what to do with the `itemsPerPage` input, whose DOM value is a string.
+
+*Hint: a type guard `isSettingsKey(name: string): name is keyof Settings` is a good start.*
+
+### Level 4 — Real-world
+
+**Ticket TF-204: Remove `any` from the legacy form components.** Four components in `legacy/forms/` have handlers typed `(e: any)`.
+
+- Replace every `any`-typed handler with the correct React event type, or remove the annotation where contextual typing applies.
+- Replace each `e.target as HTMLInputElement` with `currentTarget` or an `instanceof` check.
+- The `tsc --noEmit` run passes with `noImplicitAny` on, and `grep -r "e: any" legacy/forms` returns nothing.
+- Write one short test per component that fires a change and a submit event and asserts the resulting state.
+
+## Key takeaways
+
+- React events are typed wrappers: `React.<Kind>Event<Element>`, where the element type decides what `currentTarget` is.
+- Inline handlers need no annotation. Extracted handlers need one: a parameter type or a `…EventHandler<Element>` alias.
+- Use `e.key` for keyboard shortcuts, and narrow it to your own union of supported keys.
+- `ChangeEvent` and `FocusEvent` each have element-specific properties (`value`, `checked`, `relatedTarget`) that TypeScript makes you handle honestly.
+- `currentTarget` is the element your handler is on and is typed precisely. `target` may be a descendant and is only an `EventTarget`.
+- When unsure, hover the prop or read `ComponentProps<"input">["onChange"]`.
+
+## What comes next
+
+Handlers exist to update state, and state has its own typing traps. The most common one is `const [user, setUser] = useState(null)`, where every later `setUser(data)` fails because TypeScript decided the state could only ever be `null`. [Chapter 52: Typing State: Modeling UI States](/chapter/52) shows how to tell it the truth.

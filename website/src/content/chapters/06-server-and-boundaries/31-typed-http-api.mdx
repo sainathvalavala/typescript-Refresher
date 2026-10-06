@@ -1,0 +1,565 @@
+> 📖 **The problem.** You inherit TaskFlow's backend: a single `server.ts`, 600 lines long. One route handler parses the body, checks the title, runs three SQL queries, applies the "max 500 open tasks per project" rule, formats dates, and sends the response, all in one function. To change the rule you have to read the SQL. To test the rule you have to start a server. And every response leaks a `deleted_at` column, because the handler sends database rows straight to the client.
+
+This chapter builds TaskFlow's HTTP API (project [P07](/projects/p07), version 1) the way production teams do: in **layers**, each with its own job and its own types. You'll see what HTTP actually delivers to a server, choose a framework, separate the types the outside world sees from the types your business logic uses, and connect everything with interfaces that make each layer replaceable.
+
+Here's the kind of code we're leaving behind:
+
+```ts
+// server.ts, line 212 of 600
+app.post("/tasks", async (req, res) => {
+  if (!req.body.title) return res.status(400).send("title required");           // validation
+  const open = db.prepare("SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND status != 'done'")
+    .get(req.body.projectId) as { n: number };                                    // data access
+  if (open.n >= 500) return res.status(409).send("too many tasks");               // business rule
+  db.prepare("INSERT INTO tasks VALUES (?, ?, ?, ?)").run(/* … */);               // more data access
+  res.json(db.prepare("SELECT * FROM tasks WHERE id = ?").get(id));               // raw row to client
+});
+```
+
+One deliberate gap remains when we're done: the API will **trust `req.body`**. Keep an eye on it. [Chapter 32](/chapter/32) exists to break it.
+
+> 🧠 **Mental model.** *Layers with typed seams.* **Routes** speak HTTP. **Services** speak business rules. **Repositories** speak storage. Each layer has its own types, and the places where one layer hands data to the next (the seams) are exactly where those types change. Types make the seams visible.
+
+## 31.1 HTTP from first principles
+
+Before reaching for a framework, look at what Node itself hands you. The built-in `node:http` module calls your function once per request with two objects: an `IncomingMessage` (the request) and a `ServerResponse` (what you write back). The crucial detail is the **body**: it isn't an object, or even a string. It's a **stream of bytes** that arrives in chunks, and it's your job to collect and interpret them.
+
+```ts
+import { createServer, type IncomingMessage } from "node:http";
+
+async function readBody(req: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(chunk); // bytes, arriving over the network
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+const server = createServer(async (req, res) => {
+  if (req.method === "POST" && req.url === "/tasks") {
+    const text = await readBody(req);   // text: string, maybe JSON, maybe not
+    const body = JSON.parse(text);      // body: any. TypeScript has no idea what the client sent
+    res.writeHead(201, { "content-type": "application/json" });
+    res.end(JSON.stringify({ received: body }));
+    return;
+  }
+  res.writeHead(404).end();
+});
+
+server.listen(3000);
+```
+
+Everything a framework does for you is visible here in miniature: matching the method and URL to a handler, turning bytes into a value, and setting a status code and headers. Notice what *isn't* here: nothing in HTTP knows about a `Task` or a `User`. A client can send any bytes it likes:
+
+```sh
+curl -X POST localhost:3000/tasks -H 'content-type: application/json' -d '{"title":"Write docs"}'
+curl -X POST localhost:3000/tasks -H 'content-type: application/json' -d '{"title":42}'
+curl -X POST localhost:3000/tasks -d 'this is not json at all'   # 💥 JSON.parse throws
+```
+
+Hold on to that picture. Every typed request in this chapter is a *description* layered on top of bytes from a stranger.
+
+## 31.2 Choosing a framework
+
+Writing routing, body parsing, and error handling by hand for every endpoint gets old quickly, so real APIs use a framework. Three are worth knowing:
+
+| Framework | Strengths | How it types the request body |
+|---|---|---|
+| **Express** | The most widely used Node framework; huge ecosystem; every tutorial and job uses it | `req.body` is `any` unless you annotate it, and annotating checks nothing |
+| **Fastify** | Fast, plugin-based, schema-driven | Route schemas can generate both validation and types |
+| **Hono** | Small, modern, runs on Node, Bun, Deno, and edge platforms | Typed routes and validator middleware; types flow to a typed client |
+
+This book uses **Express 5**. It's what you'll meet in most existing codebases, and its biggest weakness, the untyped body, is precisely the lesson of the next chapter. The type-first frameworks solve the same problem with the same idea you'll learn there (schemas), so nothing here is wasted if your team picks one of them.
+
+```sh
+npm install express
+npm install --save-dev @types/express
+```
+
+```ts
+// src/app.ts
+import express from "express";
+
+const app = express();
+app.use(express.json()); // parses JSON bodies into req.body
+
+app.post("/tasks", (req, res) => {
+  const title = req.body.title.toUpperCase(); // ✅ compiles: req.body is any, so anything goes
+  res.status(201).json({ title });
+});
+
+app.listen(3000);
+```
+
+That line compiles even if the client sent `{ "title": 42 }`, in which case it crashes. Express parsed the bytes into a value, but it has no way to know what shape that value should have.
+
+> 🆕 **Modern note.** Express 5 forwards errors thrown inside `async` handlers to its error handling automatically. In Express 4 an unawaited rejection could hang the request, so older codebases wrap every handler in an `asyncHandler` helper. You won't need one here.
+
+## 31.3 API models and DTOs
+
+The most important design decision in an API is realizing that **one concept needs several types**. Your business logic wants a `Task` with real `Date` objects. A client creating a task can't send an `id` (the server assigns it) or a `createdAt`. A client reading a task receives dates as strings, because JSON has no date type, and must never see internal fields such as `deletedAt`.
+
+The types that describe what crosses the wire are called **DTOs** (Data Transfer Objects). The type your business logic uses is the **domain type**.
+
+```ts
+// src/domain/task.ts: the domain type, used by services
+export type TaskStatus = "todo" | "doing" | "done";
+export type Priority = "low" | "medium" | "high";
+
+export interface Task {
+  id: string;
+  projectId: string;
+  title: string;
+  status: TaskStatus;
+  priority: Priority;
+  dueDate: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+  deletedAt: Date | null; // soft delete: internal only
+}
+```
+
+The DTOs are derived from it with the utility types from [Chapter 21](/chapter/21), so a change to `Task` flows through to them automatically:
+
+```ts
+// src/http/dto.ts: what the outside world sends and receives
+import type { Task, Priority } from "../domain/task.js";
+
+export type CreateTaskRequest = Pick<Task, "projectId" | "title"> & {
+  priority?: Priority;  // optional: the server defaults it
+  dueDate?: string;     // "2026-10-31": JSON has no Date
+};
+
+export type UpdateTaskRequest = Partial<Pick<Task, "title" | "priority">> & { dueDate?: string | null };
+
+export type TaskResponse = Omit<Task, "dueDate" | "createdAt" | "updatedAt" | "deletedAt"> & {
+  dueDate: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+```
+
+Converting between them is a **mapper** function. Write it out field by field; it's the one place where boring code is the safe code:
+
+```ts
+export function toTaskResponse(task: Task): TaskResponse {
+  return {
+    id: task.id,
+    projectId: task.projectId,
+    title: task.title,
+    status: task.status,
+    priority: task.priority,
+    dueDate: task.dueDate ? task.dueDate.toISOString().slice(0, 10) : null,
+    createdAt: task.createdAt.toISOString(),
+    updatedAt: task.updatedAt.toISOString(),
+  };
+}
+```
+
+> ⚠️ **Common mistake.** Writing `return { ...task, dueDate: …, createdAt: …, updatedAt: … }` compiles, because TypeScript's excess-property check doesn't apply to spread properties. At runtime, `deletedAt` (and any field added to `Task` later) silently leaks into every response.
+
+## 31.4 Typing requests and responses
+
+A request has four parts a handler cares about: **route params** (`/tasks/:id`), the **query string** (`?status=todo`), the **body**, and, on the way out, the **status code** and response body. Express's `Request` and `Response` types are generics with slots for each: `Request<Params, ResBody, ReqBody, Query>` and `Response<ResBody>`.
+
+Route params are the pleasant surprise. Express's types read the path string with template literal types ([Chapter 24](/chapter/24)) and infer the params for you:
+
+```ts
+router.get("/tasks/:id", (req, res) => {
+  req.params.id;     // string, inferred from ":id" in the path
+  req.params.taskId; // ❌ Property 'taskId' does not exist on type '{ id: string; }'.
+});
+```
+
+Typing the **response** is genuinely useful: annotate `res` with `Response<TaskResponse>` and every `res.json(…)` call is checked against your DTO.
+
+```ts
+router.get("/tasks/:id", async (req, res: Response<TaskResponse>) => {
+  const task = await service.getTask(req.params.id);
+  res.json(toTaskResponse(task));                          // ✅
+  res.json({ id: task.id, titel: task.title });            // ❌ Object literal may only specify known properties, but 'titel' does not exist in type 'TaskResponse'. Did you mean to write 'title'?
+});
+```
+
+Typing the **body** looks just as useful, and that's the trap. The third slot of `Request` is a *claim*: "assume the body has this shape". Nothing checks it.
+
+```ts
+router.post(
+  "/tasks",
+  async (req: Request<{}, TaskResponse, CreateTaskRequest>, res: Response<TaskResponse>) => {
+    const task = await service.createTask(req.body); // req.body: CreateTaskRequest ... allegedly
+    res.status(201).location(`/tasks/${task.id}`).json(toTaskResponse(task));
+  },
+);
+
+router.delete("/tasks/:id", async (req, res) => {
+  await service.deleteTask(req.params.id);
+  res.status(204).end(); // 204 No Content: success with no body
+});
+```
+
+**Query strings** deserve suspicion of their own. Every value is text, a repeated key (`?status=todo&status=done`) becomes an array, and Express types `req.query` as a nested `ParsedQs` structure. Never annotate it as `{ page: number }`. Pull out strings explicitly:
+
+```ts
+function queryString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined; // ignores arrays and nested objects
+}
+
+router.get("/tasks", async (req, res: Response<TaskResponse[]>) => {
+  const status = queryString(req.query.status);           // string | undefined, still unchecked text
+  const page = Number(queryString(req.query.page) ?? "1"); // number, possibly NaN
+  const tasks = await service.listTasks({ status, page });
+  res.json(tasks.map(toTaskResponse));
+});
+```
+
+The status codes TaskFlow uses are the standard ones: `200` OK, `201` Created (with a `Location` header), `204` No Content, `400` Bad Request, `404` Not Found, `409` Conflict, and `500` for bugs. [Chapter 33](/chapter/33) makes choosing between them systematic.
+
+## 31.5 Service layer
+
+The **service layer** is where business rules live, written as plain typed functions or classes that know nothing about HTTP. No `req`, no `res`, no status codes. A service takes domain inputs, applies rules, uses a repository to load and save, and returns domain types.
+
+Why insist on "no HTTP inside"? Because the same rule ("a project can have at most 500 open tasks") must hold whether the task arrives through the API, a CSV import CLI, or a background job. And because a plain function can be tested with a plain function call.
+
+```ts
+// src/services/task-service.ts
+import { randomUUID } from "node:crypto";
+import type { Task, TaskStatus, Priority } from "../domain/task.js";
+import type { TaskRepository } from "../repositories/task-repository.js";
+
+export type NewTask = { projectId: string; title: string; priority?: Priority; dueDate?: string };
+
+const NEXT_STATUSES: Record<TaskStatus, readonly TaskStatus[]> = {
+  todo: ["doing"],
+  doing: ["todo", "done"],
+  done: ["doing"],
+};
+const MAX_OPEN_TASKS = 500;
+
+export class TaskService {
+  private readonly tasks: TaskRepository;
+  private readonly now: () => Date;
+
+  constructor(tasks: TaskRepository, now: () => Date = () => new Date()) {
+    this.tasks = tasks;
+    this.now = now; // injectable clock: tests control time
+  }
+
+  async createTask(input: NewTask): Promise<Task> {
+    const title = input.title.trim();
+    if (title === "") throw new Error("Title must not be empty");
+    if ((await this.tasks.countOpen(input.projectId)) >= MAX_OPEN_TASKS) {
+      throw new Error(`Project ${input.projectId} already has ${MAX_OPEN_TASKS} open tasks`);
+    }
+    const now = this.now();
+    const task: Task = {
+      id: randomUUID(), projectId: input.projectId, title, status: "todo",
+      priority: input.priority ?? "medium",
+      dueDate: input.dueDate ? new Date(input.dueDate) : null,
+      createdAt: now, updatedAt: now, deletedAt: null,
+    };
+    await this.tasks.insert(task);
+    return task;
+  }
+```
+
+Reading a task and moving it through its lifecycle complete the class. Each method enforces one rule and says nothing about how the request arrived:
+
+```ts
+  async getTask(id: string): Promise<Task> {
+    const task = await this.tasks.findById(id);
+    if (!task) throw new Error(`Task ${id} not found`); // Chapter 33 turns this into a real domain error
+    return task;
+  }
+
+  async transition(id: string, to: TaskStatus): Promise<Task> {
+    const task = await this.getTask(id);
+    if (!NEXT_STATUSES[task.status].includes(to)) {
+      throw new Error(`Cannot move a task from ${task.status} to ${to}`);
+    }
+    const updated: Task = { ...task, status: to, updatedAt: this.now() };
+    await this.tasks.update(updated);
+    return updated;
+  }
+}
+```
+
+With the rules out of the handler, testing them takes no server, no network, and no database:
+
+```ts
+// src/services/task-service.test.ts
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { TaskService } from "./task-service.js";
+import { InMemoryTaskRepository } from "../repositories/in-memory-task-repository.js";
+
+test("new tasks start in todo with a trimmed title and default priority", async () => {
+  const service = new TaskService(new InMemoryTaskRepository(), () => new Date("2026-10-01T09:00:00Z"));
+  const task = await service.createTask({ projectId: "p1", title: "  Write docs  " });
+  assert.equal(task.title, "Write docs");
+  assert.equal(task.status, "todo");
+  assert.equal(task.priority, "medium");
+});
+```
+
+The route handler shrinks to three steps: read the request, call the service, map the result to a response. Any handler longer than that is hiding a business rule.
+
+## 31.6 Repository pattern
+
+A **repository** is an object whose only job is to store and retrieve domain objects. The service depends on an *interface* describing what it needs, not on any particular database. That interface is the seam between business rules and storage:
+
+```ts
+// src/repositories/task-repository.ts
+import type { Task, TaskStatus } from "../domain/task.js";
+
+export interface TaskFilter {
+  projectId?: string;
+  status?: TaskStatus;
+}
+
+export interface TaskRepository {
+  findById(id: string): Promise<Task | undefined>;
+  list(filter: TaskFilter): Promise<Task[]>;
+  countOpen(projectId: string): Promise<number>;
+  insert(task: Task): Promise<void>;
+  update(task: Task): Promise<void>;
+}
+```
+
+Every method returns a `Promise`, even though the first implementation below is a plain `Map`. The interface is shaped for the *slowest* storage you'll ever plug in, so swapping implementations never changes the service.
+
+```ts
+// src/repositories/in-memory-task-repository.ts
+import type { Task } from "../domain/task.js";
+import type { TaskFilter, TaskRepository } from "./task-repository.js";
+
+export class InMemoryTaskRepository implements TaskRepository {
+  private readonly byId = new Map<string, Task>();
+
+  async findById(id: string): Promise<Task | undefined> {
+    const task = this.byId.get(id);
+    return task && !task.deletedAt ? task : undefined;
+  }
+  async list(filter: TaskFilter): Promise<Task[]> {
+    return [...this.byId.values()].filter(
+      (t) => !t.deletedAt && (!filter.projectId || t.projectId === filter.projectId) && (!filter.status || t.status === filter.status),
+    );
+  }
+  async countOpen(projectId: string): Promise<number> {
+    return (await this.list({ projectId })).filter((t) => t.status !== "done").length;
+  }
+  async insert(task: Task): Promise<void> { this.byId.set(task.id, task); }
+  async update(task: Task): Promise<void> { this.byId.set(task.id, task); }
+}
+```
+
+`implements TaskRepository` asks the compiler to verify the class against the interface ([Chapter 15](/chapter/15)): forget a method, or return the wrong type, and the class itself is flagged. The layers then meet in exactly one place, the **composition root**, where concrete implementations are chosen:
+
+```ts
+// src/main.ts
+import express from "express";
+import { InMemoryTaskRepository } from "./repositories/in-memory-task-repository.js";
+import { TaskService } from "./services/task-service.js";
+import { taskRoutes } from "./http/task-routes.js";
+
+const service = new TaskService(new InMemoryTaskRepository()); // swap for SQLite here, and only here
+const app = express();
+app.use(express.json());
+app.use("/v1", taskRoutes(service));
+app.listen(3000);
+```
+
+## 31.7 Database types
+
+A database row is a third shape of the same concept. SQL columns are conventionally `snake_case`, SQLite stores dates as text, and nullable columns come back as `null`. The table definition is the real source of truth for that shape; this is what **schema-first** means:
+
+```sql
+CREATE TABLE tasks (
+  id          TEXT PRIMARY KEY,
+  project_id  TEXT NOT NULL,
+  title       TEXT NOT NULL,
+  status      TEXT NOT NULL CHECK (status IN ('todo', 'doing', 'done')),
+  priority    TEXT NOT NULL DEFAULT 'medium',
+  due_date    TEXT,           -- 'YYYY-MM-DD' or NULL
+  created_at  TEXT NOT NULL,  -- ISO timestamp
+  updated_at  TEXT NOT NULL,
+  deleted_at  TEXT
+);
+```
+
+Give the row its own type, and convert between rows and domain objects in one pair of mapper functions. The rest of the application never sees a row:
+
+```ts
+// src/repositories/task-row.ts
+import type { Task, TaskStatus, Priority } from "../domain/task.js";
+
+export interface TaskRow {
+  id: string; project_id: string; title: string; status: TaskStatus; priority: Priority;
+  due_date: string | null; created_at: string; updated_at: string; deleted_at: string | null;
+}
+
+export function rowToTask(row: TaskRow): Task {
+  return {
+    id: row.id, projectId: row.project_id, title: row.title, status: row.status, priority: row.priority,
+    dueDate: row.due_date ? new Date(row.due_date) : null,
+    createdAt: new Date(row.created_at), updatedAt: new Date(row.updated_at),
+    deletedAt: row.deleted_at ? new Date(row.deleted_at) : null,
+  };
+}
+```
+
+Node 22 ships a built-in SQLite driver, `node:sqlite` (still marked experimental, so it prints a warning). Look closely at what its query methods return: a generic record, because the driver has no idea what your table contains.
+
+```ts
+// src/repositories/sqlite-task-repository.ts (excerpt)
+import { DatabaseSync } from "node:sqlite";
+import { rowToTask, type TaskRow } from "./task-row.js";
+
+export class SqliteTaskRepository implements TaskRepository {
+  private readonly db: DatabaseSync;
+  constructor(path: string) { this.db = new DatabaseSync(path); }
+
+  async findById(id: string): Promise<Task | undefined> {
+    const row = this.db.prepare("SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL").get(id);
+    // row: Record<string, SQLOutputValue> | undefined
+    return row ? rowToTask(row as TaskRow) : undefined; // trusted: we own this schema (Chapter 32 revisits)
+  }
+  // list, countOpen, insert, update follow the same pattern
+}
+```
+
+That `as TaskRow` is a deliberate, documented trust decision: your own database, with a schema you control and a `CHECK` constraint on `status`. It's still an assertion, and keeping it inside one file is what makes it manageable.
+
+A **TS-first query layer** goes further by describing your tables as types, so the queries themselves are checked. With Kysely, for example, a typo in a table, a column, or a value is a compile error:
+
+```ts
+import type { Kysely } from "kysely";
+
+interface Database { tasks: TaskRow } // often generated from the live schema by a tool
+declare const db: Kysely<Database>;
+
+const row = await db.selectFrom("tasks").selectAll().where("id", "=", "t1").executeTakeFirst();
+// row: TaskRow-shaped | undefined, with no cast anywhere
+
+db.selectFrom("taks");
+// ❌ Argument of type '"taks"' is not assignable to parameter of type 'TableExpressionOrList<Database, never>'.
+db.selectFrom("tasks").selectAll().where("status", "=", "archived");
+// ❌ Argument of type '"archived"' is not assignable to parameter of type 'OperandValueExpressionOrList<Database, "tasks", "status">'.
+```
+
+> 🌍 **Real world.** Kysely (a typed SQL query builder) and Drizzle (tables declared in TypeScript, with migrations generated from them) are the common TypeScript-first choices; Prisma generates types from its own schema file. All three put the row types in one place and keep `as` out of your repositories.
+
+## 31.8 API contracts
+
+An API's **contract** is everything a client may rely on: the endpoints, the request and response shapes, the status codes, and the error format. Writing it down turns "whatever the code happens to do" into a promise you can review, test, and keep.
+
+| Method and path | Request body | Success | Failures |
+|---|---|---|---|
+| `GET /v1/tasks` | none (query: `status`, `page`) | `200` `TaskResponse[]` | `400` |
+| `GET /v1/tasks/:id` | none | `200` `TaskResponse` | `404` |
+| `POST /v1/tasks` | `CreateTaskRequest` | `201` `TaskResponse` | `400`, `409` |
+| `POST /v1/tasks/:id/transitions` | `{ to: TaskStatus }` | `200` `TaskResponse` | `400`, `404`, `409` |
+| `DELETE /v1/tasks/:id` | none | `204` | `404` |
+
+The `/v1` prefix is **versioning**. Once clients depend on the contract, some changes are safe and some are breaking:
+
+```ts
+// ✅ Non-breaking: adding an optional request field or a new response field
+type TaskResponseV1_1 = TaskResponse & { tags: string[] };
+
+// ❌ Breaking: renaming, removing, or changing the type of a field clients read
+type TaskResponseBroken = Omit<TaskResponse, "dueDate"> & { due: string | null };
+// Every client reading task.dueDate now gets undefined. This needs /v2, not a quiet deploy.
+```
+
+Because the DTOs are TypeScript types, a TypeScript client can import them instead of retyping them by hand. Expose them through a small **contract module** that contains only type-only exports. Those erase completely, so a client that imports the contract pulls in zero server code:
+
+```ts
+// contract/tasks.ts: the API's public types, shared with every TypeScript client
+export type { TaskStatus, Priority } from "../src/domain/task.js";
+export type { CreateTaskRequest, UpdateTaskRequest, TaskResponse } from "../src/http/dto.js";
+
+// client/api.ts (P08, the typed API client)
+import type { TaskResponse } from "../contract/tasks.js";
+
+async function getTask(id: string): Promise<TaskResponse> {
+  const res = await fetch(`/v1/tasks/${id}`);
+  return res.json(); // ⚠️ the client trusts the server exactly as the server trusts the client
+}
+```
+
+Shared types keep both sides *in agreement at compile time*. They still don't check a single byte at runtime, in either direction. [Chapter 94](/chapter/94) turns the contract module into a proper package in a monorepo, and [Chapter 32](/chapter/32) makes it enforceable.
+
+## Common mistakes
+
+> ⚠️ **Leaking database rows into responses.** Sending a row (or spreading a domain object) exposes internal columns and couples every client to your storage. Always map to a response DTO.
+
+> ⚠️ **Business logic in route handlers.** If a rule lives in a handler, the CLI import and the background job will skip it. Handlers parse, call a service, and map. Nothing else.
+
+> ⚠️ **One type for everything.** Using `Task` as the request body, the response, and the row means a client can "send" an `id`, dates are wrongly typed as `Date` on the wire, and a column rename breaks the public API.
+
+> ⚠️ **Trusting `req.body`.** `Request<{}, TaskResponse, CreateTaskRequest>` is an annotation, not a check. This chapter left it in **on purpose**; [Chapter 32](/chapter/32) shows what it costs.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** an API has more than a handful of endpoints, more than one entry point (HTTP plus CLI or jobs), more than one developer, or a future. The layers pay for themselves the first time you write a service test without a server, or swap storage without touching a route.
+
+> 🚫 **When not to.** A three-endpoint prototype, a webhook receiver, or a demo can be a single file. Add a repository interface when you actually need a second implementation (tests count). Don't build `ITaskRepositoryFactoryProvider` on day one: every layer you add is code someone must read.
+
+## How it connects
+
+> 🔗 **Connection.** The DTOs are built with `Pick`, `Omit`, and `Partial` from [Chapter 21](/chapter/21); route-param inference uses template literal types from [Chapter 24](/chapter/24); `implements` and classes come from [Chapter 15](/chapter/15); the domain types and transition rules echo project [P02](/projects/p02). The Node setup is from [Chapter 30](/chapter/30). Next, [Chapter 32](/chapter/32) attacks the trusted `req.body`, and [Chapter 33](/chapter/33) replaces the plain `Error`s thrown by the service with errors that map to the right status codes.
+
+> 🌍 **Real world.** "Routes, services, repositories" (sometimes called controllers, use cases, and data access) is the default architecture of most production Node APIs, whatever the framework. Mature teams also publish an OpenAPI document for the contract, often generated from the same schemas they validate with.
+
+## Exercises
+
+### Level 1 — Recall
+
+Write `CreateTaskRequest` and `TaskResponse` DTOs derived from this `Task` type using utility types, so that a client can't send `id` or `createdAt`, and a response never includes `internalNotes`:
+
+```ts
+interface Task {
+  id: string; title: string; status: "todo" | "doing" | "done";
+  dueDate: Date | null; createdAt: Date; internalNotes: string;
+}
+```
+
+Then explain, in one sentence each, why `dueDate` has a different type in the response than in `Task`.
+
+### Level 2 — Application
+
+Implement `TaskService` with `createTask`, `getTask`, `listTasks`, and `transition`, backed by `InMemoryTaskRepository`. Write unit tests (with `node:test`) for the default priority, the trimmed title, the 500-open-tasks limit, and an illegal transition from `todo` to `done`. The tests must not import Express.
+
+### Level 3 — Challenge
+
+Write `SqliteTaskRepository` using `node:sqlite`, then switch the composition root to use it. Your diff must not touch any file in `services/` or `http/`, and the Level 2 tests must still pass against the in-memory repository.
+
+*Hint: create the table in the repository's constructor with `CREATE TABLE IF NOT EXISTS`, and keep every row-to-domain conversion in `task-row.ts`.*
+
+### Level 4 — Real-world
+
+**Ticket TF-231: List endpoint with pagination, filtering, and sorting.** The web app's task list needs to handle projects with thousands of tasks.
+
+- `GET /v1/tasks` accepts `status`, `projectId`, `sort` (`dueDate` or `createdAt`, optionally prefixed with `-` for descending), `page`, and `pageSize` (default 20, max 100).
+- The response is `{ items: TaskResponse[], page: number, pageSize: number, total: number }`, defined as a DTO in the contract module.
+- Query parameters are converted from strings in the route layer; the service and repository receive a typed `TaskQuery` object, never `req.query`.
+- Invalid values (such as `page=abc` or `sort=title`) produce `400`, documented in the contract table.
+
+## Key takeaways
+
+- HTTP delivers **bytes**. Every request type you write is a description layered over data from a stranger.
+- Express is ubiquitous, and its `req.body` is `any`. Annotating it is a claim, not a check.
+- One concept needs several types: the **domain type**, the **DTOs** on the wire, and the **database row**. Mappers convert between them; spreading objects across the seam leaks fields.
+- **Routes** speak HTTP, **services** hold business rules with no HTTP inside, **repositories** hide storage behind an interface. The composition root is the only place they meet.
+- Type the database schema once (row types, or a TS-first query layer) and keep any trusted assertions in one file.
+- A written, versioned contract, with shared types, keeps clients and server in agreement at compile time, but only at compile time.
+
+## What comes next
+
+Your API is cleanly layered and fully typed. Now send it this:
+
+```sh
+curl -X POST localhost:3000/v1/tasks -H 'content-type: application/json' \
+  -d '{ "title": 42, "priority": "urgent!!" }'
+```
+
+TypeScript said the body was a `CreateTaskRequest`. The network disagreed, and nothing stood between them. [Chapter 32: Runtime Safety: Trust Nothing at the Boundary](/chapter/32) is about that gap, and it's the most important chapter in Book One.

@@ -1,0 +1,421 @@
+> 📖 **The problem.** A colleague who uses a screen reader records a session on the TaskFlow board and sends you the audio. You expected to hear "Fix login bug, in progress, button." What you hear is: "clickable. clickable. clickable. clickable." Every card is a `div` with an `onClick`, so the screen reader has nothing to say about it: not a name, not a role, not a hint that it can be activated. She can't tab to a card, can't press Enter on one, and has no idea there is a board at all. The page looks perfect and works for nobody who isn't holding a mouse.
+
+This chapter is about building interfaces that work for **everyone who uses them**: people on keyboards, screen readers, voice control, switch devices, small screens in bright sunlight, and people with a broken arm. It's less work than it sounds, because the browser already does most of it **if you use the right elements**. You'll learn the order of operations: semantic HTML first, then keyboard support, then focus management, and ARIA only where HTML runs out. You'll also learn how to test it, because "I think it's accessible" is not a measurement.
+
+> 🧠 **Mental model.** **Accessibility is correctness for every user.** Start with semantic HTML (it's accessible for free), then add keyboard support, focus management, and ARIA **only where HTML runs out**. Every `div` pretending to be a control is a bug you wrote by hand.
+
+## 73.1 Why accessibility is a requirement
+
+Accessibility (often shortened to **a11y**: "a", eleven letters, "y") means that people with disabilities can perceive, operate, and understand your interface. Three arguments make it a requirement rather than a nice-to-have.
+
+**Users.** Roughly one in six people lives with a significant disability, and many more have *temporary* ones (a broken wrist) or *situational* ones (a phone in glare, a noisy train, one hand holding a baby). Features built for permanent needs help all of them: captions, keyboard shortcuts, high contrast, large tap targets.
+
+**Law and contracts.** Many countries require accessible public-facing software: the Americans with Disabilities Act is applied to websites in US courts, and the European Accessibility Act has applied to many consumer products and services in the EU since June 2025. Buyers often write the **Web Content Accessibility Guidelines (WCAG)** level AA into contracts. WCAG 2.2 is the current standard, organized around four principles: content must be **perceivable, operable, understandable, and robust**.
+
+**Quality.** Accessible interfaces tend to be better interfaces. Labeled controls are easier to test, semantic markup is easier to maintain, and keyboard support is the same logic power users want.
+
+```tsx
+// What the opening recording heard. Nothing about this is announced as a control.
+function TaskCard({ task, onOpen }: { task: Task; onOpen: (id: string) => void }) {
+  return (
+    <div className="card" onClick={() => onOpen(task.id)}>
+      {task.title}
+    </div>
+  );
+}
+```
+
+> 🌍 **Real world.** WCAG conformance is graded as A, AA, or AAA. **AA** is the practical target and the usual legal benchmark. AAA is aspirational for specific content, not a whole-site requirement.
+
+## 73.2 Semantic HTML first
+
+**Semantic HTML** means choosing the element that *describes what something is*. A `<button>` isn't just a rectangle that reacts to clicks: the browser gives it a role ("button"), a place in the Tab order, activation by both Enter and Space, a disabled state, and focus styling. A `div` has none of that, and rebuilding it by hand takes about fifteen lines and you will still miss something.
+
+```tsx
+// ❌ A div that imitates a button: not focusable, no role, no keyboard activation
+<div className="btn" onClick={save}>Save</div>
+
+// ✅ The real thing: focusable, announced as "Save, button", Enter and Space work
+<button type="button" onClick={save}>Save</button>
+```
+
+The core rule of thumb: **links navigate, buttons act.** If activating it changes the URL, it's an `<a href>`. If it does something on the page (save, delete, open a menu), it's a `<button>`.
+
+Structure matters too. Screen reader users navigate by **landmarks** (regions of the page) and **headings**, the way sighted users scan visually:
+
+```tsx
+function AppShell({ children }: { children: React.ReactNode }) {
+  return (
+    <>
+      <a href="#main" className="skip-link">Skip to main content</a>
+      <header>
+        <nav aria-label="Primary">{/* links to Board, Projects, Settings */}</nav>
+      </header>
+      <main id="main">
+        <h1>Sprint board</h1>
+        <section aria-labelledby="doing-heading">
+          <h2 id="doing-heading">In progress</h2>
+          <ul>{/* each task is an <li> */}</ul>
+        </section>
+        {children}
+      </main>
+      <footer>TaskFlow</footer>
+    </>
+  );
+}
+```
+
+Use one `h1` per page and don't skip levels (`h2` then `h4`) just for the font size; that's what CSS is for. A list of cards is a `<ul>`, so a screen reader announces "list, 12 items". And the card from 73.1 becomes:
+
+```tsx
+<li className="card">
+  <button type="button" onClick={() => onOpen(task.id)}>{task.title}</button>
+</li>
+```
+
+> ⚠️ **Common mistake.** Putting a `<button>` inside an `<a>` (or the reverse) to get both styles. Interactive elements can't nest: the result is unpredictable focus and announcements. Pick one element and style it with CSS.
+
+## 73.3 Keyboard navigation
+
+Anyone who can't use a mouse must be able to do everything with a keyboard: **Tab** and **Shift+Tab** to move between controls, **Enter** and **Space** to activate, **arrow keys** inside composite widgets (tabs, menus, grids), and **Escape** to dismiss. Real buttons and links do the first three for free. Your job is to not break them, and to extend them where needed.
+
+Three rules prevent most keyboard bugs:
+
+1. **Keep the natural order.** Tab order follows the DOM. If the visual order needs to differ from the DOM order, fix the layout with CSS, but beware that CSS reordering (`order`, `flex-direction: row-reverse`, grid placement) separates what's seen from what's tabbed.
+2. **Never use a positive `tabIndex`.** `tabIndex={0}` joins the natural order and `tabIndex={-1}` makes an element focusable by code only. Anything above zero hijacks the whole page's order.
+3. **Never remove the focus outline without replacing it.** Use `:focus-visible`, which shows the ring for keyboard users and not for mouse clicks.
+
+```css
+/* ❌ Removes the only clue where a keyboard user is */
+button:focus { outline: none; }
+
+/* ✅ A clear ring for keyboard users, nothing extra for mouse users */
+:focus-visible { outline: 3px solid #1d4ed8; outline-offset: 2px; }
+```
+
+Composite widgets follow a convention: **one Tab stop for the widget**, then arrow keys move within it. The technique is the **roving tabindex**: only the active item has `tabIndex={0}`; the others have `-1`.
+
+```tsx
+import { useRef, useState, type KeyboardEvent } from "react";
+
+type Status = "todo" | "doing" | "done";
+
+export function StatusTabs({ statuses }: { statuses: Status[] }) {
+  const [active, setActive] = useState(0);
+  const buttons = useRef<(HTMLButtonElement | null)[]>([]);
+
+  function onKeyDown(e: KeyboardEvent<HTMLDivElement>) {
+    const last = statuses.length - 1;
+    let next = active;
+    if (e.key === "ArrowRight") next = active === last ? 0 : active + 1;
+    else if (e.key === "ArrowLeft") next = active === 0 ? last : active - 1;
+    else if (e.key === "Home") next = 0;
+    else if (e.key === "End") next = last;
+    else return;
+    e.preventDefault();
+    setActive(next);
+    buttons.current[next]?.focus();
+  }
+
+  return (
+    <div role="tablist" aria-label="Task status" onKeyDown={onKeyDown}>
+      {statuses.map((s, i) => (
+        <button
+          key={s} type="button" role="tab"
+          aria-selected={i === active}
+          tabIndex={i === active ? 0 : -1}
+          ref={(el) => { buttons.current[i] = el; }}
+          onClick={() => setActive(i)}
+        >{s}</button>
+      ))}
+    </div>
+  );
+}
+```
+
+Finally, give keyboard users a **skip link** (the first element in `AppShell` above) so they don't have to Tab through the whole navigation on every page.
+
+## 73.4 Focus management
+
+Keyboard users can only operate what has **focus**, so whenever your UI changes in a way that moves the user's context, *you* must move focus deliberately. Three situations come up constantly: opening and closing a dialog, navigating to a new route, and removing the thing that was focused.
+
+**Dialogs.** A modal must move focus into itself, keep Tab from escaping behind it, close on Escape, and put focus back on the control that opened it. The native `<dialog>` element does all four when you open it with `showModal()`, so prefer it to a hand-built focus trap. In React you reach the element through a ref ([Chapter 53](/chapter/53)):
+
+```tsx
+import { useEffect, useRef, type ReactNode } from "react";
+
+export function Modal({ open, onClose, title, children }: {
+  open: boolean; onClose: () => void; title: string; children: ReactNode;
+}) {
+  const ref = useRef<HTMLDialogElement>(null);
+
+  useEffect(() => {
+    const dialog = ref.current;
+    if (!dialog) return;
+    if (open && !dialog.open) dialog.showModal(); // traps focus, Escape closes, page behind is inert
+    if (!open && dialog.open) dialog.close();     // focus returns to the opener
+  }, [open]);
+
+  return (
+    <dialog ref={ref} onClose={onClose} aria-labelledby="modal-title">
+      <h2 id="modal-title">{title}</h2>
+      {children}
+      <button type="button" onClick={onClose}>Close</button>
+    </dialog>
+  );
+}
+```
+
+The `close` event fires when the user presses Escape, so `onClose` keeps your state in sync. If you can't use `<dialog>`, you need all four behaviors by hand (Level 3 exercise).
+
+**Route changes.** In a single-page app, clicking a link doesn't reload the page, so a screen reader announces nothing and focus stays on the old link. After navigation, move focus to the new page's heading. Give the heading `tabIndex={-1}` so it can receive focus from code without joining the Tab order:
+
+```tsx
+function ProjectsPage() {
+  const heading = useRef<HTMLHeadingElement>(null);
+  useEffect(() => { heading.current?.focus(); }, []);
+  return <h1 ref={heading} tabIndex={-1}>Projects</h1>;
+}
+```
+
+**After actions.** When the user deletes a task, the focused button disappears and focus falls back to the page body. Move it to something sensible, such as the next task or the list heading.
+
+> 💡 **Tip.** The `inert` attribute (supported as a boolean prop in React 19) makes a whole subtree unfocusable and invisible to assistive tech. It's the tool for "disable everything behind this panel".
+
+## 73.5 ARIA when needed
+
+**ARIA** (Accessible Rich Internet Applications) is a set of attributes that add roles, states, and properties to the accessibility tree: the structure the browser exposes to assistive technology. It adds *meaning only*; it adds no behavior. `role="button"` on a `div` makes a screen reader say "button", but the element still can't be focused or activated by keyboard.
+
+That's why the **first rule of ARIA** is: *if a native element does the job, use it.* Reach for ARIA for what HTML can't express: the **state** of a custom control, a **name** for an element with no visible text, or a **live announcement**.
+
+```tsx
+// An icon-only button needs a name
+<button type="button" aria-label="Delete task">
+  <TrashIcon aria-hidden="true" />
+</button>
+
+// A disclosure: state is communicated, and so is what it controls
+<button type="button" aria-expanded={open} aria-controls="filters">Filters</button>
+<div id="filters" hidden={!open}>…</div>
+
+// A toggle: "pressed" state
+<button type="button" aria-pressed={showDone} onClick={() => setShowDone(!showDone)}>Show done</button>
+```
+
+A **live region** announces changes the user didn't cause by focusing something, such as "Task saved" or "3 tasks match":
+
+```tsx
+<p role="status" aria-live="polite">{saving ? "Saving…" : `${count} tasks`}</p>
+```
+
+`polite` waits for a pause; `assertive` interrupts and should be rare. The live region element must exist in the page *before* its text changes.
+
+React's types check the ARIA attributes for you: they're declared in `AriaAttributes`, so a typo or a bad value is a compile error. Note that `role` is typed as a plain `string`, so it is **not** checked:
+
+```tsx
+<p aria-live="loud">…</p>  // ❌ Type '"loud"' is not assignable to type '"assertive" | "off" | "polite" | undefined'.
+<div role="banana" />       // ✅ compiles, and means nothing. Types can't save you here.
+```
+
+> ⚠️ **Common mistake.** Bad ARIA is worse than no ARIA. `aria-hidden="true"` on something focusable, `role="button"` on a `div` with no keyboard handling, and a stale `aria-label` that contradicts the visible text all make things worse for exactly the users ARIA is meant to help.
+
+## 73.6 Accessible forms and errors
+
+A form control needs a **programmatic label**, one the browser can connect to the input. Placeholder text is not a label: it disappears when typing starts and is often low-contrast. Connect a visible `<label>` with `htmlFor` and an id. In React, `useId` generates ids that are stable and unique, even if the component renders many times:
+
+```tsx
+import { useId } from "react";
+
+export function TextField({ label, error, ...props }: {
+  label: string; error?: string;
+} & React.InputHTMLAttributes<HTMLInputElement>) {
+  const id = useId();
+  const errorId = `${id}-error`;
+  return (
+    <div>
+      <label htmlFor={id}>{label}</label>
+      <input
+        id={id}
+        aria-invalid={error ? true : undefined}
+        aria-describedby={error ? errorId : undefined}
+        {...props}
+      />
+      {error && <p id={errorId} role="alert">{error}</p>}
+    </div>
+  );
+}
+```
+
+`aria-invalid` tells assistive tech the value is wrong, and `aria-describedby` links the error message so it is read right after the label. `role="alert"` announces the message the moment it appears.
+
+Errors have three rules. **Say what's wrong and how to fix it** ("Enter a date like 2026-03-14", not "Invalid"). **Don't rely on color alone**: pair a red border with text or an icon. And on submit, **move focus to the first invalid field**, or to an error summary at the top that links to each field:
+
+```tsx
+function onSubmit(e: React.SubmitEvent<HTMLFormElement>) {
+  e.preventDefault();
+  const errors = validate(values);
+  setErrors(errors);
+  if (Object.keys(errors).length > 0) {
+    e.currentTarget.querySelector<HTMLElement>("[aria-invalid='true']")?.focus();
+  }
+}
+```
+
+Also use the right `type` (`email`, `date`, `number`), the `autoComplete` attribute for known fields (`"email"`, `"current-password"`), and group related controls such as radio buttons in a `<fieldset>` with a `<legend>`. [Chapter 63](/chapter/63) and [Chapter 64](/chapter/64) cover the form state itself; this section is about how it is *exposed*.
+
+## 73.7 Color, motion, and preferences
+
+**Contrast.** WCAG AA requires a contrast ratio of at least **4.5:1** for normal text and **3:1** for large text (about 24px, or 19px bold) and for UI boundaries such as input borders and focus rings. Light-gray text on white is the most common failure. Browser devtools show the ratio when you inspect a color.
+
+**Color is never the only signal.** About one in twelve men has some color-vision deficiency. A "done" task shown only by a green dot is invisible to many people; add a check icon and the word "Done".
+
+```tsx
+const STATUS_LABEL: Record<Status, string> = { todo: "To do", doing: "In progress", done: "Done" };
+
+function StatusBadge({ status }: { status: Status }) {
+  return (
+    <span className={`badge badge-${status}`}>
+      {status === "done" && <CheckIcon aria-hidden="true" />}
+      {STATUS_LABEL[status]}
+    </span>
+  );
+}
+```
+
+**Motion.** Parallax, auto-playing carousels, and large sliding transitions can cause nausea or vertigo for people with vestibular disorders. Operating systems expose a **reduce motion** setting, which the browser reports through the `prefers-reduced-motion` media query. Respect it in CSS:
+
+```css
+.card { transition: transform 200ms ease; }
+
+@media (prefers-reduced-motion: reduce) {
+  .card { transition: none; }
+  * { scroll-behavior: auto !important; }
+}
+```
+
+When motion is driven from JavaScript, read the preference with a small hook. `useSyncExternalStore`, React's hook for subscribing to an outside source (the same synchronization idea as [Chapter 44](/chapter/44)), keeps it in sync if the user changes the setting while the page is open:
+
+```tsx
+import { useSyncExternalStore } from "react";
+
+const QUERY = "(prefers-reduced-motion: reduce)";
+
+function subscribe(onChange: () => void) {
+  const mq = window.matchMedia(QUERY);
+  mq.addEventListener("change", onChange);
+  return () => mq.removeEventListener("change", onChange);
+}
+
+export function usePrefersReducedMotion(): boolean {
+  return useSyncExternalStore(subscribe, () => window.matchMedia(QUERY).matches, () => false);
+}
+```
+
+Two more preferences: make sure the layout works at **200% zoom** and in a 320px-wide viewport without horizontal scrolling (use `rem` rather than `px` for text), and don't disable pinch-zoom with `user-scalable=no`.
+
+## 73.8 Testing accessibility
+
+No single tool proves a page is accessible. Automated checks catch a minority of problems (missing labels, bad contrast, invalid ARIA), so layer them and then do a short manual pass.
+
+**1. Lint rules.** `eslint-plugin-jsx-a11y` flags problems as you type: `onClick` on a `div`, missing `alt`, an invalid `role`.
+
+```js
+// eslint.config.js (flat config)
+import jsxA11y from "eslint-plugin-jsx-a11y";
+
+export default [
+  jsxA11y.flatConfigs.recommended,
+  // …your other config
+];
+```
+
+**2. Role-based queries.** Testing Library's `getByRole` finds elements the way assistive tech does, so a test that passes proves the element has the right role and name. If you can't find it by role, a screen reader can't either ([Chapter 68](/chapter/68)).
+
+```tsx
+test("the card is a button named after the task", async () => {
+  render(<TaskCard task={{ id: "t1", title: "Fix login bug" }} onOpen={onOpen} />);
+  await userEvent.click(screen.getByRole("button", { name: "Fix login bug" }));
+  expect(onOpen).toHaveBeenCalledWith("t1");
+});
+```
+
+**3. Automated audits.** The `axe-core` engine scans rendered DOM for WCAG violations. Run it in component tests (through `vitest-axe` or `jest-axe`) and in E2E tests against a real browser (`@axe-core/playwright`):
+
+```ts
+import AxeBuilder from "@axe-core/playwright";
+
+test("board has no detectable accessibility violations", async ({ page }) => {
+  await page.goto("/board");
+  const results = await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag22aa"]).analyze();
+  expect(results.violations).toEqual([]);
+});
+```
+
+**4. A manual pass.** Ten minutes per feature: put the mouse away and complete the task with Tab, Shift+Tab, Enter, Space, and Escape; zoom to 200%; turn on a screen reader (VoiceOver on macOS, NVDA on Windows) and listen to the page once with your eyes closed.
+
+> 🚫 **When not to.** Don't treat a clean axe report as "done". It can't tell whether a label makes sense, whether focus moves logically, or whether the experience is understandable. And don't bolt an "accessibility overlay" widget onto a site: it doesn't fix the underlying markup, and accessibility experts widely reject it.
+
+## Common mistakes
+
+> ⚠️ **Clickable divs.** Any `onClick` on a non-interactive element is a bug until proven otherwise. Use `button` or `a`.
+
+> ⚠️ **Removing focus outlines** with `outline: none` and no replacement.
+
+> ⚠️ **ARIA instead of HTML.** `role="button"` plus handlers for Enter and Space is a worse `<button>`.
+
+> ⚠️ **Placeholder as label**, and errors that only change a border color.
+
+> ⚠️ **Forgetting focus after dynamic changes**: routes, dialogs, deletions, and inserted content.
+
+> ⚠️ **Icon-only buttons with no name.** They are announced as just "button".
+
+## When to use it, and when not to
+
+> ✅ **Use it when** always. Accessibility isn't a feature you add late; it's what correct markup looks like. The cheapest moment to get it right is the first time you write the component.
+
+> 🚫 **When not to.** There's no "not" for the goal, but there are limits to the *means*: don't add ARIA where a native element exists, don't build custom widgets (comboboxes, date pickers) from scratch when a well-tested accessible library (React Aria, Radix, Headless UI) already solves the keyboard and ARIA contract.
+
+## How it connects
+
+> 🔗 **Connection.** Focus management uses refs ([Chapter 45](/chapter/45), [Chapter 53](/chapter/53)) and effects ([Chapter 44](/chapter/44)). Accessible forms build on [Chapter 63](/chapter/63). The role queries in testing are covered in [Chapter 68](/chapter/68), and lint and axe checks join your pipeline in [Chapter 76](/chapter/76).
+
+> 🌍 **Real world.** Design systems (GOV.UK, Adobe Spectrum, Shopify Polaris) publish their keyboard and ARIA behavior per component. Reading those specs is the fastest way to learn what "correct" looks like for a menu, tabs, or a combobox.
+
+## Exercises
+
+### Level 1 — Recall
+
+Here are five clickable `div`s from TaskFlow: "Save", "Delete", "Open project", "Filters" (toggles a panel), and "Back to board" (changes the page). Replace each with the correct element and attributes. Say which are links and which are buttons, and why.
+
+### Level 2 — Application
+
+Make the task board fully keyboard-operable. A user must be able to Tab to a card, press Enter to open it, move it to another column with a keyboard control (not drag-and-drop only), and see a visible focus ring throughout. Test it without touching the mouse.
+
+### Level 3 — Challenge
+
+Build an accessible modal **without** `<dialog>`: it must trap focus, close on Escape, return focus to the opener, and mark the page behind it `inert`. Write tests with Testing Library for each behavior.
+
+*Hint: store the previously focused element in a ref before opening.*
+
+### Level 4 — Real-world
+
+**Ticket TF-401: WCAG AA audit of TaskFlow Web.** Legal has asked for an accessibility statement.
+
+- Run `eslint-plugin-jsx-a11y` and axe on every route, and list the findings by severity.
+- Do a keyboard-only and a screen-reader pass of sign-in, board, and task creation, and record the issues.
+- Fix every critical issue (anything that blocks a task), and add axe checks to the E2E suite so they can't return.
+- Write a short report: what was found, what was fixed, and what remains.
+
+## Key takeaways
+
+- Accessibility is correctness for everyone: keyboard users, screen reader users, and people in difficult situations.
+- **Semantic HTML first.** Links navigate, buttons act. Use landmarks, headings, and lists.
+- Everything must work with a keyboard, with a visible focus ring, and no positive `tabIndex`.
+- Move focus deliberately: into dialogs, to the new page's heading, and after removals. `<dialog>` and `inert` do much of it for you.
+- ARIA adds meaning, not behavior. Use it only where HTML runs out, and wrong ARIA is worse than none.
+- Label every control, link errors with `aria-describedby`, and never rely on color alone. Respect `prefers-reduced-motion`.
+- Test in layers: lint, role queries, axe, and a manual keyboard and screen-reader pass.
+
+## What comes next
+
+An accessible interface is trustworthy to its users. Next we make sure it's also trustworthy to *attackers*: in [Chapter 74](/chapter/74) we treat the browser as enemy territory and look at XSS, tokens, and what must never be in your bundle.

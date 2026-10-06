@@ -1,0 +1,422 @@
+> 📖 **The problem.** TaskFlow gets a chat panel for each project. You write a `ProjectChat` component that connects to the chat server "when it mounts". In development, the server log shows two connections every time the panel opens. Close the panel and the connections stay open. Worse, switch from the "Website" project to "Mobile App" and the panel keeps showing Website's messages, because it never reconnected. Three bugs, one `useEffect`.
+
+Everything you've built so far lives *inside* React: state, props, JSX. Real apps also have to talk to things React doesn't control: a chat server, the browser tab's title, a timer, a `window` event, a map widget. `useEffect` is the hook for those conversations, and it's also the hook developers misuse most, mainly because they think of it as "code that runs on mount".
+
+This chapter replaces that idea with a sturdier one. By the end you'll be able to write effects with correct setup, cleanup, and dependencies; fetch data without race conditions; recognize the many cases where an effect is the wrong tool; and keep non-reactive logic out of your dependency arrays with `useEffectEvent`.
+
+> 🧠 **Mental model.** An effect is a **synchronization**: "while this component is on screen with these values, keep this external thing in sync." **Setup** starts syncing, **cleanup** stops it, and **dependencies** decide when to stop and start again.
+
+## 44.1 Effects are for synchronization
+
+An **external system** is anything React doesn't manage: a network connection, a browser API such as `document.title` or `localStorage`, a timer, a non-React widget. React renders your component and updates the DOM; an effect is how you keep one of those outside things matching what's on screen.
+
+The simplest real effect keeps the browser tab title in sync with the number of open tasks:
+
+```tsx
+import { useEffect } from "react";
+
+function TaskSummary({ openCount }: { openCount: number }) {
+  useEffect(() => {
+    document.title = `(${openCount}) TaskFlow`; // sync the outside world with our props
+  }, [openCount]);                               // ...whenever openCount changes
+
+  return <p>{openCount} tasks open</p>;
+}
+```
+
+Notice the wording: "keep the title equal to the count", not "set the title on mount and again on update". If you came from class components, you may think in **lifecycle** terms (mount, update, unmount). That framing spreads one idea across three places and invites bugs such as forgetting the "update" case, which is exactly what happened to `ProjectChat`:
+
+```tsx
+// 🕰 Lifecycle thinking (class components): three methods for one idea
+// componentDidMount()    { connect(this.props.projectId); }
+// componentDidUpdate(p)  { if (p.projectId !== this.props.projectId) { /* easy to forget! */ } }
+// componentWillUnmount() { disconnect(); }
+
+// 🧠 Synchronization thinking: one effect, written from the effect's point of view
+useEffect(() => {
+  const connection = connectToProjectChat(projectId); // start syncing with this project
+  return () => connection.disconnect();               // stop syncing with this project
+}, [projectId]);
+```
+
+An effect only ever does two things: **start** synchronizing and **stop** synchronizing. React decides when, based on what's on screen.
+
+## 44.2 Anatomy of an effect
+
+An effect has three parts. The **setup** function is the body you pass to `useEffect`; React runs it after committing a render to the screen. The **cleanup** function is what setup returns; React runs it before running setup again and when the component leaves the screen. The **dependency array** lists the values setup reads from the component; React compares them (with `Object.is`) after each render to decide whether to re-sync.
+
+Here is `ProjectChat` written correctly. The chat API is imaginary, but its shape (connect, listen, disconnect) is what every real one looks like:
+
+```tsx
+function ProjectChat({ projectId }: { projectId: string }) {
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+
+  useEffect(() => {
+    // SETUP: start synchronizing with this project's chat
+    const connection = connectToProjectChat(projectId);
+    connection.onMessage((m) => setMessages((prev) => [...prev, m]));
+
+    // CLEANUP: stop synchronizing with *this same* project
+    return () => connection.disconnect();
+  }, [projectId]); // DEPENDENCIES: re-sync whenever projectId changes
+
+  return <MessageList messages={messages} />;
+}
+
+// The parent resets the message list per project with a key (see 44.7):
+// <ProjectChat key={projectId} projectId={projectId} />
+```
+
+Follow it through a session. The cleanup always pairs with the setup that came before it:
+
+| What happens | React runs |
+|---|---|
+| Panel opens for "website" | setup(website) |
+| User switches to "mobile" | cleanup(website), then setup(mobile) |
+| Panel closes | cleanup(mobile) |
+
+The dependency array has three forms, and each one means something different:
+
+```tsx
+useEffect(() => { /* ... */ });              // no array: re-sync after EVERY render
+useEffect(() => { /* ... */ }, []);          // empty: sync once on mount, clean up on unmount
+useEffect(() => { /* ... */ }, [projectId]); // re-sync when projectId changes
+```
+
+> ⚠️ **Common mistake.** Reading `[]` as "run once" and treating that as a goal. An empty array is only correct when setup truly reads *no* props or state. `ProjectChat` with `[]` is how you get the "stuck on the previous project" bug.
+
+## 44.3 The dependency array
+
+You don't *choose* your dependencies. Your code does. Every **reactive value** that setup reads must be listed. A reactive value is anything that can change between renders: props, state, and every variable or function declared in the component body (because they're recomputed from props and state). Values that can't change don't need listing: module-level constants, state setter functions (React keeps them stable), and refs.
+
+```tsx
+const SERVER_URL = "wss://chat.taskflow.dev"; // outside the component: not reactive
+
+function ProjectChat({ projectId }: { projectId: string }) {
+  const [muted, setMuted] = useState(false);
+  const channel = `project:${projectId}`;  // computed from a prop: reactive
+
+  useEffect(() => {
+    const connection = connect(SERVER_URL, channel);
+    return () => connection.disconnect();
+  }, []); // ⚠️ React Hook useEffect has a missing dependency: 'channel'. Either include it or remove the dependency array.
+  // ...
+}
+```
+
+The `exhaustive-deps` lint rule from [Chapter 43](/chapter/43) reads your effect and reports what's missing. Treat it as the source of truth. If you don't *want* the effect to re-run for some value, the answer is never to delete that value from the array. Instead, change the code so the effect doesn't read it:
+
+```tsx
+useEffect(() => {
+  const channel = `project:${projectId}`;       // ✅ computed inside: only projectId is read
+  const connection = connect(SERVER_URL, channel);
+  return () => connection.disconnect();
+}, [projectId]);                                // ✅ honest and complete
+```
+
+Moving a value inside the effect, moving a constant outside the component, or using an effect event (44.8) are the three legitimate ways to change a dependency list.
+
+## 44.4 Cleanup
+
+The cleanup's job is to **undo whatever setup did**. If setup subscribes, cleanup unsubscribes. If setup starts a timer, cleanup clears it. If setup starts a request, cleanup aborts it. A good test: the user should not be able to tell "setup → cleanup → setup" apart from a single "setup".
+
+Here's a global keyboard shortcut for TaskFlow ("n" opens the new-task dialog). The listener must be removed with the *same function reference* that was added, which is easy when both live in one effect:
+
+```tsx
+function NewTaskShortcut({ onOpen }: { onOpen: () => void }) {
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.key === "n" && !e.metaKey && !e.ctrlKey) onOpen();
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown); // same reference ✅
+  }, [onOpen]);
+
+  return null;
+}
+```
+
+Timers follow the same shape. This one polls the server for new tasks every 30 seconds while the board is visible:
+
+```tsx
+useEffect(() => {
+  const id = setInterval(() => refreshTasks(projectId), 30_000);
+  return () => clearInterval(id); // without this, every project you visit keeps polling forever
+}, [projectId]);
+```
+
+Requests are the third kind: you'll see `controller.abort()` as a cleanup in 44.6. Some effects need no cleanup at all; setting `document.title` in 44.1 is safe to repeat, so there's nothing to undo.
+
+## 44.5 Strict Mode's double effect
+
+In development, when your app is wrapped in `<StrictMode>` (the Vite template does this in `main.tsx`), React deliberately runs every effect's setup, then its cleanup, then its setup again, right after a component first mounts. Your console shows something like this:
+
+```tsx
+useEffect(() => {
+  console.log("✅ connecting to", projectId);
+  const connection = connectToProjectChat(projectId);
+  return () => {
+    console.log("❌ disconnecting from", projectId);
+    connection.disconnect();
+  };
+}, [projectId]);
+
+// Development console with Strict Mode:
+//   ✅ connecting to website
+//   ❌ disconnecting from website
+//   ✅ connecting to website
+// Production: just one "connecting".
+```
+
+This is a **stress test**, not a bug. It simulates the component leaving and coming back, which happens for real when users navigate away and back, and when React 19.2's `<Activity>` hides a subtree (its effects are cleaned up) and shows it again (setup runs again). If your cleanup is missing or incomplete, the double run makes the problem visible immediately: that's the "two connections" in the opening story. With a correct cleanup, the user can't tell the difference.
+
+> ⚠️ **Common mistake.** "Fixing" the double run with a guard such as `if (didConnect.current) return;`. That hides the missing cleanup in development, and the leak comes back in production the first time the component remounts. Fix the cleanup instead.
+
+For the rare logic that truly must run once per *app* (not per component), put it outside components entirely, at module level, for example `initAnalytics()` in `main.tsx` before `createRoot(...)`.
+
+## 44.6 Fetching in an effect
+
+Fetching looks like a simple effect, but it hides a **race condition**. Imagine search-as-you-type: the user types "re", then "rea". Two requests go out. If the slower "re" response arrives *last*, it overwrites the "rea" results and the screen shows the wrong list. The fix is to cancel the previous request whenever the query changes, which is exactly what cleanup is for. The browser's `AbortController` does the cancelling: pass its `signal` to `fetch`, and call `abort()` in cleanup.
+
+```tsx
+function TaskSearch({ query }: { query: string }) {
+  const [results, setResults] = useState<Task[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+
+    async function load() {
+      try {
+        const res = await fetch(`/api/tasks?q=${encodeURIComponent(query)}`, {
+          signal: controller.signal,               // tie the request to this controller
+        });
+        if (!res.ok) throw new Error(`Search failed (${res.status})`);
+        const data: Task[] = await res.json();     // unvalidated: Chapter 61 fixes this
+        setResults(data);
+        setError(null);
+      } catch (err) {
+        if (controller.signal.aborted) return;     // we cancelled it on purpose: not an error
+        setError(err instanceof Error ? err.message : "Search failed");
+      }
+    }
+
+    load();
+    return () => controller.abort();               // query changed or we left: cancel this one
+  }, [query]);
+
+  return error ? <p role="alert">{error}</p> : <TaskList tasks={results} />;
+}
+```
+
+Three details matter. The effect function itself can't be `async`, because it must return a cleanup (or nothing), not a promise; define an async function inside and call it. An aborted `fetch` rejects, so the `catch` must recognize the cancellation and stay quiet. And `abort()` cancels the network request too, not just the state update.
+
+```tsx
+useEffect(async () => { /* ... */ }, [query]); // ❌ Argument of type '() => Promise<void>' is not assignable to parameter of type 'EffectCallback'.
+```
+
+When the async work can't be cancelled (a third-party promise, say), use an `ignore` flag so stale results are dropped:
+
+```tsx
+useEffect(() => {
+  let ignore = false;
+  loadTaskFromCache(taskId).then((task) => {
+    if (!ignore) setTask(task); // only the latest taskId's result is applied
+  });
+  return () => { ignore = true; };
+}, [taskId]);
+```
+
+> 🌍 **Real world.** Production apps rarely hand-write fetch effects. Libraries such as TanStack Query ([Chapter 62](/chapter/62)) and framework data loaders handle caching, deduplication, retries, and races for you. Writing one by hand once is still the best way to understand what they solve.
+
+## 44.7 You might not need an effect
+
+Because effects run "after render", they're tempting for anything that should happen "when something changes". Most of those cases are better solved without one. Ask **why this code runs**: because the component is on screen (an effect), because the user did something (an event handler), or because a value depends on other values (compute it during render).
+
+**Derived values** belong in render. An effect that copies computed data into state adds an extra render and a moment where the two disagree ([Chapter 42](/chapter/42)):
+
+```tsx
+// ❌ An effect to sync derived state: extra render, briefly wrong
+const [doneCount, setDoneCount] = useState(0);
+useEffect(() => {
+  setDoneCount(tasks.filter((t) => t.status === "done").length);
+}, [tasks]);
+
+// ✅ Just compute it
+const doneCount = tasks.filter((t) => t.status === "done").length;
+```
+
+**User actions** belong in event handlers. Saving a task happens *because the user clicked Save*, not because some state changed:
+
+```tsx
+// ❌ An effect watching a flag: indirect, and re-fires if the component remounts
+useEffect(() => {
+  if (submitted) saveTask(draft).then(() => showToast("Saved"));
+}, [submitted, draft]);
+
+// ✅ Do it where it happens
+async function handleSave() {
+  await saveTask(draft);
+  showToast("Saved");
+}
+```
+
+**Resetting state when a prop changes** is what `key` is for:
+
+```tsx
+// ❌ useEffect(() => { setDraft(task.title); }, [task.id]);  // renders stale draft first
+// ✅ A new key means a new instance with fresh state
+<TaskEditor key={task.id} task={task} />
+```
+
+## 44.8 Separating events from effects
+
+Sometimes an effect needs to *read* a value without *reacting* to it. TaskFlow's activity feed subscribes to a project's live events and plays a chime for each one, if the user has sound turned on. The subscription depends on `projectId`. But the chime reads `soundEnabled`, and the linter will (correctly) insist it's a dependency, so toggling sound would tear down and rebuild the subscription. That's wrong: toggling sound shouldn't reconnect anything.
+
+The problem is that two kinds of logic are mixed together. Subscribing is **reactive** (it should re-run when `projectId` changes). Handling an incoming event is **non-reactive**: it's like an event handler that should simply see the latest values when it fires. `useEffectEvent` lets you pull that part out:
+
+```tsx
+import { useEffect, useEffectEvent } from "react";
+
+function ActivityFeed({ projectId, soundEnabled }: { projectId: string; soundEnabled: boolean }) {
+  const onActivity = useEffectEvent((event: ActivityEvent) => {
+    showToast(event.summary);
+    if (soundEnabled) playChime(); // always reads the LATEST soundEnabled
+  });
+
+  useEffect(() => {
+    const feed = subscribeToActivity(projectId, (event) => onActivity(event));
+    return () => feed.unsubscribe();
+  }, [projectId]); // ✅ complete: effect events are not dependencies
+
+  return <ActivityList projectId={projectId} />;
+}
+```
+
+Toggling sound now changes what the *next* chime does, without reconnecting. Effect events come with rules: call them only from inside effects (not during render, and not as `onClick` handlers), don't pass them to other components or hooks, and don't list them as dependencies (an up-to-date lint plugin knows this).
+
+> 🆕 **Modern note.** `useEffectEvent` became stable in React 19.2. Older code solves the same problem by storing the latest callback in a ref and reading it inside the effect; when you see that "latest ref" pattern, it's usually a candidate for `useEffectEvent`.
+
+> ⚠️ **Common mistake.** Wrapping a value in an effect event just to silence the linter. Only use it for logic that genuinely should *not* restart the synchronization, such as reading a preference while handling an event.
+
+## 44.9 Common effect bugs
+
+Most effect bugs fall into three families. Learn to recognize them by symptom.
+
+**Infinite loops.** An effect that sets state it also depends on (or that has no dependency array at all) re-runs after every render it causes:
+
+```tsx
+useEffect(() => {
+  setVisible(tasks.filter((t) => t.status !== "done")); // ❌ new array → render → effect → ...
+});
+// Fix: it's derived data. Compute it during render (44.7); no state, no effect.
+```
+
+**Stale closures.** An effect captures the values from the render it was created in. With an empty array, an interval keeps seeing the *first* render's state forever:
+
+```tsx
+const [seconds, setSeconds] = useState(0);
+useEffect(() => {
+  const id = setInterval(() => setSeconds(seconds + 1), 1000); // ❌ seconds is always 0 here
+  return () => clearInterval(id);
+}, []); // the linter warns that 'seconds' is missing
+
+// ✅ An updater function reads the current value, so nothing is captured:
+//    setInterval(() => setSeconds((s) => s + 1), 1000);  with [] dependencies
+```
+
+**Object and function dependencies.** Objects and functions created during render are **new every render** (identity is the topic of [Chapter 47](/chapter/47)), so an effect that depends on one re-syncs constantly:
+
+```tsx
+const options = { projectId, includeDone };        // new object every render
+useEffect(() => {
+  const feed = subscribe(options);
+  return () => feed.unsubscribe();
+}, [options]); // ❌ reconnects on every render, even when nothing changed
+
+useEffect(() => {
+  const feed = subscribe({ projectId, includeDone }); // ✅ build it inside
+  return () => feed.unsubscribe();
+}, [projectId, includeDone]);                          // ✅ depend on the primitives
+```
+
+## Common mistakes
+
+> ⚠️ **Suppressing the dependency lint.** `// eslint-disable-next-line react-hooks/exhaustive-deps` turns a visible warning into an invisible stale-value bug. Change the code (move values inside, use an updater, use an effect event) until the list is honestly complete.
+
+> ⚠️ **Effects that set derived state.** If the value can be computed from props and state, compute it during render. An effect adds an extra render and a frame where the screen is wrong.
+
+> ⚠️ **Fetching without cleanup.** Every fetch effect needs either an `AbortController` or an `ignore` flag. Without one, fast typing or quick navigation shows stale results.
+
+> ⚠️ **Thinking in lifecycles.** "Run on mount" is not a requirement; it's an implementation. Ask what you're synchronizing with and what values it depends on.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** you need to keep something outside React in step with what's on screen: connections and subscriptions, browser APIs (`document.title`, `window` listeners, `matchMedia`), timers, and non-React widgets.
+
+> 🚫 **When not to.** Anything triggered by a user action belongs in an event handler. Anything computed from props and state belongs in render. Resetting state on a prop change belongs to `key`. Data fetching in a real app usually belongs to a data library. If you can't name the external system, you probably don't need an effect.
+
+## How it connects
+
+> 🔗 **Connection.** Effects run after the commit step from [Chapter 37](/chapter/37) and claim slots like every hook ([Chapter 43](/chapter/43)). "Don't sync derived state" comes from [Chapter 42](/chapter/42). [Chapter 45](/chapter/45) introduces refs, which effects often read and write. [Chapter 47](/chapter/47) explains the identity problem behind object dependencies, and [Chapter 48](/chapter/48) wraps effects in custom hooks such as `useOnlineStatus`. Real data fetching returns in [Chapter 61](/chapter/61) and [Chapter 62](/chapter/62).
+
+> 🌍 **Real world.** Mature codebases have far fewer `useEffect` calls than you'd expect. Most live inside custom hooks or libraries (`useQuery`, `useMediaQuery`, router hooks), so components describe *what* to sync with rather than *how*.
+
+## Exercises
+
+### Level 1 — Recall
+
+Classify each piece of logic as **render** (compute during render), **event handler**, or **effect**, and give a one-line reason:
+
+1. Showing "3 of 8 tasks done" above the list.
+2. Sending a `POST /tasks` request when the user submits the form.
+3. Keeping a WebSocket connection open to the current project's channel.
+4. Sorting tasks by due date before displaying them.
+5. Logging an analytics "board viewed" event whenever the board is on screen for a project.
+6. Showing a toast after the user deletes a task.
+7. Listening for the Escape key while a modal is open.
+8. Resetting the "edit title" draft when a different task is selected.
+
+### Level 2 — Application
+
+Write a `useEffect` in TaskFlow's `App` that keeps `document.title` in the form `(3) TaskFlow`, where 3 is the number of tasks whose status isn't `"done"`. The count must be derived during render (no extra state), the effect must have a complete dependency list, and when there are no open tasks the title should read just `TaskFlow`.
+
+### Level 3 — Challenge
+
+This search box shows wrong results when you type quickly. Reproduce the bug (add a random delay on the server or in a fake `fetch`), then fix it with `AbortController` so only the latest query's results ever appear and cancelled requests never show an error:
+
+```tsx
+function TaskSearch({ query }: { query: string }) {
+  const [results, setResults] = useState<Task[]>([]);
+  useEffect(() => {
+    fetch(`/api/tasks?q=${query}`)
+      .then((res) => res.json())
+      .then((data) => setResults(data));
+  }, [query]);
+  return <TaskList tasks={results} />;
+}
+```
+
+*Hint: the race isn't about how fast requests go out; it's about the order responses come back.*
+
+### Level 4 — Real-world
+
+**Ticket TF-318: Live connection indicator.** Users want to know whether the live task feed is connected. Build a `ConnectionStatus` component that opens a WebSocket for the current project and shows "Connected", "Reconnecting…", or "Offline".
+
+- When the socket closes unexpectedly, it retries after 1s, 2s, 4s (capped at 30s), and the timer is cleared if the component unmounts or the project changes.
+- Switching projects closes the old socket before opening the new one; no messages from the old project appear afterward.
+- With Strict Mode on, the server sees exactly one open connection per mounted indicator.
+- No `eslint-disable` comments; the dependency lists are complete.
+
+## Key takeaways
+
+- An effect synchronizes React with an **external system**. Think "start syncing / stop syncing", not "mount / update / unmount".
+- Setup starts it, cleanup undoes it, dependencies decide when to re-sync. The linter, not you, decides what the dependencies are.
+- Strict Mode's extra setup + cleanup in development exposes missing cleanups. Fix the cleanup; never guard against the double run.
+- Fetch effects race. Cancel with `AbortController` (or ignore stale results) in cleanup.
+- Derived values go in render, user actions go in handlers, resets go in `key`. Many effects shouldn't exist.
+- `useEffectEvent` separates non-reactive logic from an effect so it can read the latest values without becoming a dependency.
+
+## What comes next
+
+The stale-closure bug and the "latest callback" problem both hint at something missing: a way to remember a value across renders *without* it being part of the render. That's a ref. [Chapter 45: useRef: Remembering Without Re-rendering](/chapter/45) covers it, starting with a stopwatch that can't find its own timer.

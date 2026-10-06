@@ -1,0 +1,409 @@
+> 📖 **The problem.** The TaskFlow board needs a configurable table: each column names a task field, and a helper reads that field for display. Your first helper is `getProperty(obj, key)`. It compiles, but every value it returns is typed `unknown`, so each caller has to cast. Worse, when someone writes `"titel"` instead of `"title"`, TypeScript says nothing, and the column quietly renders blank.
+
+```ts
+function getProperty(obj: object, key: string): unknown {
+  return (obj as Record<string, unknown>)[key];
+}
+
+const title = getProperty(task, "title"); // title: unknown, so every caller must cast
+getProperty(task, "titel");               // no error, and undefined at runtime
+```
+
+[Chapter 16](/chapter/16) gave you type parameters that connect inputs to outputs. But a bare `T` knows nothing about its value: it might be a number, a task, or `null`. This chapter gives type parameters **rules**, called constraints, and introduces `keyof`, the operator that turns an object type into the set of its property names. Together they fix `getProperty` completely. By the end, you'll be able to write helpers like `pluck`, `sortBy`, and `groupBy` that reject wrong keys and return precisely typed results, and you'll know when a constraint is too tight or too loose.
+
+> 🧠 **Mental model.** A **constraint** (`T extends X`) is a minimum requirement: "`T` can be any type that fits inside `X`." And `keyof T` is the **set of `T`'s property names**, written as a union of string literal types.
+
+## 17.1 Multiple type parameters
+
+A generic function can declare as many type parameters as it needs, separated by commas. Each one still has to earn its place by the golden rule from [Chapter 16](/chapter/16): it must connect at least two things.
+
+The classic example is `map`. It involves two *different* types: the type of the items going in, and the type of the items coming out. One type parameter can't describe both, so `map` takes two:
+
+```ts
+function map<T, U>(items: T[], fn: (item: T) => U): U[] {
+  const result: U[] = [];
+  for (const item of items) result.push(fn(item));
+  return result;
+}
+
+const titles = map(taskList, (t) => t.title);              // titles: string[]
+const isDone = map(taskList, (t) => t.status === "done");  // isDone: boolean[]
+const lengths = map(titles, (s) => s.length);              // lengths: number[]
+```
+
+Notice that you never annotated `t`. TypeScript works through the call in order. It infers `T` from `items` (here, `Task`). Then it uses that `T` to type the callback's parameter, which is called **contextual typing**: the callback gets its parameter type from the position it's passed into. Finally it infers `U` from whatever the callback returns. Each type parameter appears twice, and each one carries information from one place to another.
+
+Type parameters can also relate several inputs to one result. Here, `Acc` ties together the starting value, the callback's accumulator, and the final answer:
+
+```ts
+function reduce<T, Acc>(items: T[], fn: (acc: Acc, item: T) => Acc, initial: Acc): Acc {
+  let acc = initial;
+  for (const item of items) acc = fn(acc, item);
+  return acc;
+}
+
+const doneCount = reduce(taskList, (n, t) => (t.status === "done" ? n + 1 : n), 0); // doneCount: number
+const report = reduce(taskList, (text, t) => `${text}\n- ${t.title}`, "Tasks:");   // report: string
+```
+
+> 💡 **Tip.** When a function has two or more type parameters, give them names that say what they are: `TItem` and `TResult`, or `Acc` as above. Single letters are fine for one parameter; with several, names make hover tooltips and error messages much easier to read.
+
+## 17.2 Generic constraints
+
+Try to write a function that returns the longer of two values:
+
+```ts
+function longest<T>(a: T, b: T): T {
+  return a.length >= b.length ? a : b; // ❌ Property 'length' does not exist on type 'T'.
+}
+```
+
+The error is correct. Inside a generic function, TypeScript has to assume the worst about `T`, because a caller could pass *anything*: a number, `undefined`, a task. It only lets you do what is safe for every possible type, which is almost nothing.
+
+A **constraint** narrows the possibilities. You write it with `extends` after the type parameter:
+
+```ts
+function longest<T extends { length: number }>(a: T, b: T): T {
+  return a.length >= b.length ? a : b; // ✅ every possible T has a numeric length
+}
+
+longest(["write", "docs"], ["ship"]); // ✅ T is string[]
+longest(task.title, project.name);    // ✅ T is string
+longest(10, 20); // ❌ Argument of type 'number' is not assignable to parameter of type '{ length: number; }'.
+```
+
+Read `T extends { length: number }` as "`T` can be any type, *as long as* it has a numeric `length`." In the set picture from [Chapter 10](/chapter/10), the constraint is a set of values (every string, every array, every object with a `length`), and `T` must fit inside it. Here `extends` means "is assignable to", not class inheritance.
+
+A constraint gives you two things at once. **Inside** the function, you may use whatever the constraint guarantees, and nothing more. **Outside**, the caller still gets back their *own* specific type, not the constraint. That second half is the reason to use a generic here instead of an ordinary parameter type:
+
+```ts
+function longestLoose(a: { length: number }, b: { length: number }) {
+  return a.length >= b.length ? a : b;
+}
+
+const loose = longestLoose(["write", "docs"], ["ship"]); // loose: { length: number }
+const exact = longest(["write", "docs"], ["ship"]);      // exact: string[]
+
+exact.join(", "); // ✅
+loose.join(", "); // ❌ Property 'join' does not exist on type '{ length: number; }'.
+```
+
+Here is the same idea in TaskFlow. Anything that has a `status` can be filtered to the open ones, and the caller's type comes back intact, extra fields included:
+
+```ts
+interface Subtask {
+  id: string;
+  parentId: string;
+  status: Status;
+}
+
+function onlyOpen<T extends { status: Status }>(items: T[]): T[] {
+  return items.filter((item) => item.status !== "done");
+}
+
+declare const subtasks: Subtask[];
+
+const openTasks = onlyOpen(taskList); // openTasks: Task[]
+const openSubtasks = onlyOpen(subtasks); // openSubtasks: Subtask[]
+openSubtasks[0]?.parentId;             // ✅ the Subtask fields are still there
+```
+
+## 17.3 keyof
+
+To fix `getProperty`, we need a way to say "one of the property names of this object type". That is exactly what the **`keyof` operator** produces. Given an object type, `keyof` gives you the union of its property names as string literal types:
+
+```ts
+interface Task {
+  id: string;
+  title: string;
+  status: Status;
+  priority: Priority;
+  projectId: string;
+  assigneeId: string | null;
+  dueDate?: Date;
+}
+
+type TaskKey = keyof Task;
+// "id" | "title" | "status" | "priority" | "projectId" | "assigneeId" | "dueDate"
+
+let column: TaskKey = "title"; // ✅
+column = "titel";              // ❌ Type '"titel"' is not assignable to type 'keyof Task'. Did you mean '"title"'?
+```
+
+`keyof` is a **type operator**: it works on types, in type positions, and its result is a type. It includes optional properties such as `dueDate`, and it updates itself automatically. Add a `tags` field to `Task` and `TaskKey` gains `"tags"` with no other edits.
+
+On dictionary-like types, `keyof` returns the key type rather than a list of names. Arrays technically have keys too, but they're rarely what you want:
+
+```ts
+type A = keyof Record<Status, number>;     // "todo" | "doing" | "done"
+type B = keyof Record<string, number>;     // string
+type C = keyof { [key: string]: number };  // string | number, because obj[0] is also allowed
+type D = keyof string[];                   // number | "length" | "push" | "map" | …
+```
+
+The surprise in `C` is that JavaScript converts numeric keys to strings, so an object with a string index signature can also be indexed with numbers, and `keyof` reports both. For arrays, you'll almost always want the *element* type instead, which [Chapter 20](/chapter/20) gets with `T[number]`.
+
+> ⚠️ **Common mistake.** `keyof` is about the **type**, not the runtime object. `Object.keys(task)` is typed `string[]`, not `(keyof Task)[]`, because under structural typing ([Chapter 10](/chapter/10)) a value can carry more properties than its type mentions. A `Task` variable might hold an object with an extra `_debug` field, and `Object.keys` would return it.
+
+## 17.4 keyof with generics
+
+Now we can fix `getProperty`, one step at a time. The first attempt uses `keyof T` directly as the parameter type:
+
+```ts
+function getPropertyV2<T>(obj: T, key: keyof T): T[keyof T] {
+  return obj[key];
+}
+
+getPropertyV2(task, "titel"); // ❌ Argument of type '"titel"' is not assignable to parameter of type 'keyof Task'.
+const v = getPropertyV2(task, "title"); // v: string | Date | null | undefined
+```
+
+Typos are now caught, which is real progress. But look at the result type. `T[keyof T]` means "the type of *some* property of `T`", so we get the union of *every* property type in `Task`. TypeScript knows the key is one of the task's keys, but it has forgotten *which* one.
+
+To remember which key was passed, the key needs its own type parameter:
+
+```ts
+function getProperty<T, K extends keyof T>(obj: T, key: K): T[K] {
+  return obj[key];
+}
+
+const title = getProperty(task, "title");    // title: string
+const status = getProperty(task, "status");  // status: Status
+const due = getProperty(task, "dueDate");    // due: Date | undefined
+getProperty(task, "titel"); // ❌ Argument of type '"titel"' is not assignable to parameter of type 'keyof Task'.
+```
+
+Hover over the first call and you'll see `getProperty<Task, "title">(obj: Task, key: "title"): string`. TypeScript infers `T` from the object, then infers `K` as the *literal* type `"title"`, not just `string`. It keeps the literal because `K`'s constraint is a union of literal types, which tells inference that the exact key matters. Then `T[K]` becomes `Task["title"]`, which is `string`. Two parameters, each appearing twice, and the opening problem is solved.
+
+> 🧠 **Mental model.** `K extends keyof T` reads as "`K` is one of `T`'s keys (or a union of some of them)." `T` captures the object; `K` captures the *particular* key. That's why you need both.
+
+## 17.5 Indexed access in generics
+
+The return type `T[K]` is an **indexed access type**: it looks up the type of a property, the same way `obj[key]` looks up a value. You can use it with concrete types, too:
+
+```ts
+type Title = Task["title"];                   // string
+type Assignee = Task["assigneeId"];           // string | null
+type DateOrStatus = Task["status" | "dueDate"]; // Status | Date | undefined
+type BadLookup = Task["owner"]; // ❌ Property 'owner' does not exist on type 'Task'.
+```
+
+Passing a union of keys gives you the union of their property types. A typo in a lookup is an error, just like a typo in a property access.
+
+Inside a generic function, `T[K]` stays *unevaluated* until a call supplies real types. It's a promise: "whatever `T` and `K` turn out to be, this is the type of that property." That makes it perfect for keeping two arguments in sync. A setter's `value` must match the key that was chosen:
+
+```ts
+function setProperty<T, K extends keyof T>(obj: T, key: K, value: T[K]): void {
+  obj[key] = value;
+}
+
+setProperty(task, "status", "done");     // ✅ value must be a Status
+setProperty(task, "dueDate", new Date()); // ✅ value must be Date | undefined
+setProperty(task, "status", "archived"); // ❌ Argument of type '"archived"' is not assignable to parameter of type 'Status'.
+```
+
+Here is the realistic version. TaskFlow's inline editor changes one field at a time and must never put a date into `title`. Instead of one handler per field, a single generic update function checks every field:
+
+```ts
+function updateTask<K extends keyof Task>(current: Task, key: K, value: Task[K]): Task {
+  return { ...current, [key]: value };
+}
+
+const renamed = updateTask(task, "title", "Write release notes"); // ✅
+const assigned = updateTask(task, "assigneeId", null);           // ✅ assigneeId allows null
+updateTask(task, "priority", "urgent"); // ❌ Argument of type '"urgent"' is not assignable to parameter of type 'Priority'.
+```
+
+Notice that `updateTask` has only one type parameter. The object type is always `Task`, so there's nothing to make generic about it. Only the key varies.
+
+## 17.6 Constraints that reference other parameters
+
+In `K extends keyof T`, the constraint on `K` *mentions another type parameter*. That's allowed and very common: TypeScript infers `T` from its argument first, then checks `K` against the keys of that particular `T`. This is how most typed collection helpers are built.
+
+**`pluck`** pulls one field out of every item. The result type is "an array of whatever that field is":
+
+```ts
+function pluck<T, K extends keyof T>(items: T[], key: K): T[K][] {
+  return items.map((item) => item[key]);
+}
+
+const ids = pluck(taskList, "id");         // ids: string[]
+const statuses = pluck(taskList, "status"); // statuses: Status[]
+const names = pluck(users, "name");         // names: string[]
+pluck(users, "title"); // ❌ Argument of type '"title"' is not assignable to parameter of type 'keyof User'.
+```
+
+**`sortBy`** has the same shape. The key must belong to the item type, and the sorted array keeps the item type. (Writing a correct comparison for strings, numbers, dates, and missing values is your Level 2 exercise.)
+
+```ts
+declare function sortBy<T, K extends keyof T>(items: readonly T[], key: K): T[];
+
+sortBy(taskList, "priority");  // ✅ Task[]
+sortBy(projects, "name");      // ✅ Project[]
+sortBy(projects, "priority");  // ❌ Argument of type '"priority"' is not assignable to parameter of type 'keyof Project'.
+```
+
+**`groupBy`** is different. It groups by a *computed* key, so the key comes from a callback, and the result is an object whose property names are those keys. Object keys can only be strings, numbers, or symbols. TypeScript has a built-in alias for exactly that set, `PropertyKey`, and it's the right constraint:
+
+```ts
+function groupBy<T, K extends PropertyKey>(
+  items: readonly T[],
+  keyOf: (item: T) => K,
+): Partial<Record<K, T[]>> {
+  const groups: Partial<Record<K, T[]>> = {};
+  for (const item of items) {
+    (groups[keyOf(item)] ??= []).push(item);
+  }
+  return groups;
+}
+
+const byStatus = groupBy(taskList, (t) => t.status); // byStatus: Partial<Record<Status, Task[]>>
+byStatus.doing?.length;                              // ✅ "doing" is a known key
+groupBy(taskList, (t) => t.dueDate); // ❌ Type 'Date | undefined' is not assignable to type 'PropertyKey'.
+```
+
+The return type reads "an object with a key for each `K`, where each key might be missing" (if no task is `"done"`, there's no `done` group). You'll meet `Partial` and `Record` properly in [Chapter 21](/chapter/21). Without the `PropertyKey` constraint, grouping by a `Date` would compile and then quietly turn every date into a string key.
+
+> 🌍 **Real world.** This is almost exactly how TypeScript's own library types the built-in `Object.groupBy`: `groupBy<K extends PropertyKey, T>(items: Iterable<T>, keySelector: (item: T, index: number) => K): Partial<Record<K, T[]>>`. When you write good generic helpers, they tend to look like the standard library.
+
+## 17.7 When constraints make APIs worse
+
+A constraint is a contract with every caller. If it's too loose, the function can't do its job without cheating. If it's too tight, it rejects callers who would have worked fine. Here are both failures, using one helper that removes an item by id:
+
+```ts
+// Under-constrained: the body needs .id, the type doesn't promise it, so it cheats.
+function removeByIdLoose<T>(items: T[], id: string): T[] {
+  return items.filter((item) => (item as any).id !== id); // compiles, checks nothing
+}
+
+// Over-constrained: demands a whole Task, but only ever reads .id.
+function removeByIdStrict<T extends Task>(items: T[], id: string): T[] {
+  return items.filter((item) => item.id !== id);
+}
+removeByIdStrict(projects, "p1"); // ❌ Argument of type 'Project[]' is not assignable to parameter of type 'Task[]'.
+
+// Just right: requires exactly what the body uses.
+function removeById<T extends { id: string }>(items: T[], id: string): T[] {
+  return items.filter((item) => item.id !== id);
+}
+removeById(projects, "p1"); // ✅ T is Project
+removeById(taskList, "t1"); // ✅ T is Task
+```
+
+The guideline: **constrain to exactly what the body uses, no more and no less.** Write the body first, notice which properties it touches, and make those the constraint.
+
+A sneakier over-constraint catches many developers. `Record<string, unknown>` looks like "any object", but it actually requires an *index signature*, and interfaces don't have one implicitly:
+
+```ts
+function logFields<T extends Record<string, unknown>>(obj: T): void {
+  console.table(obj);
+}
+logFields(task); // ❌ Argument of type 'Task' is not assignable to parameter of type 'Record<string, unknown>'.
+
+function logFieldsFixed<T extends object>(obj: T): void {
+  console.table(obj);
+}
+logFieldsFixed(task); // ✅
+```
+
+Finally, sometimes the best constraint is no type parameter at all. If `T` appears only once, the generic is decoration, and the constraint alone is the honest parameter type:
+
+```ts
+function sizeOf<T extends { length: number }>(value: T): number { // T appears once
+  return value.length;
+}
+function sizeOfPlain(value: { length: number }): number { // ✅ same safety, less noise
+  return value.length;
+}
+```
+
+## Common mistakes
+
+> ⚠️ **`T extends any` (or `T extends unknown`).** These constraints allow every type, so they say nothing. Delete them. A constraint should describe something the body actually needs.
+
+> ⚠️ **Constraining to `object` when you need a shape.** `object` only means "not a primitive"; it promises no properties at all. If the body reads `.id`, the constraint must say so.
+
+```ts
+function idOf<T extends object>(item: T): string {
+  return item.id; // ❌ Property 'id' does not exist on type 'T'.
+}
+```
+
+> ⚠️ **Returning `T` when you actually return the constraint type.** A value that merely fits the constraint is not necessarily a `T`. The caller might have chosen a more specific type with extra fields, and your new object doesn't have them.
+
+```ts
+function emptyLike<T extends { length: number }>(value: T): T {
+  return { length: 0 }; // ❌ Type '{ length: number; }' is not assignable to type 'T'.
+  // '{ length: number; }' is assignable to the constraint of type 'T',
+  // but 'T' could be instantiated with a different subtype of constraint '{ length: number; }'.
+}
+```
+
+The second half of that message is TypeScript being precise: if a caller passes a `string[]`, then `T` is `string[]`, and `{ length: 0 }` is not a `string[]`. Either return something built from the input, or change the return type to the constraint.
+
+> ⚠️ **Treating `Object.keys` as `keyof`.** Looping over `Object.keys(task)` gives you `string` keys, and indexing with a plain `string` fails. Iterate over a known list of keys typed as `(keyof Task)[]`, or use `Object.entries` when you only need values.
+
+```ts
+for (const key of Object.keys(task)) {
+  console.log(task[key]); // ❌ Element implicitly has an 'any' type because expression of type 'string' can't be used to index type 'Task'.
+}
+```
+
+## When to use it, and when not to
+
+> ✅ **Use it when** the function body needs a capability from `T` (a `length`, an `id`, a `status`), when a parameter must be one of an object's keys (`getProperty`, `pluck`, `sortBy`), or when a second argument's type depends on a chosen key (`setProperty`, `updateTask`). Constraints plus `keyof` are what turn "flexible" helpers into helpers that autocomplete field names and reject typos.
+
+> 🚫 **When not to.** If the function only ever handles one type, use that type: `updateTask` doesn't need a `T`. If the specific type never flows back out, drop the type parameter and use the constraint as a plain parameter type, as `sizeOfPlain` does. And don't add constraints "just in case". Every extra requirement is a caller you might reject.
+
+## How it connects
+
+> 🔗 **Connection.** `extends` in a constraint is the "fits inside" relationship from [Chapter 10](/chapter/10), and `keyof` produces exactly the kind of literal union you learned in [Chapter 13](/chapter/13). Next, [Chapter 18](/chapter/18) moves type parameters from functions onto *types* (`ApiResponse<T>`, `Repository<T>`). [Chapter 20](/chapter/20) combines `keyof` with `typeof` to derive keys from runtime objects, and [Chapter 21](/chapter/21) shows that `Pick` and `Record` are built from the same `K extends keyof T` pattern you used here. In React, a generic table component takes `columns: K[]` where `K extends keyof Row` ([Chapter 57](/chapter/57)).
+
+> 🌍 **Real world.** Typed table libraries let you declare a column with an accessor key that must be a key of your row type, and give the cell renderer that property's value type. Object helpers like lodash's `pick` and `get` are typed with `K extends keyof T`. And the standard library's `Object.groupBy` uses a `PropertyKey` constraint, just like the `groupBy` above.
+
+## Exercises
+
+### Level 1 — Recall
+
+Write the constraint for a type parameter that accepts "anything with an `id: string`". Then use it in a function `ids` that takes an array of such items and returns their ids. Check that all three calls below behave as commented:
+
+```ts
+ids(taskList); // should compile
+ids(projects); // should compile
+ids([1, 2, 3]); // should be a compile error
+```
+
+### Level 2 — Application
+
+Implement `sortBy<T, K extends keyof T>(items: readonly T[], key: K): T[]` from 17.6.
+
+- It must not mutate the input array.
+- It must sort strings alphabetically, numbers and dates ascending, and put `null` or `undefined` values last.
+- Test it on tasks sorted by `"title"`, `"dueDate"`, and `"assigneeId"`, and confirm that `sortBy(taskList, "owner")` fails to compile.
+
+### Level 3 — Challenge
+
+Implement `pick(obj, keys)`, which returns a new object containing only the listed keys. The return type must be **precise**: `pick(task, ["id", "title"])` should be typed as an object with exactly `id: string` and `title: string`, so reading `.status` on the result is an error.
+
+*Hint: the return type can be written `{ [P in K]: T[P] }`. Read it as "for each key `P` in `K`, a property of type `T[P]`". [Chapter 22](/chapter/22) explains this syntax in full.*
+
+### Level 4 — Real-world
+
+**Ticket TF-163: Typed lookups for the in-memory store.** TaskFlow's store keeps arrays of tasks, projects, and users, and each feature has written its own lookup loop. Add two shared helpers to the store module.
+
+- `findById(items, id)` works for any item type that has an `id: string`, and returns that item type (or `undefined`), never a wider type.
+- `upsert(items, item)` returns a new array: it replaces the item with the same `id` if one exists, otherwise it appends. The input array is not mutated.
+- Neither helper uses `any` or a type assertion, and neither needs explicit type arguments at any call site.
+- Tests cover found, not found, insert, and replace, for both tasks and projects.
+
+## Key takeaways
+
+- A constraint, `T extends X`, is a **minimum requirement**: the body may use what `X` guarantees, and callers still get their own specific type back.
+- `keyof T` is the union of `T`'s property names. It updates automatically when `T` changes, and it describes the type, not the runtime object.
+- `<T, K extends keyof T>(obj: T, key: K): T[K]` is the core pattern: `T` captures the object, `K` captures the particular key, and `T[K]` is that property's type.
+- Indexed access (`T[K]`) keeps arguments in sync, so a setter's value must match the chosen key.
+- Constrain to exactly what the body uses. Too loose forces casts, too tight rejects valid callers, and a `T` that appears once shouldn't exist.
+
+## What comes next
+
+Your functions are now generic, but your *types* are still copy-pasted. TaskFlow's API returns `TaskResponse`, `UserResponse`, and `ProjectResponse`: three types that are identical except for the type of their `data` field. A function would take a parameter here. Can a type? It can, and that's [Chapter 18: Generic Types, Interfaces, Classes & Defaults](/chapter/18).

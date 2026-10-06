@@ -1,0 +1,399 @@
+> 📖 **The problem.** TaskFlow Web has one global store, and everything is in it: the current user, every task fetched from the server, whether the "new task" modal is open, and the text in the search box. Typing one letter into search re-renders the whole board, all 300 task cards. Worse, after a teammate moves a task to "done", your board still shows it in "doing" until you reload, because the store's copy of the tasks never learned that the server changed.
+
+None of that state is wrong to *have*. It's in the wrong *places*. A modal flag, a search string, a server's data, and the URL's filters are different kinds of state with different lifetimes, owners, and update rates, and treating them all the same is what made the app slow and stale.
+
+This chapter gives you a way to classify any piece of state and pick its home. By the end, you'll be able to name the five kinds of state, explain why server data needs a cache rather than a store, choose between context and an external store, build a typed Zustand store with selectors, derive values instead of storing them, and keep global state small.
+
+> 🧠 **Mental model.** **There are five kinds of state, and each has a natural home.** **Local UI** state lives in a component. **Shared client** state lives in context or a store. **URL** state lives in the router. **Server** state lives in a server-state cache. **Form** state lives in form state. Ask "what kind is this?" before asking "which library?".
+
+## 60.1 The five kinds of state
+
+Every piece of state in a React app answers the question "what does the UI need to remember?". But the *answers* differ in who owns the data, how long it lives, and who else needs it. Sort TaskFlow's state by those properties and five groups appear:
+
+| Kind | Who owns it | TaskFlow examples | Natural home |
+|---|---|---|---|
+| **Local UI** | One component | Is the "add task" popover open? Which column is hovered while dragging? | `useState`, `useReducer` |
+| **Shared client** | The browser, many components | Theme, board density, multi-selected tasks, the toast queue | Context or an external store |
+| **URL** | The address bar | Current project, open task, status filter, sort, page | The router ([Chapter 59](/chapter/59)) |
+| **Server cache** | The server | Tasks, projects, members, the signed-in user's profile | A server-state library ([Chapter 62](/chapter/62)) |
+| **Form** | One form, until submit | The create-task form's values, errors, touched fields | Form state ([Chapters 63–64](/chapter/63)) |
+
+Here is what it looks like when each kind is in its home. One screen, five kinds, five different tools, and each line is boring:
+
+```tsx
+function ProjectBoardPage({ projectId }: { projectId: string }) {
+  const [isAddOpen, setAddOpen] = useState(false);                // local UI
+  const density = useBoardUiStore((s) => s.density);              // shared client
+  const [filters, setFilters] = useTaskFilters();                 // URL
+  const tasks = useProjectTasks(projectId);                       // server cache
+  const quickAdd = useForm({ initialValues: { title: "" } });     // form (Chapter 63)
+
+  // …render the board…
+}
+```
+
+Notice that none of these needs to know about the others. The modal flag doesn't re-render anything outside this component; the filters survive refresh; the tasks are shared with every other component that asks for the same project. Each home gives its kind of state the behavior it needs.
+
+## 60.2 Server state is not client state
+
+Of the five kinds, one is fundamentally different. **Client state** is owned by the browser: if your code doesn't change the board density, nobody does. **Server state** is owned by *someone else*. What you hold in the browser is only a **snapshot**, a copy of the server's data as it was when you fetched it.
+
+A snapshot has problems that client state never has:
+
+- **It goes stale.** A teammate completes a task; your copy still says "doing".
+- **It needs refetching.** When should you ask again: on focus, on an interval, after your own changes?
+- **Ownership is split.** Your change might be rejected; the server's version wins.
+- **Many components want the same data.** Without coordination, each fetches its own copy.
+
+The opening's store treated the snapshot as if the browser owned it:
+
+```ts
+type AppStore = {
+  currentUser: User | null;     // server state, copied
+  tasks: Task[];                // server state, copied
+  isCreateModalOpen: boolean;   // local UI state, globalized
+  searchText: string;           // URL or local state, globalized
+};
+
+async function completeTask(id: string) {
+  await api.tasks.update(id, { status: "done" });
+  useAppStore.setState((s) => ({
+    tasks: s.tasks.map((t) => (t.id === id ? { ...t, status: "done" } : t)),
+  }));
+  // ✅ this tab is updated
+  // ❌ the project's "3 open tasks" counter (a separate copy) is now wrong
+  // ❌ other users' changes never arrive until a full reload
+}
+```
+
+Every bug here comes from the same mistake: maintaining a **copy** of someone else's data by hand. What server data actually needs is a **cache**: a structure that knows each entry's age, refetches when it's stale, deduplicates requests, and lets you say "the tasks list is out of date now" after a change. That is exactly what a server-state library like TanStack Query provides, and it's why [Chapter 62](/chapter/62) exists. For now, the rule: **server data does not go into `useState`, context, or a client store.**
+
+> ⚠️ **Common mistake.** Copying query results into state "so it's easier to update":
+> `useEffect(() => setTasks(data), [data])`. Now there are two sources of truth, and they will disagree. Read from the cache, and change the server, not the copy.
+
+## 60.3 Choosing a home
+
+When you meet a new piece of state, walk down this chart and stop at the first "yes". The order matters: the earlier questions describe stronger, more specific homes.
+
+```text
+                 ┌───────────────────────────────────────────────┐
+                 │ Is it a copy of data the server owns?          │──yes──► server cache   (Ch 62)
+                 └───────────────────────────────────────────────┘
+                                   │ no
+                 ┌───────────────────────────────────────────────┐
+                 │ Should a link, refresh, or Back reproduce it?  │──yes──► URL            (Ch 59)
+                 └───────────────────────────────────────────────┘
+                                   │ no
+                 ┌───────────────────────────────────────────────┐
+                 │ Is it the in-progress input of a form?         │──yes──► form state     (Ch 63–64)
+                 └───────────────────────────────────────────────┘
+                                   │ no
+                 ┌───────────────────────────────────────────────┐
+                 │ Does only one component (or a small subtree)   │──yes──► local state, lifted
+                 │ need it?                                       │         only as far as needed
+                 └───────────────────────────────────────────────┘
+                                   │ no
+                                   ▼
+            shared client state: context if it changes rarely (theme, auth status),
+                                 an external store if it changes often (selection, drag state)
+```
+
+TypeScript can make the result of this exercise explicit. A **state map** is a typed inventory of every piece of state and its home. With `satisfies`, a typo in a home is caught, and the object becomes documentation the whole team can review:
+
+```ts
+type StateHome = "local" | "shared-client" | "url" | "server-cache" | "form";
+
+export const taskflowStateMap = {
+  statusFilter:      { home: "url",           why: "shareable; survives refresh" },
+  openTaskId:        { home: "url",           why: "deep links to a task" },
+  taskList:          { home: "server-cache",  why: "owned by the API; goes stale" },
+  signedInUser:      { home: "server-cache",  why: "session data, read through useAuth (Ch 65)" },
+  boardDensity:      { home: "shared-client", why: "many components, client-owned, persisted" },
+  addPopoverOpen:    { home: "local",         why: "one component, throwaway" },
+  commentDraft:      { home: "form",          why: "in-progress input until submit" },
+  selectedTaskIds:   { home: "shared-client", why: "toolbar and cards in different subtrees" },
+} satisfies Record<string, { home: StateHome; why: string }>;
+```
+
+## 60.4 Context + reducer at app scale
+
+In [Chapter 55](/chapter/55) and [Chapter 54](/chapter/54) you combined `useReducer` with context to share state without a library. That pattern is genuinely good, and it's where many apps should start. It works best for state that is **app-wide but changes rarely**: the theme, the auth status, feature flags, a toast queue.
+
+It strains when state changes **often** and is read by **many** components. Consider board multi-selection, kept in a context with a reducer:
+
+```tsx
+type BoardUiState = { selectedTaskIds: string[]; density: "compact" | "cozy" };
+
+type BoardUiAction =
+  | { type: "taskToggled"; id: string }
+  | { type: "selectionCleared" }
+  | { type: "densityChanged"; density: BoardUiState["density"] };
+
+const BoardUiContext = createContext<{
+  state: BoardUiState;
+  dispatch: Dispatch<BoardUiAction>;
+} | null>(null);
+
+function TaskCard({ task }: { task: Task }) {
+  const { state, dispatch } = useBoardUi(); // subscribes to the WHOLE state object
+  const isSelected = state.selectedTaskIds.includes(task.id);
+  return (
+    <article aria-selected={isSelected} onClick={() => dispatch({ type: "taskToggled", id: task.id })}>
+      {task.title}
+    </article>
+  );
+}
+```
+
+Context has no **selectors**: a component can't say "I only care whether *my* task is selected". When the context value changes, every component that reads it re-renders. Click one card, and all 300 cards re-render, plus the density toggle, which didn't change at all.
+
+You can push the pattern further. Splitting state and dispatch into two contexts ([Chapter 54](/chapter/54)) means components that only dispatch don't re-render. Splitting the selection from the density into separate contexts helps more. But each split adds a provider, and you end up with a "provider pyramid" and no way to subscribe to *part* of a value. That's the signal to reach for a store.
+
+```tsx
+// The pyramid that grows when context is used for everything
+<ThemeProvider>
+  <AuthProvider>
+    <DensityProvider>
+      <SelectionStateProvider>
+        <SelectionDispatchProvider>
+          <ToastProvider>
+            <App />
+```
+
+> ✅ **Use it when** values change rarely (on sign-in, on a settings change) or few components read them. Context + reducer has no dependency and is easy to test.
+
+## 60.5 External stores
+
+An **external store** keeps state *outside* React's component tree and lets each component subscribe to exactly the slice it needs through a **selector**: a function from the whole state to the part this component reads. The component re-renders only when its selected value changes. **Zustand** is a small, popular store with excellent TypeScript support.
+
+```ts
+// features/board/boardUiStore.ts
+import { create } from "zustand";
+
+type Density = "compact" | "cozy";
+
+type BoardUiStore = {
+  selectedTaskIds: string[];
+  density: Density;
+  toggleSelected: (id: string) => void;
+  clearSelection: () => void;
+  setDensity: (density: Density) => void;
+};
+
+export const useBoardUiStore = create<BoardUiStore>()((set) => ({
+  selectedTaskIds: [],
+  density: "cozy",
+  toggleSelected: (id) =>
+    set((state) => ({
+      selectedTaskIds: state.selectedTaskIds.includes(id)
+        ? state.selectedTaskIds.filter((x) => x !== id)
+        : [...state.selectedTaskIds, id],
+    })),
+  clearSelection: () => set({ selectedTaskIds: [] }),
+  setDensity: (density) => set({ density }),
+}));
+```
+
+Notice the odd double call, `create<BoardUiStore>()(…)`. TypeScript can't infer some type parameters while you supply others, so Zustand splits the call in two: the first call takes your state type, and the second infers everything else (including middleware types). The state type includes the actions, so `set` is checked against it: `set({ density: "tiny" })` is an error.
+
+Now the card subscribes to one boolean:
+
+```tsx
+function TaskCard({ task }: { task: Task }) {
+  const isSelected = useBoardUiStore((s) => s.selectedTaskIds.includes(task.id)); // boolean
+  const toggleSelected = useBoardUiStore((s) => s.toggleSelected);               // stable function
+  return (
+    <article aria-selected={isSelected} onClick={() => toggleSelected(task.id)}>
+      {task.title}
+    </article>
+  );
+}
+// Click one card → only the cards whose `isSelected` actually changed re-render.
+```
+
+> ⚠️ **Common mistake.** Returning a new object from a selector, like `useBoardUiStore((s) => ({ density: s.density, setDensity: s.setDensity }))`. A new object every time means "changed" every time, and Zustand v5 will loop. Select values one at a time, or wrap the selector in `useShallow` from `zustand/react/shallow`.
+
+**Redux Toolkit** is the other mainstream choice. It's more structured: state is split into **slices**, changes happen through dispatched actions (a discriminated union, generated for you), and its devtools record every action. The TypeScript story is "define once, derive the rest":
+
+```ts
+import { configureStore, createSlice, type PayloadAction } from "@reduxjs/toolkit";
+import { useDispatch, useSelector } from "react-redux";
+
+const initialState: { selectedTaskIds: string[] } = { selectedTaskIds: [] };
+
+const selectionSlice = createSlice({
+  name: "selection",
+  initialState,
+  reducers: {
+    taskToggled(state, action: PayloadAction<string>) {
+      const i = state.selectedTaskIds.indexOf(action.payload);
+      if (i === -1) state.selectedTaskIds.push(action.payload); // Immer makes "mutation" safe here
+      else state.selectedTaskIds.splice(i, 1);
+    },
+    selectionCleared(state) { state.selectedTaskIds = []; },
+  },
+});
+
+export const store = configureStore({ reducer: { selection: selectionSlice.reducer } });
+export type RootState = ReturnType<typeof store.getState>;      // derived, never hand-written
+export const useAppSelector = useSelector.withTypes<RootState>();
+export const useAppDispatch = useDispatch.withTypes<typeof store.dispatch>();
+```
+
+Choose Zustand when you want the least ceremony; choose Redux Toolkit when a large team benefits from enforced conventions, action logs, and time-travel debugging. Both are typed well. Neither should hold server data.
+
+## 60.6 Derived state across features
+
+**Derived state** is any value you can compute from other state: the number of overdue tasks, the tasks that match the current filters, whether "Select all" is checked. The rule is short: **compute it, don't store it.** A stored copy of a derived value is one more thing that can fall out of sync.
+
+The clean way to derive is with **selector functions**: small, pure functions that take state and return the derived value. They live in the feature that understands the data, which makes them trivial to unit test.
+
+```ts
+// features/tasks/selectors.ts
+export function selectVisibleTasks(tasks: readonly Task[], filters: TaskFilters): Task[] {
+  const query = filters.q.toLowerCase();
+  return tasks
+    .filter((t) => (filters.status ? t.status === filters.status : true))
+    .filter((t) => t.title.toLowerCase().includes(query));
+}
+
+export function countOverdue(tasks: readonly Task[], now: Date): number {
+  return tasks.filter((t) => t.status !== "done" && t.dueDate !== null && t.dueDate < now).length;
+}
+```
+
+Derived values often combine state from *different homes*. The visible tasks depend on server state (the tasks) and URL state (the filters). Compute them during render from the two sources, instead of syncing them into a third place:
+
+```tsx
+function ProjectBoard({ projectId }: { projectId: string }) {
+  const [filters] = useTaskFilters();          // URL
+  const tasks = useProjectTasks(projectId);    // server cache
+  if (tasks.isPending) return <BoardSkeleton />;
+  if (tasks.isError) return <ErrorState error={tasks.error} />;
+
+  const visible = selectVisibleTasks(tasks.data, filters); // derived: no state, no effect
+  return <BoardColumns tasks={visible} />;
+}
+```
+
+When another feature needs a derived value, the owning feature exports it through its public API ([Chapter 58](/chapter/58)), usually as a hook. The projects feature never computes "overdue" itself:
+
+```ts
+// features/tasks/index.ts
+export function useOverdueCount(projectId: string): number {
+  const tasks = useProjectTasks(projectId); // same cache entry as the board: no extra request
+  return tasks.data ? countOverdue(tasks.data, new Date()) : 0;
+}
+
+// features/projects/components/ProjectCard.tsx
+const overdue = useOverdueCount(project.id); // ✅ via the tasks feature's public API
+```
+
+The same rule applies inside stores: `selectedCount` is `useBoardUiStore((s) => s.selectedTaskIds.length)`, never a separate field that every action must remember to update.
+
+> 💡 **Tip.** Derive first and memoize later. `selectVisibleTasks` over a few hundred tasks costs microseconds. Reach for `useMemo` only when a profiler shows a real cost ([Chapter 72](/chapter/72)).
+
+## 60.7 Avoiding global-state sprawl
+
+Global state is easy to add and hard to remove. Each new field in a global store is visible to the whole app, so nobody is sure who reads it, and nobody dares to delete it. The antidote is a habit: **colocate first, promote only when needed.** Start state as close as possible to where it's used, and move it up one rung only when a real second consumer appears:
+
+```text
+1. useState in the component that uses it
+2. lifted to the nearest common parent         (two siblings need it)
+3. context around one subtree                  (a deep subtree needs it)
+4. an app-wide store                           (distant parts of the app need it, often)
+```
+
+The opening's `searchText` is a good example of state that climbed too high. It was in the global store, so every keystroke notified every subscriber. It actually has two parts: the text *being typed* (local UI state, changing on every key) and the *committed* query (URL state, shareable). Splitting them puts each part in its proper home:
+
+```tsx
+// Before: global, and every keystroke re-renders every store subscriber
+const searchText = useAppStore((s) => s.searchText);
+const setSearchText = useAppStore((s) => s.setSearchText);
+
+// After: the draft is local; the committed query lives in the URL
+function TaskSearch() {
+  const [filters, setFilters] = useTaskFilters();
+  const [draft, setDraft] = useState(filters.q);
+
+  useEffect(() => {
+    if (draft === filters.q) return; // nothing new to commit
+    const id = setTimeout(() => setFilters({ q: draft }, { replace: true }), 250);
+    return () => clearTimeout(id);
+  }, [draft]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  return <input type="search" value={draft} onChange={(e) => setDraft(e.currentTarget.value)} />;
+}
+```
+
+Now typing re-renders one input, the board updates a quarter-second after the user pauses, and the search is shareable as a link. The global store lost a field, and nothing got worse.
+
+> 🚫 **When not to.** Don't move state *down* just to follow a rule. If the toolbar and the cards genuinely both need the selection, lifting it into a shared store is the right call. The goal is the smallest home that serves every real consumer, not the smallest possible store.
+
+## Common mistakes
+
+> ⚠️ **Server data in a client store.** Tasks, projects, and users are snapshots of the server's data. Keep them in a server-state cache, not in `useState`, context, or Zustand.
+
+> ⚠️ **Two sources of truth.** Copying URL filters into `useState`, or query results into a store, guarantees that they'll disagree eventually. Read from the one true home.
+
+> ⚠️ **Storing derived values.** A `visibleTasks` or `overdueCount` field must be updated by every action that touches its inputs. Compute it instead.
+
+> ⚠️ **Context for high-frequency state.** Context re-renders every consumer on every change. Use it for values that change rarely; use a store with selectors for the rest.
+
+```ts
+// ❌ A derived value stored next to its source: every action must remember to update both
+set((s) => ({ selectedTaskIds: [...s.selectedTaskIds, id], selectedCount: s.selectedCount + 1 }));
+// ✅ Derived on read
+const selectedCount = useBoardUiStore((s) => s.selectedTaskIds.length);
+```
+
+## When to use it, and when not to
+
+> ✅ **Use it when** many distant components read and write the same **client-owned** state, and it changes often: multi-selection, drag-and-drop state, an editor canvas, a media player. That's where an external store with selectors earns its place.
+
+> 🚫 **When not to.** Don't add a store for server data (use a server-state cache), for anything that belongs in the URL, for form input, or for state that only one component uses. Many well-built apps have *no* global client store at all: the router, a server-state library, and a couple of small contexts cover everything.
+
+## How it connects
+
+> 🔗 **Connection.** Local state and lifting come from [Chapter 42](/chapter/42); context + reducer from [Chapter 54](/chapter/54) and [Chapter 55](/chapter/55). The URL home was built in [Chapter 59](/chapter/59). The server-cache home is [Chapter 62](/chapter/62), after [Chapter 61](/chapter/61) shows how painful it is to build by hand. Form state is [Chapter 63](/chapter/63). Re-render costs and when to optimize them are in [Chapter 72](/chapter/72).
+
+> 🌍 **Real world.** The industry shift of the last few years has been *shrinking* global stores: once teams moved server data into TanStack Query or RTK Query, and navigational state into the URL, the remaining client store was often a handful of fields.
+
+## Exercises
+
+### Level 1 — Recall
+
+Classify fifteen pieces of TaskFlow state into the five kinds, and name the home for each: the current project ID, a task's comments, the "assignee" dropdown's open flag, the theme, the logged-in user's name, the board's sort order, the text in a new-comment box, the list of project members, the selected tasks for a bulk action, a toast message, the current page of results, whether a drag is in progress, the create-project form's errors, the user's notification settings, and the expanded/collapsed state of one sidebar section.
+
+### Level 2 — Application
+
+A TaskFlow store holds `isCreateTaskModalOpen` and `openCreateTaskModal()`, and only the board header and the modal itself use them. Move that state out of the global store into local state in the nearest common parent, delete the store fields, and confirm that opening the modal no longer re-renders unrelated store subscribers.
+
+### Level 3 — Challenge
+
+Implement a typed Zustand store for the board with two slices, `selection` and `preferences` (density, collapsed columns), each in its own file, combined into one store. Write selectors for "is this task selected", "selected count", and "is this column collapsed", and test the store's actions and selectors without rendering any components.
+
+*Hint: Zustand's slice pattern types each slice creator with `StateCreator<FullStore, [], [], SliceType>`.*
+
+### Level 4 — Real-world
+
+**Ticket TF-327: TaskFlow Web state map.** Before building more of [P14](/projects/p14), document where every piece of state lives.
+
+- A typed state map (like the one in 60.3) lists every piece of state in the app with its home and a one-line reason.
+- Every "shared-client" entry justifies why local state, the URL, or the server cache would not work.
+- No server data appears in any client store or context; any existing violations are listed with a fix.
+- The map is checked into the repository and referenced from the architecture decision record.
+
+## Key takeaways
+
+- State comes in **five kinds**: local UI, shared client, URL, server cache, and form. Each has a natural home.
+- **Server state is a snapshot** of someone else's data. It needs a cache with staleness and refetching, not a store you update by hand.
+- Choose a home with the flowchart: server-owned → cache; shareable → URL; form input → form state; one consumer → local; otherwise shared client state.
+- **Context + reducer** is great for low-frequency app-wide values and strains with high-frequency updates, because context has no selectors.
+- **External stores** like Zustand (`create<State>()(…)`) let components subscribe through selectors; Redux Toolkit adds structure and derives its types from the store.
+- **Derive, don't store**: selectors are pure functions in the owning feature, shared through its public API.
+- **Colocate first, promote only when needed.** The smallest home that serves every real consumer wins.
+
+## What comes next
+
+The flowchart's first question sends tasks, projects, and users to a "server cache", but you don't have one yet. Before using a library, it's worth crossing the network boundary by hand: fetching, validating, mapping, and modeling every loading and error state. That journey starts with a production crash caused by a single `as Task[]`. That's [Chapter 61: Data Fetching & the API Boundary](/chapter/61).

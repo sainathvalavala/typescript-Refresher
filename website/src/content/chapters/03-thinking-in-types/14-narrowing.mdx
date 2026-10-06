@@ -1,0 +1,607 @@
+> 📖 **The problem.** A TaskFlow function receives `value: string | number | null`, say a filter coming from the URL. You know it's a number *right here*, because you just checked. Yet the compiler still says `Property 'toFixed' does not exist on type 'string | number | null'`. Every TypeScript developer asks the same question at this point: "TypeScript knows it *could* be a number. How do I tell it that it *is* one, right here?"
+
+The answer isn't a cast. It is that **you already told it**, by writing the `if`. This chapter teaches you to read your own code the way the compiler does, so every `if`, `return`, and `throw` becomes evidence that narrows a type. You'll learn the eight or so checks TypeScript understands, how to write your own, how to make the compiler prove you handled every case, and how to deal with the `unknown` that every `catch` gives you.
+
+This chapter is the partner of [Chapter 13](/chapter/13). Unions *ask* which one it is; narrowing *answers*.
+
+> 🧠 **Mental model.** **TypeScript reads your code like a detective.** Every `if`, `return`, and `throw` is a piece of evidence, and the type of a variable at any point is *what is still possible at that point in the code*. Narrowing is the shrinking of that set of possibilities as evidence accumulates.
+
+## 14.1 typeof narrowing
+
+The simplest evidence is a `typeof` check. In an `if`, TypeScript removes the types that the check rules out, in the true branch and in the `else`:
+
+```ts
+function format(value: string | number | null): string {
+  if (typeof value === "string") {
+    return value.toUpperCase();   // value: string
+  } else if (typeof value === "number") {
+    return value.toFixed(2);      // value: number
+  } else {
+    return "none";                // value: null  (what's left over)
+  }
+}
+```
+
+`typeof` recognizes the primitives: `"string"`, `"number"`, `"boolean"`, `"bigint"`, `"symbol"`, `"undefined"`, `"function"`, and `"object"`.
+
+Here is the famous trap. In JavaScript, `typeof null === "object"`, a 30-year-old quirk. So a `typeof x === "object"` check does **not** remove `null`:
+
+```ts
+function keysOf(x: object | null) {
+  if (typeof x === "object") {
+    return Object.keys(x);   // ❌ No overload matches this call: 'object | null' is not assignable to 'object'.
+  }
+}
+
+function keysOfSafe(x: object | null) {
+  if (typeof x === "object" && x !== null) {
+    return Object.keys(x);   // ✅ x: object
+  }
+}
+```
+
+Always pair `typeof x === "object"` with an explicit `x !== null`. TypeScript models the quirk faithfully, because the runtime has it.
+
+> ⚠️ **Common mistake.** Assuming `typeof x === "object"` means "a real object". It also matches `null` and arrays.
+
+## 14.2 Truthiness narrowing
+
+In JavaScript, an `if (x)` runs for "truthy" values and skips "falsy" ones: `false`, `0`, `""`, `null`, `undefined`, `NaN` (and `0n`). TypeScript uses that to narrow away `null` and `undefined`:
+
+```ts
+function greet(name: string | undefined): string {
+  if (name) {
+    return `Hello, ${name.toUpperCase()}`;   // name: string
+  }
+  return "Hello, stranger";                  // name: string | undefined  (it might be "")
+}
+```
+
+Notice the last comment. In the false branch, `name` could be `undefined` **or the empty string**. Truthiness checks are *blunt*. They drop more than you meant to:
+
+```ts
+function showCount(count: number | undefined): string {
+  if (count) {
+    return `${count} tasks`;
+  }
+  return "no data";   // 💥 also reached when count is 0, which is valid data!
+}
+
+showCount(0);         // "no data": wrong. There are zero tasks, and we know it.
+```
+
+When `0`, `""`, or `false` are legitimate values, **compare explicitly** instead:
+
+```ts
+function showCount(count: number | undefined): string {
+  if (count !== undefined) {
+    return `${count} tasks`;   // ✅ 0 is handled correctly
+  }
+  return "no data";
+}
+```
+
+The same applies to the `||` and `&&` operators, and to the `!` negation. In the false branch of `!count`, the type includes `0`:
+
+```ts
+function check(x: number | undefined | null) {
+  if (!x) {
+    const t: string = x;   // ❌ Type 'number | null | undefined' is not assignable to type 'string'.
+  }                        //    x still includes number, because the value could be 0
+}
+```
+
+> 💡 **Tip.** Use truthiness for objects and arrays that are `null`/`undefined`, where no falsy value is valid. Use `!== undefined` or `??` for numbers, strings, and booleans.
+
+## 14.3 Equality narrowing
+
+Comparing with `===` or `!==` narrows too. When you compare against a literal or a known value, the variable takes that type:
+
+```ts
+function describe(status: "todo" | "doing" | "done") {
+  if (status === "done") {
+    return "finished";   // status: "done"
+  }
+  return status;         // status: "todo" | "doing"
+}
+```
+
+Comparing **two variables** narrows both to their *common* types:
+
+```ts
+function same(a: string | number, b: string | boolean) {
+  if (a === b) {
+    a;   // a: string   (the only type both can share)
+    b;   // b: string
+  }
+}
+```
+
+The loose check `== null` is the one place where JavaScript's double-equals is useful: `x == null` is true for **both** `null` and `undefined`, and `x != null` removes both:
+
+```ts
+function length(value: string | null | undefined): number {
+  if (value != null) {
+    return value.length;   // value: string  (both null and undefined removed)
+  }
+  return 0;                // value: null | undefined
+}
+```
+
+Many style guides ban `==` everywhere else, and make this one exception. If your linter rejects it, write `value !== null && value !== undefined`; the narrowing is identical.
+
+```ts
+function parse(input: string | undefined): string {
+  if (input === undefined) {
+    return "default";
+  }
+  return input.trim();   // input: string  (the early return removed undefined)
+}
+```
+
+That last example previews a theme of this chapter: even without an `else`, a `return` is evidence.
+
+## 14.4 The in operator
+
+When the members of a union are object types with different properties, the `in` operator checks whether a property *exists* on the value, and narrows accordingly:
+
+```ts
+type Task = { id: string; title: string };
+type Project = { id: string; name: string; tasks: Task[] };
+
+function label(item: Task | Project): string {
+  if ("title" in item) {
+    return item.title;       // item: Task
+  }
+  return item.name;          // item: Project
+}
+```
+
+`"title" in item` is `true` only for the members that *might* have a `title`, so TypeScript keeps `Task` in the true branch and `Project` in the false branch.
+
+`in` is also the standard way to narrow an `unknown` object before you read a property, because it proves the property exists:
+
+```ts
+function readId(value: unknown): string | undefined {
+  if (typeof value === "object" && value !== null && "id" in value) {
+    // value: object & Record<"id", unknown>
+    return typeof value.id === "string" ? value.id : undefined;
+  }
+  return undefined;
+}
+```
+
+Three limits to know. `in` checks existence, not the *type* of the property, so `value.id` above is still `unknown` and needs its own `typeof` check. It only narrows unions of object types, not primitives. And optional properties blur the picture, since a type with `title?: string` may or may not carry the key.
+
+> 🚫 **When not to.** If your union members share a literal tag (`kind`, `status`), narrow on the tag (14.6) instead of `in`. A tag check is faster to read and doesn't depend on which optional fields happen to be present.
+
+## 14.5 instanceof
+
+`instanceof` checks whether a value was created by a given class (technically, whether the class's prototype is in the value's prototype chain). TypeScript narrows to that class:
+
+```ts
+function formatWhen(value: Date | string): string {
+  if (value instanceof Date) {
+    return value.toISOString();   // value: Date
+  }
+  return value;                   // value: string
+}
+```
+
+It's the right tool for built-in classes (`Date`, `Error`, `Map`, `Set`, `RegExp`, `Promise`) and for your own classes ([Chapter 15](/chapter/15)):
+
+```ts
+class ValidationError extends Error {
+  constructor(public field: string, message: string) {
+    super(message);
+  }
+}
+class NotFoundError extends Error {}
+
+function toMessage(error: Error): string {
+  if (error instanceof ValidationError) {
+    return `Check "${error.field}": ${error.message}`;   // error: ValidationError
+  }
+  if (error instanceof NotFoundError) {
+    return "That item no longer exists.";                // error: NotFoundError
+  }
+  return "Something went wrong.";                        // error: Error
+}
+```
+
+The key limitation: `instanceof` is a **runtime** check against a **runtime** value (the class constructor). It does not work with interfaces or type aliases, which are erased, and it can be fooled across realms: an `Error` created in an iframe or a different module copy may not be `instanceof` your `Error`.
+
+```ts
+interface Task { id: string }
+function check(x: unknown) {
+  if (x instanceof Task) {}   // ❌ 'Task' only refers to a type, but is being used as a value here.
+}
+```
+
+> 🔗 **Connection.** `instanceof` and custom error classes are a natural pair, and [Chapter 15](/chapter/15) and [Chapter 33](/chapter/33) build error hierarchies on it.
+
+## 14.6 Narrowing discriminated unions
+
+This is the payoff of [Chapter 13](/chapter/13). When union members share a literal-typed tag, checking the tag narrows to exactly one member. The idiomatic form is a `switch`:
+
+```ts
+type TaskState =
+  | { status: "todo" }
+  | { status: "doing"; assignee: string }
+  | { status: "done"; completedAt: string };
+
+function describe(state: TaskState): string {
+  switch (state.status) {
+    case "todo":
+      return "Not started";
+    case "doing":
+      return `In progress, owned by ${state.assignee}`;   // state: { status: "doing"; assignee: string }
+    case "done":
+      return `Finished on ${state.completedAt}`;          // state: { status: "done"; completedAt: string }
+  }
+}
+```
+
+Inside each `case`, the compiler has narrowed `state` to a single member. You get autocomplete for exactly its fields, and an error for any field from a different one.
+
+An `if` chain works identically, and so do early returns:
+
+```ts
+function assigneeOf(state: TaskState): string | undefined {
+  if (state.status !== "doing") return undefined;
+  return state.assignee;   // ✅ the early return eliminated the other two members
+}
+```
+
+Modern TypeScript even follows the tag through a destructured copy, as long as the original is a `const` or an unreassigned parameter:
+
+```ts
+function show(state: TaskState) {
+  const { status } = state;
+  if (status === "doing") {
+    state.assignee;   // ✅ state: { status: "doing"; assignee: string }
+  }
+}
+```
+
+> ⚠️ **Common mistake.** Reading a variant's field before checking the tag, for example `state.assignee` at the top of the function. The field lives on only one member, so check the tag first and read the field inside that branch.
+
+## 14.7 Control-flow analysis
+
+The name for everything you've seen so far is **control-flow analysis**: TypeScript follows every path through your function, tracking what's been ruled out along each one. Three behaviors to master.
+
+**Early returns and throws narrow the code after them.** This lets you write flat, guard-clause style code instead of nesting:
+
+```ts
+function titleLength(task: { title?: string } | undefined): number {
+  if (!task) return 0;                       // after this: task is an object
+  if (task.title === undefined) return 0;    // after this: task.title is string
+  return task.title.length;                  // ✅ both narrowings accumulate
+}
+```
+
+**Assignments narrow.** A variable's *declared* type is what it may hold. Its *narrowed* type is what it holds *right now*:
+
+```ts
+let value: string | number = "hello";
+value.toUpperCase();   // ✅ value: string (narrowed by the assignment)
+value = 42;
+value.toFixed(0);      // ✅ value: number
+
+function pick(x: string | undefined) {
+  let y = x;           // y: string | undefined
+  if (y === undefined) {
+    y = "default";     // assignment narrows y to string
+  }
+  return y.toUpperCase();   // ✅ y: string on both paths
+}
+```
+
+**Narrowing can be lost.** TypeScript is careful about places where the value may change before your code runs, most commonly inside **callbacks** that capture a variable you reassign later:
+
+```ts
+function schedule(x: string | undefined) {
+  let current = x;
+  if (current === undefined) return;
+
+  setTimeout(() => {
+    current.toUpperCase();   // ❌ 'current' is possibly 'undefined'.
+  });
+
+  current = undefined;       // because of this later assignment, the callback can't trust the check
+}
+```
+
+The compiler can't know *when* the callback runs, so if the variable is ever reassigned after the check, it falls back to the declared type. Take away that reassignment, or use a `const`, and the narrowing is kept:
+
+```ts
+function schedule(x: string | undefined) {
+  if (x === undefined) return;
+  const name = x;                                   // const: can never change
+  setTimeout(() => name.toUpperCase());             // ✅ name: string
+  [1, 2].forEach(() => x.toUpperCase());            // ✅ x is never reassigned, so narrowing survives
+}
+```
+
+The practical fix when you hit a lost narrowing: copy the narrowed value into a `const` before the callback.
+
+> 💡 **Tip.** Prefer `const` and avoid reassigning parameters. Control-flow analysis then has almost nothing to be careful about, and narrowing "just works" even inside callbacks.
+
+## 14.8 User-defined type guards
+
+Sometimes the check you want is too complex for `typeof` or `in`, or you want to reuse it. A **type guard** is a function whose return type is a **type predicate**, `value is Type`. When it returns `true`, TypeScript treats the argument as that type:
+
+```ts
+interface Task { id: string; title: string; done: boolean }
+
+function isTask(value: unknown): value is Task {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as Task).id === "string" &&
+    typeof (value as Task).title === "string" &&
+    typeof (value as Task).done === "boolean"
+  );
+}
+
+const parsed: unknown = JSON.parse(text);
+if (isTask(parsed)) {
+  parsed.title.toUpperCase();   // ✅ parsed: Task
+}
+```
+
+Type guards are also how you filter arrays of mixed types. Passing a guard to `filter` changes the result type:
+
+```ts
+const raw: (Task | undefined)[] = [task1, undefined, task2];
+const tasks = raw.filter((t): t is Task => t !== undefined);   // tasks: Task[]
+```
+
+> 🆕 **Modern note.** From TypeScript 5.5, the compiler **infers** type predicates for simple callbacks, so the explicit `t is Task` is often unnecessary: `raw.filter((t) => t !== undefined)` already produces `Task[]`. It infers only when the function is a pure, single check that is true *exactly* when the type holds. `filter((t) => !!t)` or `filter((t) => t)` do **not** infer a predicate for numbers, because `0` is falsy but still a `number`.
+
+Now the danger. A type predicate is a **promise the compiler trusts without checking**. If the body doesn't verify what the predicate claims, you've written a lie:
+
+```ts
+function isTaskBad(value: unknown): value is Task {
+  return typeof value === "object";   // 😬 any object, even {} or an array, now "is a Task"
+}
+
+if (isTaskBad({ nope: true })) {
+  // TypeScript now believes this is a Task: ✅ compiles, then 💥 at runtime
+}
+```
+
+Keep guards honest: check every property the type requires (as `isTask` does), or use a validation library for large shapes ([Chapter 32](/chapter/32)). A guard is as trustworthy as its body, and no more.
+
+> 🚫 **When not to.** Don't write a type guard where `in`, `typeof`, `instanceof`, or a discriminant check already works. Guards are for checks the built-in forms can't express, or that you'd otherwise repeat.
+
+## 14.9 Assertion functions
+
+A type guard returns a boolean and you branch on it. An **assertion function** takes a different approach: it **throws** if the check fails, and if it returns at all, the type is narrowed for the rest of the scope. Its signature uses `asserts`:
+
+```ts
+function assertIsDefined<T>(value: T | null | undefined, message?: string): asserts value is T {
+  if (value === null || value === undefined) {
+    throw new Error(message ?? "Expected a value, got null or undefined");
+  }
+}
+
+function focusTitle() {
+  const input = document.getElementById("title");   // HTMLElement | null
+  assertIsDefined(input, "#title is missing");
+  input.focus();                                     // ✅ input: HTMLElement. No `!`, no `if`.
+}
+```
+
+This is the safe replacement for the `!` operator from [Chapter 9](/chapter/9): same convenience (no extra nesting), but the check is *real*, and a failure produces a clear message at the right place.
+
+The second form, `asserts condition`, narrows based on a boolean expression you pass in. It's the shape of an **invariant** check:
+
+```ts
+function assert(condition: unknown, message: string): asserts condition {
+  if (!condition) throw new Error(message);
+}
+
+function process(value: string | number) {
+  assert(typeof value === "string", "expected a string");
+  value.toUpperCase();   // ✅ value: string. Execution only reaches here if the assertion held.
+}
+```
+
+Two practical rules. The assertion must be called as a plain statement, and for that the function needs an **explicit type annotation** (a declared function or an annotated const). Also, like type guards, assertions are only as honest as their body. An `asserts value is Task` function with an empty body is a lie that the compiler believes.
+
+```ts
+function assertIsTask(value: unknown): asserts value is Task {
+  if (!isTask(value)) throw new TypeError("Not a Task");   // reuse the guard from 14.8
+}
+```
+
+> ⚠️ **Common mistake.** Using assertions to quiet the compiler without checking anything. An assertion function that doesn't throw on the bad input is `as` in a trench coat.
+
+## 14.10 Exhaustiveness checking with never
+
+When you've narrowed a union by every member, what's left? Nothing: the type `never` ([Chapter 9](/chapter/9)). We can ask the compiler to *verify* that nothing is left, so adding a member to a union produces errors in every place that needs updating.
+
+The classic tool is a helper that accepts only `never`:
+
+```ts
+function assertNever(value: never): never {
+  throw new Error(`Unhandled case: ${JSON.stringify(value)}`);
+}
+
+type Shape =
+  | { kind: "circle"; radius: number }
+  | { kind: "square"; side: number };
+
+function area(shape: Shape): number {
+  switch (shape.kind) {
+    case "circle": return Math.PI * shape.radius ** 2;
+    case "square": return shape.side ** 2;
+    default: return assertNever(shape);   // ✅ shape is never here
+  }
+}
+```
+
+Now add a third member and watch the compiler *find every function to update*:
+
+```ts
+type Shape =
+  | { kind: "circle"; radius: number }
+  | { kind: "square"; side: number }
+  | { kind: "triangle"; base: number; height: number };
+
+// In area():
+//   default: return assertNever(shape);
+//   ❌ Argument of type '{ kind: "triangle"; base: number; height: number; }'
+//      is not assignable to parameter of type 'never'.
+```
+
+The error appears at the `default`, in *every* `switch` that forgot the new case, in all three files of your codebase, with no test needed. It also still throws at runtime if bad data sneaks in from outside.
+
+A lighter version uses `satisfies never` and needs no helper function:
+
+```ts
+function describe(shape: Shape): string {
+  switch (shape.kind) {
+    case "circle": return "round";
+    case "square": return "boxy";
+    default: {
+      shape satisfies never;   // ❌ Type '{ kind: "triangle"; ... }' does not satisfy the expected type 'never'.
+      return "unknown";
+    }
+  }
+}
+```
+
+Use `assertNever` when you want a runtime throw too; use `satisfies never` when the compile-time check is enough. Either way, **always include the `default`.** Without it, a missing case silently falls out of the `switch`. (The same trick drives exhaustive reducers in [Chapter 55](/chapter/55).)
+
+> 💡 **Tip.** An explicit return type on the function also gives exhaustiveness for free in simple cases: if a `switch` misses a case, TypeScript reports `Function lacks ending return statement and return type does not include 'undefined'.` The `default` + `never` version gives a better message and works for non-returning functions.
+
+## 14.11 Narrowing unknown errors
+
+In JavaScript, *anything* can be thrown: `throw "oops"`, `throw 42`, `throw { code: 404 }`. So TypeScript types the variable in a `catch` clause as **`unknown`** (under `strict`, via the `useUnknownInCatchVariables` flag):
+
+```ts
+try {
+  riskyOperation();
+} catch (error) {
+  console.log(error.message);
+  // ❌ 'error' is of type 'unknown'.
+}
+```
+
+It looks like an annoyance, but it's honest: you don't know what was thrown. Narrow it with exactly the tools from this chapter:
+
+```ts
+try {
+  riskyOperation();
+} catch (error) {
+  if (error instanceof Error) {
+    console.error(error.message);   // error: Error
+  } else {
+    console.error("Unexpected throw:", error);   // error: unknown
+  }
+}
+```
+
+Because you'll write this over and over, wrap it in a small helper that always gives you a string:
+
+```ts
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string") return error;
+  if (typeof error === "object" && error !== null && "message" in error && typeof error.message === "string") {
+    return error.message;   // error-like objects, such as ones that cross a boundary
+  }
+  return "Unknown error";
+}
+
+try {
+  await saveTask(task);
+} catch (error) {
+  showToast(getErrorMessage(error));   // ✅ always a string
+}
+```
+
+Don't write `catch (error: any)` or `(error as Error).message` to skip the work. Both claim a fact nobody checked. [Chapter 33](/chapter/33) builds a proper error taxonomy, and custom error classes with `instanceof` ([Chapter 15](/chapter/15)) make the narrowing precise.
+
+## Common mistakes
+
+> ⚠️ **Type guards that lie.** A `value is Task` function whose body doesn't check everything a `Task` requires. The compiler believes it completely.
+
+> ⚠️ **Narrowing lost inside callbacks.** A variable that is reassigned after the check falls back to its declared type inside the callback. Copy the narrowed value to a `const` first.
+
+> ⚠️ **Truthiness checks that drop `0` and `""`.** `if (count)` treats zero as missing. Use `!== undefined` when falsy values are valid.
+
+> ⚠️ **Forgetting `typeof null === "object"`.** Pair an `"object"` check with `!== null`.
+
+> ⚠️ **A `switch` without a `default` that proves exhaustiveness.** Without it, the compiler stays silent when a new union member appears.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** you have a union, an optional value, or an `unknown`, which is all the time. Prefer the built-in forms (`typeof`, `in`, `instanceof`, the discriminant) first. Reach for a custom guard or assertion function when the check is reused or too complex to inline, and for `never` checks on every union that drives behavior.
+
+> 🚫 **When not to.** Don't write a type guard where `in`, `typeof`, or a discriminant already works, and don't use assertion functions to silence the compiler without a real check. If you find yourself writing many guards for one big shape, it's time for runtime validation ([Chapter 32](/chapter/32)).
+
+## How it connects
+
+> 🔗 **Connection.** Narrowing is the other half of [Chapter 13](/chapter/13). It replaces `any` with `unknown` plus proof ([Chapter 9](/chapter/9), [Chapter 32](/chapter/32)); it powers exhaustive reducers ([Chapter 55](/chapter/55)) and discriminated props ([Chapter 85](/chapter/85)); and `instanceof` leads to the error classes of [Chapter 15](/chapter/15) and error design in [Chapter 33](/chapter/33).
+
+> 🌍 **Real world.** Handling a union of API error shapes (`{ type: "network" } | { type: "validation"; fields: ... } | { type: "server"; status: number }`) with a `switch` and `assertNever` is the everyday use. A new error variant from the backend team becomes a compile error in every handler.
+
+## Exercises
+
+### Level 1 — Recall
+
+For each marked line, write the narrowed type of the variable, then verify by hovering.
+
+```ts
+function a(x: string | number | null) {
+  if (typeof x === "number") { x; }          // 1
+  else if (x) { x; }                          // 2
+  else { x; }                                 // 3
+}
+function b(x: string | string[] | undefined) {
+  if (Array.isArray(x)) { x; }                // 4
+  if (!x) return;
+  x;                                          // 5
+}
+function c(x: Date | string | null) {
+  if (x instanceof Date) { x; }               // 6
+  if (x != null) { x; }                       // 7
+  x;                                          // 8
+}
+```
+
+### Level 2 — Application
+
+Write `isTask(value: unknown): value is Task` for TaskFlow's `Task` (`id`, `title`, `done`, optional `dueDate` string). Use it to turn `JSON.parse` output (an array of unknown items) into a `Task[]` containing only the valid entries. Then add a test input in which a task has `done: "yes"` and confirm that your guard rejects it.
+
+### Level 3 — Challenge
+
+Take a small codebase of three files: a `TaskEvent` union with three members, a reducer, a logger that formats events, and a notifier that picks recipients. Add a **fourth** member to the union. Add `assertNever` (or `satisfies never`) defaults so the compiler lists **every place** that needs an update, and keep a list of the exact errors it reports. Then handle the new case in each place until the build is clean.
+
+*Hint: you can only get an error where the `default` branch exists. Check that all three `switch` statements have one.*
+
+### Level 4 — Real-world
+
+**Ticket TF-014: Remove the `!`s.** `src/ui/taskForm.ts` has six non-null assertions (`document.getElementById("title")!` and friends), and two of them crashed in production last month.
+
+- Write a reusable `assertIsDefined` helper (with a message parameter) and refactor the file to use it where the element must exist, and a normal `if` where absence is acceptable.
+- No `!`, no `as`, and no `any` remain in the file.
+- Each failure message names the missing element.
+- Add a short note in the pull request listing which of the six you handled with a throw, and which with a branch, and why.
+
+## Key takeaways
+
+- **Narrowing** is how a union becomes a specific type: every `if`, `return`, and `throw` is evidence the compiler uses.
+- `typeof`, truthiness, equality, `in`, `instanceof`, and a discriminant tag are the built-in checks. Prefer them to custom code.
+- Beware the traps: `typeof null === "object"`, and truthiness dropping `0` and `""`.
+- Narrowing is lost inside callbacks when the variable is reassigned later. Copy to a `const`.
+- Custom **type guards** (`x is T`) and **assertion functions** (`asserts x is T`) extend narrowing, but the compiler trusts them without checking. Make the body honest.
+- End every union-driven `switch` with `assertNever` or `satisfies never`, and the compiler tells you everywhere a new member needs handling.
+- `catch (error)` is `unknown`. Narrow it with `instanceof Error` before you read `.message`.
+
+## What comes next
+
+You have been using `Error`, `Date`, and `Map` with `instanceof` all chapter long without asking where those come from. They are **classes**: factories that bundle data and behavior and also give you a type of the same name. TypeScript adds compile-time access control and contracts on top of what JavaScript provides. [Chapter 15: Classes in TypeScript](/chapter/15) shows you what the extra keywords buy, what `private` does *not* protect, and when a plain function or object is the better choice.

@@ -1,0 +1,522 @@
+> 📖 **The problem.** TaskFlow's billing page has a helper, `formatPrice(value, opts)`, written in plain JavaScript two years ago. It's called in 14 places, and an audit just found that most of them are subtly wrong. Some pass the price as a string. Some pass `{ currency: "usd" }` when the function compares against `"USD"`. One passes `opts` as a bare string "because that's what the other file did". Two callers multiply the result by a tax rate, not realizing it returns a formatted *string*, and quietly produce `NaN`. Nothing in the code said what `opts` was, which arguments were optional, or what came back. Every caller guessed.
+
+Functions are where most of your types will live, because functions are where code meets other code. Annotating a function turns "read the body and guess" into a contract your editor can show at every call site and your compiler can enforce. By the end of this chapter you'll be able to type parameters and returns, optional, default, and rest parameters, callbacks and higher-order functions, functions with properties, overloads, `this`, and async functions, and you'll see exactly where these tools run out and generics begin.
+
+> 🧠 **Mental model.** **A function type is a contract with two sides**: what the caller must provide (the parameters) and what the caller can rely on (the return type). In the set language of [Chapter 10](/chapter/10): every argument must fit inside its parameter's set, and the result is guaranteed to fit inside the return type's set.
+
+## 11.1 Parameter and return types
+
+Here is `formatPrice` with its contract written down. The parameter annotations say what callers must provide; the `: string` after the parentheses says what they get back.
+
+```ts
+type Currency = "USD" | "EUR" | "INR";
+type PriceOptions = { currency: Currency; decimals?: number };
+
+function formatPrice(value: number, opts: PriceOptions): string {
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: opts.currency,
+    minimumFractionDigits: opts.decimals ?? 2,
+  }).format(value);
+}
+
+formatPrice(19.99, { currency: "USD" });   // ✅ "$19.99"
+formatPrice("19.99", { currency: "USD" }); // ❌ Argument of type 'string' is not assignable to parameter of type 'number'.
+formatPrice(19.99, { currency: "usd" });   // ❌ Type '"usd"' is not assignable to type 'Currency'. Did you mean '"USD"'?
+const withTax = formatPrice(19.99, { currency: "USD" }) * 1.2; // ❌ The left-hand side of an arithmetic operation must be of type 'any', 'number', 'bigint' or an enum type.
+```
+
+Every one of the audit's bugs is now a red squiggle at the call site. **Parameters always need annotations**, because TypeScript can't guess what callers will pass; under strict mode an unannotated parameter is an error ("Parameter 'value' implicitly has an 'any' type"). **Return types are inferred** from the `return` statements, so you don't strictly need to write them.
+
+So when should you annotate a return type anyway? When the function is part of a contract other code relies on: exported functions, module APIs, anything called from many places. An inferred return type is whatever the body *happens* to produce, so a careless edit silently changes the contract, and the errors show up at 14 call sites instead of in the function you just broke:
+
+```ts
+// Inferred: the contract is whatever the body produces today.
+function findTask(tasks: Task[], id: string) {
+  return tasks.find((t) => t.id === id) ?? "not found";
+} // hover: function findTask(tasks: Task[], id: string): "not found" | Task
+
+// Annotated: the body must keep the promise.
+function findTaskById(tasks: Task[], id: string): Task | undefined {
+  return tasks.find((t) => t.id === id) ?? "not found"; // ❌ Type '"not found" | Task' is not assignable to type 'Task | undefined'.
+}
+```
+
+> 💡 **Tip.** A good default from [Chapter 6](/chapter/6)'s boundary rule: annotate parameters always, annotate returns on exported functions, and let small local helpers infer.
+
+## 11.2 Optional and default parameters
+
+JavaScript lets callers skip arguments; TypeScript makes you say which ones they may skip. A `?` after the parameter name marks it **optional**. Inside the function, its type includes `undefined`, so you must handle the missing case. A **default value** also makes a parameter optional for callers, but inside the body the default fills the gap, so the type no longer includes `undefined`. TypeScript even infers the type from the default.
+
+```ts
+function formatDue(date: Date, locale?: string): string {
+  // locale: string | undefined
+  return date.toLocaleDateString(locale ?? "en-US");
+}
+
+function paginate(tasks: Task[], page = 1, pageSize = 20): Task[] {
+  // page: number, pageSize: number (the defaults remove undefined)
+  const start = (page - 1) * pageSize;
+  return tasks.slice(start, start + pageSize);
+}
+// hover: function paginate(tasks: Task[], page?: number, pageSize?: number): Task[]
+
+paginate(taskList);      // ✅ page 1, 20 per page
+paginate(taskList, 2);   // ✅
+paginate(taskList, "2"); // ❌ Argument of type 'string' is not assignable to parameter of type 'number'.
+```
+
+There's an ordering rule. Arguments are positional, so an optional parameter can't come before a required one: the caller would have no way to skip it.
+
+```ts
+function assign(note?: string, taskId: string) {} // ❌ A required parameter cannot follow an optional parameter.
+```
+
+Once a function grows a second or third optional parameter, positional arguments get hard to read (`paginate(tasks, undefined, 50)`). That's the moment to switch to an **options object** with destructured defaults, which is what `formatPrice` should have had all along:
+
+```ts
+type Currency = "USD" | "EUR" | "INR";
+
+function formatAmount(
+  value: number,
+  { currency = "USD", decimals = 2 }: { currency?: Currency; decimals?: number } = {},
+): string {
+  return `${currency} ${value.toFixed(decimals)}`;
+}
+
+formatAmount(19.99);                    // ✅ "USD 19.99"
+formatAmount(19.99, { decimals: 0 });   // ✅ named, skippable, order-free
+```
+
+## 11.3 Rest parameters and spread arguments
+
+A **rest parameter** (`...name`) collects any number of trailing arguments into an array, and its annotation is the array type. Callers can pass zero or more values, and each one must fit the element type.
+
+```ts
+function tagTask(taskId: string, ...tags: string[]): void {
+  // tags: string[]
+  console.log(`Tagging ${taskId} with ${tags.join(", ")}`);
+}
+
+tagTask("t1");                       // ✅ zero tags is fine
+tagTask("t1", "urgent", "frontend"); // ✅
+tagTask("t1", "urgent", 3);          // ❌ Argument of type 'number' is not assignable to parameter of type 'string'.
+
+const extraTags = ["backend", "api"];
+tagTask("t1", ...extraTags);         // ✅ spreading an array into a rest parameter
+```
+
+Spreading into a function with a *fixed* list of parameters is stricter. A `string[]` might hold zero items or fifty, so TypeScript can't promise it supplies exactly the right number. A **tuple** has a known length, so it can:
+
+```ts
+function moveTask(taskId: string, toProjectId: string) {
+  /* … */
+}
+
+const args = ["t1", "p2"];                // args: string[]
+moveTask(...args);                        // ❌ A spread argument must either have a tuple type or be passed to a rest parameter.
+
+const pair: [string, string] = ["t1", "p2"];
+moveTask(...pair);                        // ✅ exactly two strings
+```
+
+Tuples work in the other direction too: a rest parameter can have a tuple type, which gives a function a fixed, labeled argument list with optional tail elements. The labels show up in your editor's signature help:
+
+```ts
+type LogLevel = "info" | "error";
+
+function logEvent(...entry: [level: LogLevel, message: string, details?: unknown]) {
+  const [level, message, details] = entry;
+  console[level](message, details);
+}
+
+logEvent("info", "Task created");                // ✅
+logEvent("error", "Sync failed", { code: 503 }); // ✅
+logEvent("warn", "Hmm");                         // ❌ Argument of type '"warn"' is not assignable to parameter of type 'LogLevel'.
+```
+
+## 11.4 Function type expressions
+
+So far we've annotated function *declarations*. But functions are values too: you store them in variables, pass them as arguments, keep them in object properties. To describe a function value, use a **function type expression**, which looks like an arrow function with types instead of a body: `(a: Task, b: Task) => number`. Give it a name with a type alias and it becomes a reusable piece of vocabulary.
+
+```ts
+type TaskComparator = (a: Task, b: Task) => number;
+type TaskPredicate = (task: Task) => boolean;
+
+const byTitle: TaskComparator = (a, b) => a.title.localeCompare(b.title); // a, b: Task from the type
+const isDone: TaskPredicate = (task) => task.status === "done";
+
+const sorted = [...taskList].sort(byTitle); // sorted: Task[]
+const finished = taskList.filter(isDone);   // finished: Task[]
+```
+
+Notice that `byTitle`'s parameters needed no annotations: the type on the variable told TypeScript what `a` and `b` are. The parameter names in a function type are documentation only, so implementations can choose different names.
+
+Two traps are worth knowing. First, the names are *not* optional: in a function type, a lone identifier is read as a parameter **name**, so `(string) => void` declares a parameter called `string` with no type at all. Second, resist the built-in `Function` type. It accepts anything callable and returns `any`, so it checks nothing:
+
+```ts
+type Broken = (string) => void; // ❌ Parameter has a name but no type. Did you mean 'arg0: string'?
+
+function runLater(fn: Function) {
+  return fn("any", "arguments", "at", "all"); // compiles: the result is any
+}
+```
+
+## 11.5 Callbacks
+
+A **callback** is a function you hand to another function to call later: an event listener, a comparator, the function you pass to `map`. You type the callback slot with a function type, and then something pleasant happens at the call site. An inline arrow function gets its parameter types from the slot it's passed into. This is **contextual typing**, and it's why you almost never annotate the parameters of a callback you write inline.
+
+```ts
+type TaskListener = (task: Task, previous: Task) => void;
+
+function onTaskChange(listener: TaskListener) {
+  /* store the listener; call it whenever a task changes */
+}
+
+onTaskChange((task, previous) => {
+  // task: Task, previous: Task, both from context
+  console.log(`${previous.status} → ${task.status}`);
+});
+
+onTaskChange((task) => console.log(task.title)); // ✅ ignoring trailing parameters is fine
+```
+
+That second call shows a rule worth internalizing: a callback may accept **fewer** parameters than the slot provides. JavaScript simply drops the extra arguments, and you do this constantly with `taskList.map((t) => t.title)`, ignoring the index and array that `map` also passes.
+
+A `void` return type in a callback slot means "I will ignore whatever you return", not "you must return nothing". That's what lets terse arrow functions work even when their body happens to produce a value. It's different from declaring a function's *own* return type as `void`, which really does forbid returning a value:
+
+```ts
+const changedIds: string[] = [];
+onTaskChange((task) => changedIds.push(task.id)); // ✅ push returns a number; the slot ignores it
+
+function notify(): void {
+  return true; // ❌ Type 'boolean' is not assignable to type 'void'.
+}
+```
+
+Contextual typing only works when the function is written *in* the slot. Define the callback separately and the context is gone:
+
+```ts
+const logChange = (task) => console.log(task.title); // ❌ Parameter 'task' implicitly has an 'any' type.
+const logChangeTyped: TaskListener = (task) => console.log(task.title); // ✅ context from the annotation
+```
+
+## 11.6 Higher-order functions
+
+A **higher-order function** takes a function as an argument, returns a function, or both. They're how you package *behavior* for reuse: "make me a comparator for this ordering", "make me a version of this function that waits until typing stops". Typing them is just applying 11.4 to parameters and return types.
+
+Here is a factory that returns a comparator. The return annotation is a function type, and the inner arrow function is contextually typed by it:
+
+```ts
+function byPriority(order: Priority[]): (a: Task, b: Task) => number {
+  return (a, b) => order.indexOf(a.priority) - order.indexOf(b.priority);
+}
+
+const urgentFirst = byPriority(["high", "medium", "low"]); // urgentFirst: (a: Task, b: Task) => number
+taskList.sort(urgentFirst);
+```
+
+The classic higher-order function in UI code is `debounce`: wrap a function so that rapid calls collapse into one call after a pause. Here's a version typed for TaskFlow's search box:
+
+```ts
+function debounce(fn: (query: string) => void, ms: number): (query: string) => void {
+  let timer: ReturnType<typeof setTimeout> | undefined; // "whatever setTimeout returns" (Chapter 21)
+  return (query) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn(query), ms);
+  };
+}
+
+const searchTasks = (query: string) => {
+  /* call the API */
+};
+const debouncedSearch = debounce(searchTasks, 300); // debouncedSearch: (query: string) => void
+
+debouncedSearch("docs"); // ✅
+debouncedSearch(42);     // ❌ Argument of type 'number' is not assignable to parameter of type 'string'.
+```
+
+It's type-safe, and it's also limited: this `debounce` works only for functions shaped like `(query: string) => void`. Debouncing a `(taskId: string, title: string) => void` would need another copy. Hold that thought until 11.11.
+
+## 11.7 Call signatures and construct signatures
+
+JavaScript functions are objects, and objects can have properties. A validator might carry its own error message; a React component might carry a `displayName`. A function type expression can't describe properties, so for these you write an object type with a **call signature**: a signature with no name, using `:` before the return type instead of `=>`.
+
+```ts
+type Validator = {
+  (value: string): boolean; // call signature: values of this type can be called
+  message: string;          // …and they also have a message property
+};
+
+function notEmpty(value: string) {
+  return value.trim().length > 0;
+}
+notEmpty.message = "Title is required"; // TypeScript tracks properties added to a function declaration
+
+const titleRule: Validator = notEmpty; // ✅
+if (!titleRule("  ")) console.log(titleRule.message);
+```
+
+The cousin is a **construct signature**, which describes something you call with `new`. You need it when you pass a *class itself* as a value, for example to choose a storage implementation at startup. Write it as `new (args) => Instance`:
+
+```ts
+class ApiTaskStore {
+  baseUrl: string;
+  constructor(baseUrl: string) { this.baseUrl = baseUrl; }
+}
+class MemoryTaskStore {
+  baseUrl: string;
+  constructor(baseUrl: string) { this.baseUrl = baseUrl; }
+}
+
+type TaskStoreClass = new (baseUrl: string) => { baseUrl: string };
+
+function createStore(Store: TaskStoreClass) {
+  return new Store("/api");
+}
+
+createStore(ApiTaskStore);    // ✅
+createStore(MemoryTaskStore); // ✅
+createStore(() => ({ baseUrl: "" })); // ❌ Argument of type '() => { baseUrl: string; }' is not assignable to parameter of type 'TaskStoreClass'.
+```
+
+The last call fails because a plain function can't be called with `new`. You'll write construct signatures rarely, but you'll read them in library types often.
+
+## 11.8 Overloads
+
+Sometimes a function's *return type depends on which kind of argument you pass*. Pass one id, get one task (or nothing); pass an array of ids, get an array of tasks. A single signature with unions can't say that; it would claim every call might return either. **Overloads** let you list several call signatures, followed by one implementation:
+
+```ts
+function find(id: string): Task | undefined; // overload 1
+function find(ids: string[]): Task[];        // overload 2
+function find(idOrIds: string | string[]): Task | Task[] | undefined {
+  // implementation signature: not visible to callers
+  if (typeof idOrIds === "string") return taskList.find((t) => t.id === idOrIds);
+  return taskList.filter((t) => idOrIds.includes(t.id));
+}
+
+const one = find("t1");          // one: Task | undefined
+const many = find(["t1", "t2"]); // many: Task[]
+```
+
+Callers see only the overloads, and TypeScript picks the first one that matches. The implementation signature is hidden, which surprises people when they hold a value that could be *either* kind:
+
+```ts
+function findFromInput(input: string | string[]) {
+  return find(input); // ❌ No overload matches this call.
+}
+```
+
+Overloads have a second weakness: TypeScript checks the body only against the broad implementation signature, not against each overload. If the string branch accidentally returned an array, the compiler wouldn't notice. Overloads are a promise you keep by hand.
+
+So use them only when the return type genuinely varies with the input. If every overload returns the same type, a union parameter says the same thing in one line:
+
+```ts
+// ❌ Overkill: both overloads return string
+function label(value: string): string;
+function label(value: number): string;
+function label(value: string | number): string {
+  return `#${value}`;
+}
+
+// ✅ Same contract, one signature
+function formatLabel(value: string | number): string {
+  return `#${value}`;
+}
+```
+
+## 11.9 Typing this
+
+In JavaScript, `this` isn't decided where a function is written; it's decided by *how it's called*. Call it as `task.method()` and `this` is the task. Pull the method out and call it bare, and `this` is `undefined` in strict mode. For object methods, TypeScript assumes the normal case, which means it can't catch the extracted-method bug:
+
+```ts
+const counter = {
+  count: 0,
+  increment() {
+    this.count++; // this: { count: number; increment(): void; }
+  },
+};
+
+counter.increment();             // ✅
+const increment = counter.increment;
+increment();                     // compiles, then 💥 TypeError: Cannot read properties of undefined (reading 'count')
+```
+
+For standalone functions that rely on `this`, TypeScript lets you declare a **`this` parameter**: a fake first parameter that's checked at compile time and erased from the output. Now calling the function without the right `this` is a compile error:
+
+```ts
+function markDone(this: Task) {
+  this.status = "done";
+}
+
+markDone.call(task); // ✅ this is a Task
+markDone();          // ❌ The 'this' context of type 'void' is not assignable to method's 'this' of type 'Task'.
+```
+
+You'll still meet `this` parameters in DOM code (`function (this: HTMLButtonElement, event: MouseEvent)`) and older libraries. Arrow functions can't take one at all, because they don't have their own `this`: they capture it from the surrounding code. In new code, the simplest fix is to not depend on `this`. Pass the object as an ordinary parameter, and the problem disappears:
+
+```ts
+function completeTask(task: Task): Task {
+  return { ...task, status: "done" };
+}
+
+const done = completeTask(task); // done: Task, with no hidden context to get wrong
+```
+
+## 11.10 Async functions
+
+An `async` function **always** returns a promise, no matter what its body returns. So its return type is `Promise<T>`, where `T` is what the caller gets after `await`. TypeScript infers this for you, and it rejects an annotation that forgets the promise:
+
+```ts
+async function fetchTaskCount(): Promise<number> {
+  const response = await fetch("/api/tasks/count");
+  const body: { count: number } = await response.json();
+  return body.count; // returning a number from an async function produces Promise<number>
+}
+
+async function fetchTaskTitles(): string[] { // ❌ The return type of an async function or method must be the global Promise<T> type. Did you mean to write 'Promise<string[]>'?
+  return [];
+}
+```
+
+Inside an `async` function, `await` unwraps a `Promise<T>` back into a `T`. Forgetting `await` is one of the most common async bugs, and TypeScript catches it, because a `Promise<Task[]>` doesn't have the methods of a `Task[]`:
+
+```ts
+async function countOpenTasks(): Promise<number> {
+  const pending = loadTasks();           // pending: Promise<Task[]>
+  pending.filter((t) => t.status !== "done"); // ❌ Property 'filter' does not exist on type 'Promise<Task[]>'.
+
+  const tasks = await loadTasks();       // tasks: Task[]
+  return tasks.filter((t) => t.status !== "done").length; // ✅
+}
+```
+
+When you start several independent requests at once, `Promise.all` with an array literal keeps each position's type, producing a **tuple** rather than an array of a union:
+
+```ts
+async function loadTaskPage(taskId: string, userId: string, projectId: string) {
+  const [tasks, user, project] = await Promise.all([
+    loadTasks(),
+    loadUser(userId),
+    loadProject(projectId),
+  ]);
+  // tasks: Task[], user: User, project: Project
+  return { task: tasks.find((t) => t.id === taskId), user, project };
+}
+```
+
+> ⚠️ **Common mistake.** `response.json()` returns `Promise<any>`, so `const tasks: Task[] = await response.json()` compiles without checking anything. For data from a server, the honest return type is `Promise<unknown>` until you validate it ([Chapter 32](/chapter/32)).
+
+## 11.11 Generic functions (preview)
+
+Look back at the limits we've hit. `debounce` works only for `(query: string) => void` callbacks. A `first(items)` helper would need a separate version for tasks, users, and projects. Each time, the **return type depends on the argument type**, and nothing in this chapter can express that relationship. The two obvious workarounds both lose information:
+
+```ts
+// With a union: the caller's specific type is lost.
+function firstOf(items: (Task | User)[]): Task | User | undefined {
+  return items[0];
+}
+const t = firstOf(taskList); // t: Task | User | undefined, even though we passed only tasks
+
+// With any: everything is lost.
+function firstAny(items: any[]): any {
+  return items[0];
+}
+const u = firstAny(taskList); // u: any
+u.titel;                      // compiles, and is a typo
+```
+
+What we want is a way to say "whatever kind of array comes in, *that* kind of element comes out". That needs a parameter for the *type* itself:
+
+```ts
+function first<T>(items: T[]): T | undefined {
+  return items[0];
+}
+
+const firstTask = first(taskList);    // firstTask: Task | undefined
+const firstName = first(["Ada", "Linus"]); // firstName: string | undefined
+```
+
+The angle brackets and that `T` are **generics**, and they get a whole part of the book, starting with [Chapter 16](/chapter/16).
+
+## Common mistakes
+
+> ⚠️ **Overloads where a union would do.** If every overload returns the same type, replace them with one signature that takes a union. Save overloads for when the *return* type varies with the input.
+
+> ⚠️ **Using `Function` as a type.** It accepts anything callable and returns `any`. Write the actual shape: `(task: Task) => void`.
+
+> ⚠️ **Putting optional parameters before required ones.** It's a compile error, and for good reason: positional callers couldn't skip them. Reorder the parameters, or switch to an options object.
+
+> ⚠️ **Declaring an async function as returning `T`.** `async function load(): Task[]` is an error. The annotation is always `Promise<Task[]>`, and the caller gets `Task[]` only after `await`.
+
+```ts
+async function loadAll(): Task[] { // ❌ The return type of an async function or method must be the global Promise<T> type. Did you mean to write 'Promise<Task[]>'?
+  return loadTasks();
+}
+```
+
+## When to use it, and when not to
+
+> ✅ **Use it when** you're writing any function that other code calls: annotate every parameter, annotate the return type of anything exported, and name function types (`TaskComparator`, `TaskListener`) that appear in more than one place. Use an options object once a function has more than one optional parameter.
+
+> 🚫 **When not to.** Don't annotate inline callback parameters that contextual typing already infers (`taskList.map((t: Task) => …)` adds noise). Avoid overloads unless the return type genuinely differs by input. And avoid explicit `this` parameters in new code: a plain function that takes the object as an argument is simpler and can't be called with the wrong context.
+
+## How it connects
+
+> 🔗 **Connection.** Function contracts are assignability from [Chapter 10](/chapter/10) applied at every call. The `typeof` checks inside `find` are a first taste of narrowing ([Chapter 14](/chapter/14)). The limitation in 11.11 is solved by generics ([Chapter 16](/chapter/16)), and a fully generic `debounce` appears in [Chapter 19](/chapter/19). In React, every event handler you write is a contextually typed callback ([Chapter 51](/chapter/51)), and every component is a function whose parameter is its props ([Chapter 50](/chapter/50)). You'll build a library of these helpers in [P03](/projects/p03).
+
+> 🌍 **Real world.** Two typing jobs show up in almost every codebase. One is an **event registry**: a type that maps each event name to its callback type, so `created` listeners receive a `Task` and `deleted` listeners receive an id. The other is a **`fetch` wrapper** that sets headers, handles errors, and returns `Promise<unknown>` until the data is validated. Here's the registry's shape; [Chapter 17](/chapter/17) shows how to type a single `on(event, handler)` function over it.
+
+```ts
+type TaskEvents = {
+  created: (task: Task) => void;
+  moved: (task: Task, fromProjectId: string) => void;
+  deleted: (taskId: string) => void;
+};
+```
+
+## Exercises
+
+### Level 1 — Recall
+
+Write a named function type (a `type` alias) for each of these. Don't implement them; just write the contract.
+
+1. A comparator that orders two users.
+2. A predicate that tells whether a task is overdue, given the task and today's date.
+3. An async loader that takes a project id and resolves to a project.
+4. A formatter that takes a `Date` and an *optional* locale string and returns a string.
+5. A listener that receives a task and its previous status, and whose return value is ignored.
+
+### Level 2 — Application
+
+Type a `debounce(fn, ms)` for TaskFlow's filter bar, whose callback is `(status: TaskStatus, search: string) => void`. The debounced function must accept exactly the same arguments as the callback. Then try to pass a callback of a different shape and write a short comment explaining the limitation you hit. You'll remove it in [Chapter 19](/chapter/19).
+
+### Level 3 — Challenge
+
+Write overloads for `createElement(tag)` so that `createElement("input")` returns `HTMLInputElement`, `createElement("a")` returns `HTMLAnchorElement`, and `createElement("div")` returns `HTMLDivElement`. Then answer: what happens when a caller passes a `tag` whose type is `string`? What would you have to add to support twenty tags? Keep your answer; [Chapter 20](/chapter/20) replaces the overloads with a lookup type.
+
+*Hint: the implementation signature's return type must cover all three element types.*
+
+### Level 4 — Real-world
+
+**Ticket TF-188: Type the legacy API module.** `api.js` has eight untyped functions: `getTasks(projectId)`, `getTask(id)`, `createTask(input)`, `updateTask(id, changes)`, `deleteTask(id)`, `onSyncProgress(callback)`, `retryFailed(callback, attempts)`, and `formatError(err, options)`. Convert it to `api.ts`.
+
+- Every exported function has annotated parameters **and** an explicit return type; all async functions return `Promise<…>`.
+- Callbacks have named function types; inline callbacks at call sites need no annotations.
+- No `any` and no `Function`; server responses are typed `unknown` at the point they arrive, with a `TODO(Ch 32)` comment where validation will go.
+- At least one call site in the app that was previously wrong now fails to compile, and you fix it.
+
+## Key takeaways
+
+- A function type is a two-sided **contract**: parameters are what callers must provide, the return type is what they can rely on.
+- Annotate **parameters always** and **returns on exported functions**; let the rest infer.
+- `?` adds `undefined` inside the body; a default removes it. Optional parameters go last, and more than one optional parameter usually wants an options object.
+- Rest parameters are arrays; spreading into fixed parameters needs a **tuple**.
+- Name function types, avoid `Function`, and let **contextual typing** annotate inline callbacks for you. A `void` callback slot means "return value ignored".
+- Call signatures describe functions with properties; construct signatures describe things you call with `new`.
+- Use **overloads** only when the return type varies with the input; otherwise use a union.
+- Prefer plain parameters to `this`. Async functions return `Promise<T>`, and `Promise.all` preserves tuple types.
+
+## What comes next
+
+Most of the parameters in this chapter were objects: `PriceOptions`, `Task`, filter settings. TaskFlow already has `AdminUser`, `GuestUser`, and `Customer` types that share most of their fields, and every change to `email` has to be made three times. [Chapter 12: Objects, Interfaces & Composition](/chapter/12) shows how to build object types from small named pieces, so that each fact about your domain is written exactly once.

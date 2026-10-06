@@ -1,0 +1,283 @@
+> 📖 **The problem.** You maintain `@taskflow/utils`, a small library used by six internal apps. Last Tuesday you shipped a minor release, `1.4.0`, whose changelog said "improved typings". You made `groupBy` return a more precise type and tightened a parameter from `string` to a union of keys. By Wednesday morning, 40 downstream projects had red builds. No runtime behavior had changed at all. The only thing that changed was what TypeScript *believed*, and that was enough.
+
+Types feel like internal bookkeeping while you're the only consumer. The moment someone else imports your code, they become something stricter: a **promise about what callers may write and what they may rely on**. This chapter is about making promises you can keep. You'll learn to treat exported types as an API surface, design signatures that infer well, accept wide and return narrow, tame complicated generics behind simple names, resist cleverness you can't afford, evolve types without breaking people, and document them so others can use them.
+
+> 🧠 **Mental model.** **Every exported type is a promise.** Make promises you can keep: accept wide inputs, return precise outputs, and hide complexity behind simple names. The more you promise, the less freedom you keep.
+
+## 91.1 Types as API surface
+
+An **API surface** is everything a consumer can touch and therefore everything you must not casually change. In a TypeScript library, that surface is larger than the functions people call. It includes every exported type, every property on those types, every generic parameter and its constraint, every overload, and even the *inferred* return types of functions you never annotated.
+
+That last one is the trap. If you don't write a return type, the compiler writes one for you, and consumers can come to depend on it:
+
+```ts
+// taskflow-utils/src/index.ts
+export function summarize(tasks: Task[]) {
+  return { total: tasks.length, done: tasks.filter((t) => t.status === "done").length };
+}
+// Inferred return type: { total: number; done: number }
+// It is now part of your public API, whether you meant it to be or not.
+```
+
+Add a field to that object tomorrow and nobody breaks. Rename `done` to `completed` and everyone does. Writing the return type explicitly turns an accident into a decision:
+
+```ts
+export interface TaskSummary {
+  total: number;
+  done: number;
+}
+
+export function summarize(tasks: readonly Task[]): TaskSummary {
+  return { total: tasks.length, done: tasks.filter((t) => t.status === "done").length };
+}
+```
+
+> 💡 **Tip.** Think of the file that re-exports your public names (usually `index.ts`) as the contract. Anything not re-exported there is private, and consumers who deep-import it are on their own. Chapter 92 shows how `exports` in `package.json` makes that rule enforceable.
+
+## 91.2 Inference-first public APIs
+
+The best generic API is one where the caller never writes angle brackets. If a consumer must write `createStore<TaskState, TaskAction>(...)`, you have pushed your type machinery onto them. Design the signature so that every type parameter appears in a **value-level argument** that TypeScript can read ([Chapter 16](/chapter/16)).
+
+Compare two designs for a typed event channel:
+
+```ts
+// ❌ Callers must name the type. Nothing is inferred; it's an unchecked assertion.
+declare function createChannel<TEvents>(): Channel<TEvents>;
+const a = createChannel<{ taskDone: { id: string } }>();
+
+// ✅ Callers pass a value; the type is inferred from it.
+declare function defineChannel<const TEvents extends Record<string, unknown>>(
+  initial: TEvents,
+): Channel<TEvents>;
+
+const b = defineChannel({ taskDone: { id: "t1" } }); // Channel<{ readonly taskDone: { readonly id: "t1" } }>
+```
+
+The `const` modifier on a type parameter (TypeScript 5.0+) asks the compiler to infer the narrowest literal types, which is often what a configuration-style API wants. Whether you want that depends on the API: for configuration objects, yes; for data containers, you usually want the widened `string`.
+
+A quick test for your own APIs: write the three most common call sites in a scratch file and look at the hover text. If any of them needs a manual type argument or an `as`, the design is leaking.
+
+## 91.3 Accept wide, return narrow
+
+This is the oldest rule in interface design, and in TypeScript it has concrete forms.
+
+**Accept wide:** a function should ask for the *least* it needs. If it only reads from an array, take `readonly T[]`, which accepts both mutable and readonly arrays. If it only needs an `id`, don't demand a full `Task`:
+
+```ts
+// ❌ Rejects readonly arrays, and demands a whole Task
+export function countDone(tasks: Task[]): number { /* … */ return 0; }
+
+const frozen: readonly Task[] = loadTasks();
+countDone(frozen); // ❌ The type 'readonly Task[]' is 'readonly' and cannot be assigned to the mutable type 'Task[]'.
+
+// ✅ Reads only what it uses
+export function countDone(tasks: readonly Pick<Task, "status">[]): number {
+  return tasks.filter((t) => t.status === "done").length;
+}
+```
+
+**Return narrow:** give back the most precise type you can *truthfully* promise. Callers can always widen a precise type, but they can't recover precision you threw away:
+
+```ts
+export function splitByStatus(tasks: readonly Task[]): Record<Task["status"], Task[]> {
+  const out: Record<Task["status"], Task[]> = { todo: [], doing: [], done: [] };
+  for (const t of tasks) out[t.status].push(t);
+  return out;
+}
+const { todo } = splitByStatus(all); // todo: Task[] (never undefined)
+```
+
+> ⚠️ **Common mistake.** Returning a precise type is a stronger promise. If `splitByStatus` returned `Partial<Record<...>>` first and you later "improve" it to the full record, that's safe. The reverse, tightening an input or loosening an output, is how you break 40 projects.
+
+## 91.4 Managing complex generics
+
+Sometimes the problem genuinely needs a sophisticated type. The goal is then to keep the sophistication *behind* the API, in a form a reader can navigate. Three habits help.
+
+**Name the intermediate steps.** One 30-line conditional type is unreadable and unmaintainable. Split it into named pieces, each with one job, and hover text improves too:
+
+```ts
+// ❌ One expression doing four jobs
+export type RouteParamsTangled<T extends string> =
+  T extends `${string}:${infer P}/${infer R}` ? { [K in P | keyof RouteParamsTangled<R>]: string }
+  : T extends `${string}:${infer P}` ? { [K in P]: string } : {};
+
+// ✅ Named pieces
+type ParamName<Segment extends string> = Segment extends `:${infer Name}` ? Name : never;
+type Segments<Path extends string> = Path extends `${infer Head}/${infer Rest}` ? Head | Segments<Rest> : Path;
+
+export type RouteParams<Path extends string> = {
+  [Name in ParamName<Segments<Path>>]: string;
+};
+type P = RouteParams<"/projects/:projectId/tasks/:taskId">; // { projectId: string; taskId: string }
+```
+
+**Keep helpers unexported.** `ParamName` and `Segments` are implementation details, so don't export them. Fewer exports means fewer promises.
+
+**Present a simple surface.** The consumer sees `RouteParams<"/a/:id">`, not the machinery. If an error message from your type leaks three layers of internals, add a friendlier failure case (a branded error type or a descriptive string literal) at the point where the input is invalid.
+
+## 91.5 Avoiding over-engineering
+
+You met the **complexity budget** in [Chapter 89](/chapter/89): every clever type costs readers, compile time, and future maintainers. For public APIs the price goes up, because you can't see your consumers' code, and they can't see your reasons.
+
+Ask three questions before shipping an advanced type:
+
+1. **What bug does it prevent that a plain type wouldn't?** If you can't name a real bug, skip it.
+2. **Can a consumer debug its errors?** An error that says `Type 'X' is not assignable to type 'DeepMerge<Omit<Partial<...>>>'` is a support ticket.
+3. **What does it cost the compiler?** Deep recursion and huge unions slow every consumer's editor ([Chapter 95](/chapter/95)).
+
+```ts
+// Plain and honest
+export function updateTask(task: Task, patch: Partial<Pick<Task, "title" | "status" | "dueDate">>): Task {
+  return { ...task, ...patch };
+}
+
+// Over-engineered: a recursive DeepPatch with path strings, for a flat 6-field object
+export declare function updateTaskDeep<P extends Paths<Task>>(task: Task, path: P, value: PathValue<Task, P>): Task;
+```
+
+> 🚫 **When not to.** If the clever version only saves callers one line and the plain version fails with a readable error, the plain version wins.
+
+## 91.6 Evolving types safely
+
+Libraries live for years, so the important skill is changing types *without* breaking people. The safest changes are **additive**: new optional properties, new exports, new overloads at the end of the list. Dangerous changes remove or narrow what callers could do before.
+
+When something must go, **deprecate first**. TSDoc's `@deprecated` tag makes editors draw a strikethrough at every use, with your migration hint:
+
+```ts
+export interface Task {
+  id: string;
+  title: string;
+  status: "todo" | "doing" | "done";
+  /** @deprecated Use `status === "done"` instead. Removed in v3. */
+  completed?: boolean;
+}
+
+export function addTask(title: string): Task;
+export function addTask(input: { title: string; projectId?: string }): Task; // new form, added alongside
+export function addTask(arg: string | { title: string; projectId?: string }): Task {
+  const input = typeof arg === "string" ? { title: arg } : arg;
+  return { id: crypto.randomUUID(), title: input.title, status: "todo" };
+}
+```
+
+The overload transition is the pattern: ship the new form alongside the old one, mark the old one `@deprecated`, give people a release or two (or a codemod, [Chapter 93](/chapter/93)), then remove it in the next major.
+
+| Change | Safe? |
+|---|---|
+| Add an optional property to a returned type | Yes |
+| Add a required property to an *input* type | **No**: existing callers lack it |
+| Add a required property to an *output* type | Usually yes (callers only read) |
+| Widen a parameter type (`string` to `string \| number`) | Yes |
+| Narrow a parameter type | **No** |
+| Change a return type to a supertype | **No**: callers may use the narrower fields |
+
+## 91.7 Documenting types
+
+Types document *shape*; they can't document *intent*. For that, use **TSDoc** comments, which editors show on hover. Write the sentence a consumer needs at the moment they're deciding whether to call the function: what it does, what the edge cases are, and an example.
+
+```ts
+/**
+ * Groups tasks by a key, preserving input order inside each group.
+ *
+ * @param tasks - Tasks to group. Not mutated.
+ * @param key - Property to group by. Must be a primitive-valued field.
+ * @returns A map from each distinct key value to its tasks.
+ *
+ * @example
+ * ```ts
+ * const byStatus = groupTasksBy(tasks, "status");
+ * byStatus.get("done"); // Task[] | undefined
+ * ```
+ * @since 1.2.0
+ */
+export function groupTasksBy<K extends keyof Task>(tasks: readonly Task[], key: K): Map<Task[K], Task[]> {
+  const out = new Map<Task[K], Task[]>();
+  for (const t of tasks) out.set(t[key], [...(out.get(t[key]) ?? []), t]);
+  return out;
+}
+```
+
+Examples in comments rot, so the strongest documentation is a **type test**: a compile-time assertion that your exported types behave as promised. It fails the build when someone changes behavior by accident, and it doubles as a runnable example ([Chapter 19](/chapter/19) and [P04](/projects/p04) used the technique).
+
+```ts
+// groupTasksBy.test-d.ts (checked by tsc, never executed)
+type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false;
+const assertType = <T extends true>() => {};
+
+const grouped = groupTasksBy([] as Task[], "status");
+assertType<Equal<typeof grouped, Map<"todo" | "doing" | "done", Task[]>>>(); // ✅ fails to compile if the promise changes
+```
+
+> 🔗 **Connection.** Libraries like `tsd` and `expect-type` package this idea. In [Chapter 92](/chapter/92) you'll combine type tests with an API report so that *any* change to your public surface shows up in review.
+
+## Common mistakes
+
+> ⚠️ **Leaking inferred types.** An un-annotated exported function exports whatever the compiler inferred. Annotate return types on every public function, and consider `isolatedDeclarations` ([Chapter 92](/chapter/92)), which enforces this.
+
+> ⚠️ **Treating type-only changes as "safe".** Tightening a parameter, adding a required field to an input, or changing a generic default can break every consumer without touching runtime behavior.
+
+> ⚠️ **Exporting helper types "just in case".** Each export is a promise. Export when someone needs it, not when it might be handy.
+
+> ⚠️ **Public `any` and `object`.** `any` in your signature disables checking in every caller. Prefer `unknown` for inputs and a precise type for outputs.
+
+```ts
+export function parse(text: string): any { return JSON.parse(text); }
+const n = parse("{}").nope.deeper; // ✅ compiles → 💥 TypeError at runtime
+```
+
+## When to use it, and when not to
+
+> ✅ **Use it when** other people compile against your code: published packages, shared internal libraries, a design system, a contracts package. The more consumers and the less you can see their code, the more these habits pay.
+
+> 🚫 **When not to.** In application code that only your team imports and that changes weekly, full API discipline (TSDoc on every function, type tests, deprecation cycles) is overhead. A rename plus "fix all the red squiggles" beats a deprecation period. Save the ceremony for real boundaries.
+
+## How it connects
+
+> 🔗 **Connection.** This chapter applies [Chapter 16](/chapter/16) (inference), [Chapter 19](/chapter/19) (reusable generic APIs and type tests), and [Chapter 89](/chapter/89) (component API design) to libraries. Next, [Chapter 92](/chapter/92) covers how the package itself is built so consumers actually *see* these types, and [Chapter 93](/chapter/93) applies the same discipline to UI components.
+
+> 🌍 **Real world.** Mature libraries publish API reports and run type tests in CI: TanStack Query, Zod, and the React type definitions all treat type changes as semver-relevant.
+
+## Exercises
+
+### Level 1 — Recall
+
+For each change to an exported type, decide whether it is breaking for existing consumers:
+
+1. Add an optional `dueDate?: string` to `Task`.
+2. Add a required `projectId: string` to the `CreateTaskInput` parameter type.
+3. Change a parameter from `string` to `string | number`.
+4. Change a parameter from `Task[]` to `readonly Task[]`.
+5. Change a return type from `Task[]` to `readonly Task[]`.
+6. Rename an exported interface without leaving an alias.
+7. Add a new overload at the end of an overload list.
+8. Add a required `reviewer: User` to the `Task` type that your function *returns*.
+
+### Level 2 — Application
+
+A library function is declared `function totalEstimate(tasks: Task[]): number | undefined`, and it always returns a number when `tasks` is non-empty. Make the input `readonly`, accept anything with an `estimate` field, and make the output more precise without breaking any existing caller. Explain, for each change, why callers cannot break.
+
+### Level 3 — Challenge
+
+Take this exported 30-line conditional type (provided by your instructor or from a router library you use) and refactor it into named, documented, tested pieces. Only one name may remain exported. *Hint: write the type tests first, then refactor while they stay green.*
+
+### Level 4 — Real-world
+
+**Ticket UI-31: Public-API guidelines for `@taskflow/ui` ([P20](/projects/p20)).** Write `API-GUIDELINES.md` for the component library.
+
+- Cover prop naming, inference rules, `readonly` inputs, when to export helper types, and the deprecation process.
+- Include one good and one bad example of each rule, with the compiler or reviewer feedback.
+- Define what counts as a breaking type change for this library, with a table.
+- Add a pull-request checklist item that links to the guidelines.
+
+## Key takeaways
+
+- Every exported type is a promise, including types the compiler **inferred** for you. Annotate public return types.
+- Design for inference: if callers must write type arguments, the signature is leaking.
+- Accept wide (`readonly`, `Pick`), return narrow. Tightening inputs or loosening outputs breaks callers.
+- Name intermediate types, keep helpers private, and show a simple surface.
+- Evolve by adding. Deprecate with `@deprecated` and an overload transition before removing.
+- Document with TSDoc, and **test types** so the documentation can't lie.
+
+## What comes next
+
+You've designed types worth publishing. But a package whose types work in your repo can still show `any` for every import in a consumer's CommonJS project, or fail to load in Node ESM. Publishing is its own discipline: [Chapter 92: Library Authoring, Publishing & Semantic Versioning](/chapter/92).

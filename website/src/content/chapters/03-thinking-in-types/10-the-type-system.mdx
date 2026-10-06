@@ -1,0 +1,465 @@
+> 📖 **The problem.** In your first week on the TaskFlow codebase, TypeScript does three things that look inconsistent. First, a function that expects an `Animal` happily accepts a `Dog`, even though `Dog` never mentions `Animal`: no `extends`, no `implements`, nothing. Second, `createTask({ title: "Ship it", priorty: "high" })` is rejected with "Object literal may only specify known properties", yet when a teammate stores the very same object in a variable and passes the variable, it compiles. Third, you hover over `const method = "GET"` and the editor says its type is `"GET"`. Not `string`. Change `const` to `let`, and now it *is* `string`.
+
+These are not three quirks to memorize. They are three consequences of one idea, and once you hold that idea, most of TypeScript's behavior (including its error messages) stops being surprising and starts being predictable.
+
+This chapter gives you that idea. By the end, you'll be able to predict whether one type is assignable to another, read "is not assignable" errors as precise statements instead of noise, tell type space from value space, and decide when a type assertion is a legitimate tool and when it is a lie told to the compiler.
+
+> 🧠 **Mental model.** **Types are sets of values.** `string` is the set of every possible string. `"GET"` is a set with exactly one member. `unknown` is the set that contains everything, and `never` is the empty set. **Assignability means "fits inside"**: type A is assignable to type B when every value in A is also in B. This picture comes back in almost every chapter of the book, so it's worth making it vivid now.
+
+## 10.1 Types as sets of values
+
+[Chapter 6](/chapter/6) described a type informally as "a description of which values are allowed". Let's take that literally. A type **is** a set: the collection of every runtime value it allows. Some of these sets have one member, some have a handful, and some are infinite.
+
+```ts
+type Method = "GET";                         // a singleton set: exactly one value
+type Flag = boolean;                         // a finite set: true and false
+type TaskStatus = "todo" | "doing" | "done"; // a finite set of three strings
+type Title = string;                         // an infinite set: every string there is
+
+const method: Method = "GET";        // ✅ "GET" is a member of the set
+const status: TaskStatus = "doing";  // ✅
+const other: TaskStatus = "blocked"; // ❌ Type '"blocked"' is not assignable to type 'TaskStatus'.
+```
+
+When TypeScript checks a value against a type, it is asking a membership question: *is this value in that set?* `"blocked"` simply isn't one of the three members of `TaskStatus`, so the answer is no.
+
+Sets can sit inside other sets. Every member of `TaskStatus` is also a string, so the `TaskStatus` region lives inside the `string` region. Here is the primitive world drawn that way. Keep this picture handy; we'll redraw parts of it all book long.
+
+```text
+┌──────────────────────────── unknown: every value ────────────────────────────┐
+│                                                                              │
+│   ┌───────────── string ─────────────┐   ┌──────── number ────────┐          │
+│   │  ""   "hello"   "GET"   …        │   │  0   -7   3.14   …     │          │
+│   │   ┌──────── TaskStatus ───────┐  │   │   ┌─── 1 | 2 | 3 ───┐  │          │
+│   │   │ "todo"  "doing"  "done"   │  │   │   │  1    2    3    │  │          │
+│   │   └───────────────────────────┘  │   │   └─────────────────┘  │          │
+│   └──────────────────────────────────┘   └────────────────────────┘          │
+│                                                                              │
+│   ┌─ boolean ──┐    null    undefined    objects, arrays, functions …        │
+│   │ true false │                                                             │
+│   └────────────┘              never = ∅  (contains no values at all)         │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+Object types are sets too, and this is where intuition needs care. `{ title: string }` does **not** mean "objects with exactly a title". It means *the set of all values that have a `title` property holding a string*. A task with ten other properties is still in that set. So adding a property to an object type makes the set **smaller**: fewer values satisfy two requirements than one.
+
+```ts
+type HasTitle = { title: string };                       // every value with a string title
+type HasTitleAndDone = { title: string; done: boolean }; // …that ALSO has a boolean done
+
+const draft = { title: "Write docs", done: false, priority: "high" };
+const a: HasTitle = draft;        // ✅ draft has a string title; the rest doesn't matter
+const b: HasTitleAndDone = draft; // ✅ it also has a boolean done
+
+//  ┌──────────── { title: string } ────────────┐
+//  │                                           │
+//  │   ┌── { title: string; done: boolean } ┐  │   more properties
+//  │   │          (draft lives here)        │  │   = more requirements
+//  │   └────────────────────────────────────┘  │   = a SMALLER set
+//  └───────────────────────────────────────────┘
+```
+
+Hold on to "more properties, smaller set". It sounds backwards the first time, and it's the key to [Chapter 13](/chapter/13)'s intersections.
+
+## 10.2 Assignability
+
+The error you will see most often in TypeScript is "Type 'X' is not assignable to type 'Y'". With the set picture, "assignable" has a precise meaning: **X is assignable to Y when the set X fits entirely inside the set Y**. Mathematicians call this being a *subset*, written X ⊆ Y. If even one value of X lives outside Y, the assignment is rejected, because TypeScript can't rule out that this is exactly the value you'll have at runtime.
+
+```ts
+type TaskStatus = "todo" | "doing" | "done";
+
+function setStatus(status: TaskStatus) {
+  /* … */
+}
+
+setStatus("done"); // ✅ the set "done" fits inside TaskStatus
+
+const fromUrl = new URLSearchParams(location.search).get("status") ?? "todo"; // fromUrl: string
+setStatus(fromUrl); // ❌ Argument of type 'string' is not assignable to parameter of type 'TaskStatus'.
+```
+
+The second call fails even though the URL *probably* says `"done"`. TypeScript reasons about the whole set, not the likely value: `fromUrl` could be `"banana"`, and `"banana"` is not a status. The fix is never to silence the error. It's to **shrink the set** with a runtime check, which is what [Chapter 14](/chapter/14) (narrowing) is all about.
+
+Notice that assignability has a direction. Narrow fits into wide; wide does not fit into narrow:
+
+```text
+   "done"   ⊆   TaskStatus   ⊆   string   ⊆   unknown
+   ─────────────────────────────────────────────────►
+      a value can always move to a BIGGER set,
+      never to a smaller one without proof
+```
+
+When an error has several lines, each line zooms in on *where* a value escapes the target set. Read them top to bottom as "this doesn't fit, because this part doesn't fit, because this value doesn't fit":
+
+```ts
+type Task = { title: string; status: TaskStatus };
+
+const draft = { title: "Ship it", status: "todo" }; // draft: { title: string; status: string; }
+const task: Task = draft; // ❌ Type '{ title: string; status: string; }' is not assignable to type 'Task'.
+//                             Types of property 'status' are incompatible.
+//                               Type 'string' is not assignable to type 'TaskStatus'.
+```
+
+The last line is the real cause: `draft.status` was inferred as the whole `string` set, which doesn't fit inside the three-member `TaskStatus`. Why `string` and not `"todo"`? That's puzzle three, and we'll solve it in 10.5.
+
+## 10.3 Structural typing
+
+Back to puzzle one: why does a `Dog` fit where an `Animal` is expected when neither mentions the other? Languages such as Java and C# use **nominal typing**: compatibility comes from *names* and declared relationships. A `Dog` is an `Animal` only if its declaration says so.
+
+```java
+// Java: nominal typing
+interface Animal { String name(); }
+class Dog { public String name() { return "Rex"; } } // same shape, but never says "implements Animal"
+
+static void greet(Animal a) { System.out.println("Hello, " + a.name()); }
+
+greet(new Dog()); // compile error: Dog cannot be converted to Animal
+```
+
+TypeScript uses **structural typing**: compatibility comes from *shape*. The type `{ name: string }` is the set of every value with a string `name`, and a dog value has a string name, so it's in the set. Nobody needs to declare anything.
+
+```ts
+type Animal = { name: string };
+type Dog = { name: string; bark(): void };
+
+function greet(animal: Animal) {
+  return `Hello, ${animal.name}`;
+}
+
+const rex: Dog = { name: "Rex", bark: () => console.log("Woof") };
+greet(rex); // ✅ Dog never mentions Animal, but every Dog has a string name
+```
+
+Why would a language choose this? Because JavaScript already works this way. JS code never checks declared relationships; it just reaches for properties. This style is often called *duck typing*: if it has a `name`, it can be greeted. TypeScript describes JavaScript as it's actually written, including object literals that were never declared to be any type at all. In TaskFlow, that means a `renderBadge(item: { title: string; status: TaskStatus })` function works for tasks today and for subtasks or milestones tomorrow, without anyone wiring up a hierarchy.
+
+The flip side: two types with the same shape are interchangeable, even when they mean different things.
+
+```ts
+type UserId = string;
+type ProjectId = string;
+
+function archiveProject(id: ProjectId) {
+  /* … */
+}
+
+const currentUserId: UserId = "u_42";
+archiveProject(currentUserId); // ✅ compiles, and archives the wrong thing
+```
+
+A type alias is just a *name for a set*, not a new set. `UserId` and `ProjectId` both name the set of all strings, so TypeScript sees no difference. When you genuinely need distinct types with the same underlying shape, [Chapter 78](/chapter/78) shows how to simulate nominal typing with branded types.
+
+## 10.4 Excess property checks
+
+Puzzle two. By the rules of 10.1, an object with extra properties is still in the set. So why does this fail?
+
+```ts
+type NewTask = { title: string; priority?: Priority; dueDate?: Date };
+
+function createTask(input: NewTask) {
+  /* … */
+}
+
+createTask({ title: "Ship it", priorty: "high" }); // ❌ Object literal may only specify known properties, but 'priorty' does not exist in type 'NewTask'. Did you mean to write 'priority'?
+
+const input = { title: "Ship it", priorty: "high" };
+createTask(input); // ✅ compiles, and the priority is silently lost
+```
+
+The difference is **freshness**. When you write an object literal directly where a type is expected, that object is *fresh*: no other code holds a reference to it, so nothing can ever read the extra `priorty` property. A property nobody can read is almost certainly a typo. So TypeScript adds a special, stricter check just for fresh literals: every property must be one the target type knows about.
+
+This is the one place where TypeScript stops treating an object type as "at least these properties" and briefly treats it as "exactly these properties", the closest it comes to behaving nominally. Once the object sits in a variable, it's no longer fresh. That variable might be used somewhere else where the extra properties matter, so TypeScript falls back to the ordinary structural rule.
+
+The check earns its keep with optional properties. If every property of a type is optional, nearly any object "fits", and typos would be invisible:
+
+```ts
+type TaskFilters = { status?: TaskStatus; assigneeId?: string; search?: string };
+
+function applyFilters(filters: TaskFilters) {
+  /* … */
+}
+
+applyFilters({ staus: "done" }); // ❌ Object literal may only specify known properties, but 'staus' does not exist in type 'TaskFilters'. Did you mean to write 'status'?
+applyFilters({ status: "done" }); // ✅
+```
+
+> 💡 **Tip.** When you hit an excess property error, assume it's a typo first; it usually is. If it isn't, the target type is probably missing a property. Fix the type rather than routing the object through a variable to dodge the check.
+
+## 10.5 Widening and literal inference
+
+Puzzle three. The value `"GET"` belongs to two sets at once: the singleton `"GET"` and the infinite `string`. When TypeScript infers a variable's type, which set should it pick? The answer depends on whether the variable can change.
+
+```ts
+const method = "GET"; // method: "GET"
+let verb = "GET";     // verb: string
+
+verb = "POST";        // ✅ that's why it was widened
+```
+
+A `const` can never hold anything else, so the narrowest set is accurate. A `let` can be reassigned, so TypeScript **widens** the literal to its base type, guessing that you'll want to store other strings later. Numbers and booleans behave the same way: `const n = 3` is `3`, `let n = 3` is `number`.
+
+Widening also happens *inside* arrays and objects, even when the variable itself is `const`, because their contents can still be changed:
+
+```ts
+const statuses = ["todo", "done"];            // statuses: string[]
+const request = { method: "GET", retries: 3 }; // request: { method: string; retries: number; }
+
+request.method = "DELETE"; // legal JavaScript, so TypeScript had to widen
+```
+
+That rule produces the most common "but it *is* `'GET'`!" error in TypeScript:
+
+```ts
+type HttpMethod = "GET" | "POST" | "PATCH" | "DELETE";
+type RequestOptions = { method: HttpMethod };
+
+function send(url: string, options: RequestOptions) {
+  /* … */
+}
+
+const options = { method: "GET" };
+send("/api/tasks", options); // ❌ Argument of type '{ method: string; }' is not assignable to parameter of type 'RequestOptions'.
+```
+
+There are three fixes, and each one tells TypeScript which set you mean:
+
+```ts
+// 1. Write the literal inline: the parameter type guides inference ("contextual typing").
+send("/api/tasks", { method: "GET" }); // ✅
+
+// 2. Annotate the variable with the type you intend.
+const viaAnnotation: RequestOptions = { method: "GET" };
+send("/api/tasks", viaAnnotation); // ✅
+
+// 3. Freeze the literal with as const (first seen in Chapter 8).
+const viaConst = { method: "GET" } as const; // viaConst: { readonly method: "GET"; }
+send("/api/tasks", viaConst); // ✅
+```
+
+> 🔗 **Connection.** `as const` and its partner `satisfies` get a full treatment in [Chapter 20](/chapter/20), where you'll use them to derive whole types from configuration objects.
+
+## 10.6 Two worlds: type space and value space
+
+A TypeScript file is really two languages woven together. **Value space** is the JavaScript that will run. **Type space** is the annotations, aliases, and interfaces that the compiler checks and then erases ([Chapter 3](/chapter/3)). Every name you declare lives in one world or in both.
+
+```ts
+type Priority = "low" | "medium" | "high"; // type space only: erased from the output
+const defaultPriority = "medium";          // value space only: exists at runtime
+
+class TaskQueue {                          // BOTH worlds at once:
+  items: string[] = [];                    //   a value (the constructor function)
+}                                          //   and a type (the shape of its instances)
+
+const queue: TaskQueue = new TaskQueue();
+//           ^^^^^^^^^     ^^^^^^^^^^^^^^
+//           type space    value space
+```
+
+You can tell which world you're in from position. After a `:` annotation, on the right of `type X =`, inside angle-bracketed type arguments, and after `as` or `satisfies`, you're in type space. On the right of `=` in a variable declaration, in function arguments, and after `return`, you're in value space. Classes and enums are the common names that live in both. Cross the worlds by mistake and you get one of these two errors:
+
+```ts
+const p = Priority;         // ❌ 'Priority' only refers to a type, but is being used as a value here.
+let level: defaultPriority; // ❌ 'defaultPriority' refers to a value, but is being used as a type here. Did you mean 'typeof defaultPriority'?
+```
+
+That second message hints at the trickiest part: the keyword `typeof` exists in **both** worlds and means something different in each.
+
+```ts
+const settings = { theme: "dark", pageSize: 25 };
+
+// Value space: JavaScript's runtime operator. It produces a string while the program runs.
+const kind = typeof settings; // kind: "bigint" | "boolean" | "function" | "number" | "object" | "string" | "symbol" | "undefined"
+console.log(kind);            // "object"
+
+// Type space: TypeScript's operator. It produces a type at compile time, then disappears.
+type Settings = typeof settings; // { theme: string; pageSize: number; }
+```
+
+Same keyword, different world, decided entirely by where it appears. The type-space `typeof` is how you derive types from values instead of writing them twice, the main subject of [Chapter 20](/chapter/20).
+
+## 10.7 Type assertions (as)
+
+Sometimes you know more than the compiler. A **type assertion**, written `expr as T`, tells TypeScript "treat this value as a `T`". In set terms, an assertion is a *claim* that the value lives in a smaller set than TypeScript can prove. The crucial detail is that assertions are erased like every other type: there is no conversion and no check at runtime. If your claim is wrong, nothing stops the program.
+
+The legitimate case is when you hold information the compiler cannot see. The classic example is the DOM: TypeScript can't read your HTML, but you can.
+
+```ts
+const el = document.querySelector("#new-task-title"); // el: Element | null
+const field = el as HTMLInputElement;                  // field: HTMLInputElement
+field.value = "";                                      // ✅ compiles, because you vouched for it
+```
+
+TypeScript does sanity-check the claim: the two types must overlap, meaning one fits inside the other. Asserting between unrelated sets is rejected, though a double assertion through `unknown` can force it. When you see `as unknown as`, read it as "I'm overriding the compiler entirely".
+
+```ts
+const count = "42" as number; // ❌ Conversion of type 'string' to type 'number' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.
+const forced = "42" as unknown as number; // compiles, and lies: the runtime value is still the string "42"
+```
+
+Assertions are also weaker than annotations. An annotation *checks* that the value fits the type; an assertion only checks that the types overlap. That's why `as Task` lets an incomplete object through:
+
+```ts
+const checked: Task = { id: "t1", title: "Ship it" }; // ❌ Type '{ id: string; title: string; }' is missing the following properties from type 'Task': status, priority, projectId
+const claimed = { id: "t1", title: "Ship it" } as Task; // compiles, with three fields missing
+```
+
+Where an assertion becomes a lie is at the boundary of your program, where data arrives from outside:
+
+```ts
+async function fetchTasks(): Promise<Task[]> {
+  const response = await fetch("/api/tasks");
+  const data: unknown = await response.json();
+  return data as Task[]; // compiles. Nothing checked it.
+}
+```
+
+If the server answers `{ "error": "unauthorized" }`, this function still promises `Task[]`, and the crash happens three components away. The fix is to *check* the data instead of claiming it: type guards in [Chapter 14](/chapter/14), runtime validation in [Chapter 32](/chapter/32).
+
+> 💡 **Tip.** Two assertion uses are usually fine: DOM lookups you control, and tests that build a partial fake for a function that reads only a couple of fields. Outside those, treat every `as` in a code review as a question: "what do you know that the compiler doesn't, and how do you know it?"
+
+## 10.8 unknown and never revisited
+
+[Chapter 9](/chapter/9) introduced `unknown` and `never` by their behavior. The set model explains that behavior completely: they are the **top** and **bottom** of the whole hierarchy.
+
+`unknown` is the universal set, containing every value. So *everything* is assignable to `unknown`: every set fits inside the set of everything. But `unknown` is assignable to almost nothing else, because a value drawn from "everything" could be anything. `never` is the empty set. The empty set fits inside every set, so `never` is assignable to *every* type, and nothing (except `never` itself) is assignable to `never`, because no value is in it.
+
+```text
+                    unknown            ← the set of every value (top)
+          ┌────────────┼─────────────┐
+       string        number         Task   …
+          │            │             │
+       "done"          42           …
+          └────────────┼─────────────┘
+                     never             ← the empty set (bottom)
+
+   "is assignable to":   anything ──► unknown      never ──► anything
+```
+
+In code, each of those arrows is an assignment that TypeScript accepts or rejects:
+
+```ts
+let anything: unknown;
+anything = "done";   // ✅ every type fits inside unknown
+anything = taskList; // ✅
+
+const title: string = anything; // ❌ Type 'unknown' is not assignable to type 'string'.
+
+function fail(message: string): never {
+  throw new Error(message);
+}
+const found: Task = fail("Task not found"); // ✅ never fits inside every type
+const impossible: never = "done";           // ❌ Type '"done"' is not assignable to type 'never'.
+```
+
+The model also predicts how these types combine. Adding the empty set to a union adds nothing; intersecting with the set of everything removes nothing; and asking for values that are in two disjoint sets leaves you with the empty set:
+
+```ts
+type A = TaskStatus | never;   // same as TaskStatus: adding nothing changes nothing
+type B = TaskStatus & unknown; // same as TaskStatus: "in everything" is no extra constraint
+type C = string & number;      // never: no value is both a string and a number
+```
+
+> ⚠️ **Common mistake.** `any` is *not* the top of the hierarchy. It's an escape from the model entirely: everything is assignable to `any`, **and** `any` is assignable to everything, as if it were top and bottom at once. That contradiction is exactly why `any` switches checking off. `unknown` is the honest top.
+
+```ts
+const raw: any = "hello";
+const n: number = raw;     // compiles: any opts out of the set rules
+const safe: unknown = "hello";
+const m: number = safe;    // ❌ Type 'unknown' is not assignable to type 'number'.
+```
+
+## Common mistakes
+
+> ⚠️ **Expecting nominal behavior.** Two types with the same shape are the same set, whatever they're called. `type UserId = string` and `type ProjectId = string` are interchangeable, and so are two classes with identical public fields. If the distinction matters, you need a brand ([Chapter 78](/chapter/78)), not a new name.
+
+```ts
+class Celsius { constructor(public value: number) {} }
+class Fahrenheit { constructor(public value: number) {} }
+
+const boiling: Celsius = new Fahrenheit(212); // ✅ compiles: same shape, so same set
+```
+
+> ⚠️ **Using `as` to "fix" an error instead of understanding it.** An "is not assignable" error is a statement that some value in one set lies outside another. Find that value. Asserting it away moves the bug from compile time to production.
+
+> ⚠️ **Confusing type-space `typeof` with JavaScript's `typeof`.** At runtime, `typeof` only ever returns one of eight strings. It can't tell you whether something is a `Task`.
+
+```ts
+function isTask(value: unknown) {
+  return typeof value === "Task"; // ❌ This comparison appears to be unintentional because the types '"bigint" | "boolean" | "function" | "number" | "object" | "string" | "symbol" | "undefined"' and '"Task"' have no overlap.
+}
+```
+
+> ⚠️ **Reading assignability backwards.** "`Dog` is assignable to `Animal`" means the `Dog` set is the *smaller* one. The type with more properties describes fewer values.
+
+## When to use it, and when not to
+
+The set model isn't a feature you opt into; it's how TypeScript always works. The decision you make in this chapter is about **assertions**.
+
+> ✅ **Use it when** you hold information the compiler genuinely can't see: a DOM element you know exists because you wrote the HTML, a partial fake object in a test, or a value proven safe by logic TypeScript can't follow. Prefer an annotation (`const t: Task = …`) to an assertion (`… as Task`) whenever both would work, because only the annotation checks the value.
+
+> 🚫 **When not to.** Never assert data that crossed a boundary: `fetch` responses, `JSON.parse`, `localStorage`, URL parameters, form input. Check it instead. Don't use `as` to silence an error you haven't understood, and treat `as unknown as T` as a red flag outside tests and low-level library code.
+
+## How it connects
+
+> 🔗 **Connection.** The set model is the foundation for the rest of the book. Unions are set **union** and intersections are set **intersection** ([Chapter 13](/chapter/13)). Narrowing is the art of shrinking a set with runtime checks ([Chapter 14](/chapter/14)). A generic constraint `T extends X` means "T is a subset of X" ([Chapter 17](/chapter/17)), and a conditional type asks "is this a subset?" ([Chapter 23](/chapter/23)). Variance ([Chapter 77](/chapter/77)) and branded types ([Chapter 78](/chapter/78)) push the same picture further.
+
+> 🌍 **Real world.** In mature codebases, a pull request that adds an `as` almost always attracts a review comment. Validation libraries such as Zod exist largely to replace `data as User` with a function that *proves* the data is a `User` and only then gives it that type.
+
+## Exercises
+
+### Level 1 — Recall
+
+For each pair, decide whether `A` is assignable to `B`, and whether `B` is assignable to `A`. Sketch the two sets if you're unsure, then verify in your editor with `const b: B = a` style declarations.
+
+```ts
+//      A                                B
+// 1.   "todo"                           TaskStatus
+// 2.   TaskStatus                       string
+// 3.   string                           unknown
+// 4.   never                            Task
+// 5.   { title: string }                { title: string; done: boolean }
+// 6.   { title: string }                { title?: string }
+// 7.   42                               number | string
+// 8.   boolean                          true
+// 9.   string[]                         readonly string[]
+// 10.  null                             string | undefined
+```
+
+### Level 2 — Application
+
+Draw a set diagram (boxes inside boxes, as in 10.1) for each of these types, and mark where a few example values live: `string`; `"a" | "b"`; `unknown`; `never`; and `{ title: string; dueDate?: Date }`. For the last one, place these three values in or out of the set and explain each: `{ title: "x" }`, `{ title: "x", dueDate: new Date() }`, and `{ title: "x", dueDate: "tomorrow" }`.
+
+### Level 3 — Challenge
+
+Construct two structurally identical types that represent different concepts, such as an amount in cents and an amount in dollars, or a `TaskId` and a `ProjectId`. Write a small function that accepts one of them, then write a call that passes the *other* one, compiles cleanly, and produces a wrong result. Explain in two sentences why TypeScript can't catch it.
+
+*Hint: the bug only exists because the two sets are identical. Ask what you'd need to add to make them different sets.*
+
+### Level 4 — Real-world
+
+**Ticket TF-210: Review the "quick filters" PR.** A teammate's pull request contains these four assertions:
+
+```ts
+const root = document.getElementById("app") as HTMLDivElement;
+const saved = JSON.parse(localStorage.getItem("filters") ?? "{}") as TaskFilters;
+const status = new URLSearchParams(location.search).get("status") as TaskStatus;
+const fixture = { id: "t1", title: "Test task" } as Task; // in quick-filters.test.ts
+```
+
+- For each assertion, write a one-line verdict: *justified* (and why the compiler can't know) or *unjustified* (and which value could break it).
+- Replace every unjustified assertion with code that checks the value and handles the failure case.
+- Write the review comment you would post, in a tone that teaches rather than scolds.
+
+## Key takeaways
+
+- A type is a **set of values**: singletons like `"GET"`, finite sets like `TaskStatus`, infinite sets like `string`.
+- "A is assignable to B" means **A fits inside B**. Error messages name the value that doesn't fit.
+- TypeScript is **structural**: compatibility comes from shape, not names. More properties means a *smaller* set.
+- **Fresh object literals** get an extra excess-property check, because an unreadable property is almost always a typo.
+- `const` keeps literal types; `let`, array elements, and object properties **widen**.
+- Names live in **type space**, **value space**, or both, and `typeof` means something different in each.
+- `as` is an unchecked **claim**. Use it for things the compiler can't see, never for data from outside.
+- `unknown` is the top set, `never` the empty bottom set, and `any` is an escape from the model.
+
+## What comes next
+
+You can now read any assignment as a set question. The most important place that question gets asked is at a function call: every argument must fit inside its parameter's type, and every caller relies on the set the function promises to return. [Chapter 11: Typing Functions](/chapter/11) turns that into a contract you can design on purpose, from optional parameters and callbacks to overloads and async functions.

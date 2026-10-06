@@ -1,0 +1,498 @@
+> 📖 **The problem.** Priya runs `npm run typecheck` and gets four errors in `src/legacy/dates.ts`, all variations of `'task' is possibly 'undefined'`. Marco opens the same file, on the same commit, and his editor is spotless. They spend twenty minutes arguing about whether the code is broken before someone runs `ls src/legacy` and finds a `tsconfig.json` copied in from an old project two years ago, with `"strict": false`. Marco's editor used the *nearest* config above the file. Priya's terminal used the root one. Neither of them was wrong. They were asking two different configs.
+
+A `tsconfig.json` looks like a bag of unrelated switches, and most people learn it by copying one from somewhere and changing lines until the errors go away. That works until two configs disagree, a test folder silently stops being checked, or a build that passed yesterday emits files into the wrong folder today.
+
+This chapter teaches tsconfig the way you'd want to learn it: each setting by **what it changes**, the error it creates or removes, the output it alters. By the end, you'll be able to read any tsconfig, predict what it does, debug "it works on my machine" type-check problems, and write a justified config for an app, a Node service, and a library.
+
+> 🧠 **Mental model.** Every tsconfig answers **four questions**: **Which files?** (`include`, `exclude`, `rootDir`) **How strict?** (`strict` and friends) **What JavaScript comes out?** (`target`, `outDir`, `sourceMap`, `declaration`) **What environment does the code run in?** (`lib`, `types`, `module`, `moduleResolution`). When a setting confuses you, first ask which question it answers.
+
+## 26.1 Which files: include, exclude, files, rootDir
+
+Before TypeScript checks anything, it builds a list of files: the **program**. `include` adds files by glob pattern, relative to the tsconfig's folder (when you omit it, the default is everything below that folder, `**/*`). `exclude` removes files from what `include` found. `files` lists individual files explicitly, which is rare outside special configs you'll meet in 26.8. Here's the first surprise in practice:
+
+```json
+{
+  "compilerOptions": { "strict": true, "noEmit": true },
+  "include": ["src"]
+}
+```
+
+```sh
+$ npx tsc --listFilesOnly | grep -v node_modules
+/app/src/main.ts
+/app/src/tasks/filters.ts
+# tests/filters.test.ts is not in the list, so it is never type-checked
+```
+
+Your tests live in `tests/`, and `include` only says `src`, so `tsc` never looks at them. Tests can then drift into nonsense (wrong argument types, deleted functions) while `typecheck` stays green, and only the test runner, which doesn't check types, executes them. Add the folder (`"include": ["src", "tests"]`) and the errors appear.
+
+The second surprise is that **`exclude` is not a firewall**. It only filters the `include` globs. If an included file imports an excluded one, the excluded file is pulled back into the program anyway. When you can't tell why a file is being checked, ask the compiler:
+
+```sh
+$ npx tsc --explainFiles | grep -A2 "legacy/dates"
+src/legacy/dates.ts
+   Imported via "./legacy/dates.js" from file 'src/main.ts'
+```
+
+`rootDir` answers a related question: which folder's structure gets mirrored into the output. With `"outDir": "dist"`, a `rootDir` of `src` turns `src/tasks/filters.ts` into `dist/tasks/filters.js`. Leave it unset and current TypeScript stops you rather than guessing, because the guess used to change whenever a file was added:
+
+```sh
+error TS5011: The common source directory of 'tsconfig.json' is './src'. The 'rootDir' setting must be explicitly set to this or another path to adjust your output's file layout.
+```
+
+```json
+{
+  "compilerOptions": { "rootDir": "src", "outDir": "dist" },
+  "include": ["src"]
+}
+```
+
+Once `rootDir` is set, every emitted file must come from inside it. Adding `"tests"` to this `include` fails with `File '…/tests/filters.test.ts' is not under 'rootDir' '…/src'`, which is your hint that build output and test checking want **separate configs** (26.7).
+
+## 26.2 How strict: the strict family
+
+`"strict": true` is not one check. It's a switch that turns on a whole family of them, and new members join the family as TypeScript grows. The ones you'll feel most are `noImplicitAny` (no silent `any` for unannotated parameters), `strictNullChecks` (`null` and `undefined` are separate types you must handle), `strictFunctionTypes` (function parameters are checked soundly when you assign one function type to another), `strictPropertyInitialization` (class fields must be assigned), and `useUnknownInCatchVariables` (caught errors are `unknown`, not `any`). The family also includes `strictBindCallApply`, `noImplicitThis`, and `strictBuiltinIteratorReturn`.
+
+Here is what each of the big five catches. Every one of these lines compiles without `strict`:
+
+```ts
+function title(task) { return task.title; }       // ❌ Parameter 'task' implicitly has an 'any' type.
+
+const found = tasks.find((t) => t.id === "t1");
+found.title;                                       // ❌ 'found' is possibly 'undefined'.
+
+type TaskHandler = (task: Task) => void;
+const logCompleted = (task: Task & { completedAt: Date }) => console.log(task.completedAt.toISOString());
+const handler: TaskHandler = logCompleted;         // ❌ Type '(task: Task & { completedAt: Date; }) => void' is not assignable to type 'TaskHandler'.
+
+class TaskStore { name: string; }                  // ❌ Property 'name' has no initializer and is not definitely assigned in the constructor.
+
+try { await save(); } catch (err) { err.message; } // ❌ 'err' is of type 'unknown'.
+```
+
+The `strictFunctionTypes` case deserves a second look. `logCompleted` reads `completedAt`, but a `TaskHandler` may be called with any `Task`, including one that was never completed. Without the flag, that assignment passes and crashes at runtime. Current TypeScript versions default `strict` to `true`, but write it explicitly anyway: configs outlive compiler versions, and the next reader shouldn't need to know the defaults.
+
+Two valuable checks are **not** part of `strict`, because they reject a lot of existing code. `noUncheckedIndexedAccess` makes index access honest: `tasks[0]` might not exist, so its type includes `undefined`.
+
+```ts
+// With "noUncheckedIndexedAccess": true
+const tasks: Task[] = await loadTasks();
+tasks[0].title;          // ❌ Object is possibly 'undefined'.
+
+const byId: Record<string, Task> = indexTasks(tasks);
+const task = byId["t1"]; // task: Task | undefined, the key may be missing
+task?.title;             // ✅
+
+for (const t of tasks) t.title; // ✅ iteration never produces missing elements
+```
+
+`exactOptionalPropertyTypes` separates "the property is absent" from "the property is present and set to `undefined`". Those behave differently at runtime (`"dueDate" in draft`, `Object.keys`, spreading over defaults), and this flag makes the type system notice:
+
+```ts
+interface TaskDraft { title: string; dueDate?: Date }
+
+const draft: TaskDraft = { title: "Plan sprint", dueDate: undefined };
+// ❌ Type '{ title: string; dueDate: undefined; }' is not assignable to type 'TaskDraft' with 'exactOptionalPropertyTypes: true'. Consider adding 'undefined' to the types of the target's properties.
+
+const ok: TaskDraft = { title: "Plan sprint" }; // ✅ simply leave it out
+```
+
+> 💡 **Tip.** Turn on `noUncheckedIndexedAccess` from day one in new projects; retrofitting it later produces hundreds of errors at once. `exactOptionalPropertyTypes` is most valuable in libraries and shared models, where "missing" and "explicitly undefined" carry different meanings.
+
+## 26.3 What comes out: target, outDir, sourceMap, declaration
+
+When `tsc` emits JavaScript, four settings decide what you get. **`target`** sets which JavaScript syntax version the output may use. Syntax newer than the target gets rewritten into older equivalents. Here's the same source compiled two ways (real compiler output):
+
+```ts
+// src/tasks/filters.ts
+export function dueLabel(task: Task): string {
+  return task.dueDate ?? "no due date";
+}
+```
+
+```js
+// "target": "es2019": ?? didn't exist yet, so it is rewritten
+export function dueLabel(task) {
+    var _a;
+    return (_a = task.dueDate) !== null && _a !== void 0 ? _a : "no due date";
+}
+
+// "target": "es2022": modern syntax passes through untouched
+export function dueLabel(task) {
+    return task.dueDate ?? "no due date";
+}
+```
+
+`target` rewrites *syntax* only. It never adds missing built-in functions (polyfills). If your target runtime lacks `Array.prototype.findLast`, setting `target` won't add it; that's the job of `lib` (26.4) and, if needed, a polyfill library.
+
+**`outDir`** says where emitted files go, mirroring `rootDir`. **`sourceMap`** emits a `.js.map` file next to each `.js` file, mapping output lines back to your `.ts` lines, so debuggers and stack traces point at code you wrote. **`declaration`** emits a `.d.ts` file describing each module's types, which other TypeScript projects need in order to consume your code ([Chapter 28](/chapter/28)). Here's one source file with all three on:
+
+```json
+{
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "target": "es2022",
+    "sourceMap": true,
+    "declaration": true
+  }
+}
+```
+
+```sh
+$ npx tsc && find dist -type f
+dist/tasks/filters.js       # the JavaScript, ending with //# sourceMappingURL=filters.js.map
+dist/tasks/filters.js.map   # line-by-line mapping back to src/tasks/filters.ts
+dist/tasks/filters.d.ts     # export declare function dueLabel(task: Task): string;
+```
+
+When something else produces the JavaScript, such as Vite for a web app, set `"noEmit": true`. Then `tsc` becomes a pure checker, and `target`, `outDir`, and `sourceMap` stop mattering for it.
+
+## 26.4 What environment: lib, types, module, moduleResolution
+
+TypeScript can't know where your code will run, so you tell it, and it adjusts which **globals** exist. **`lib`** selects the built-in declaration files: `es2023` describes the language's built-ins (`Array`, `Map`, `Promise`), and `dom` describes the browser (`document`, `window`, `fetch`). When you don't set it, `lib` follows `target` and includes the DOM. That's why a Node project with an explicit `"lib": ["es2023"]` says:
+
+```ts
+document.title = "TaskFlow";
+// ❌ Cannot find name 'document'. Do you need to change your target library? Try changing the 'lib' compiler option to include 'dom'.
+
+tasks.findLast((t) => t.status === "done"); // with "lib": ["es2019"]
+// ❌ Property 'findLast' does not exist on type 'Task[]'. Do you need to change your target library? Try changing the 'lib' compiler option to 'es2023' or later.
+```
+
+For a Node service, that first error is a *feature*. There is no `document` in Node, and you want TypeScript to say so before production does.
+
+**`types`** controls which `@types/*` packages are loaded as **globals**. Node's globals (`process`, `Buffer`) come from `@types/node`, and Vite's (`import.meta.env`, asset imports) from `vite/client`. Recent TypeScript versions load none of them unless you list them, and they tell you so:
+
+```ts
+const port = process.env.PORT;
+// ❌ Cannot find name 'process'. Do you need to install type definitions for node? Try `npm i --save-dev @types/node` and then add 'node' to the types field in your tsconfig.
+```
+
+```json
+{ "compilerOptions": { "types": ["node"] } }
+```
+
+Older versions loaded every `@types/*` package in `node_modules` automatically, which caused a classic leak: one tool depends on `@types/node`, and suddenly your *browser* code sees Node's `setTimeout`:
+
+```ts
+const timer: number = setTimeout(refresh, 1000);
+// ❌ Type 'Timeout' is not assignable to type 'number'.   (Node's types leaked into browser code)
+```
+
+**`module`** and **`moduleResolution`** answer the last environment question, *who loads this code?*, which [Chapter 25](/chapter/25) covered in depth:
+
+| Who loads the code | `module` | `moduleResolution` |
+|---|---|---|
+| A bundler (Vite, webpack) | `esnext` or `preserve` | `bundler` |
+| Node, directly | `nodenext` | `nodenext` (implied) |
+
+## 26.5 Transpiler-friendly flags
+
+Most of the time, `tsc` is not what turns your TypeScript into JavaScript. Vite uses esbuild, `tsx` uses esbuild, test runners use esbuild or SWC, and Node's type stripping removes types itself. All of these are **single-file transpilers**: fast because they never look at more than one file. Three flags make `tsc` warn you about code that such a tool would mishandle, so the problem shows up as a type error instead of a runtime surprise.
+
+**`isolatedModules`** flags code whose output depends on information from *other* files. The classic case is re-exporting a type: a single-file tool can't tell whether `Task` is a type, so it can't decide whether to keep the re-export.
+
+```ts
+// src/tasks/index.ts, with "isolatedModules": true
+export { Task } from "./types.js";
+// ❌ Re-exporting a type when 'isolatedModules' is enabled requires using 'export type'.
+export type { Task } from "./types.js"; // ✅
+```
+
+**`verbatimModuleSyntax`** ([Chapter 25](/chapter/25)) goes further. It requires every type-only import to be marked, and it guarantees that unmarked imports are emitted exactly as written, so every tool agrees on the output. It also enforces the `isolatedModules` checks, which is why many configs set only `verbatimModuleSyntax`.
+
+**`erasableSyntaxOnly`** flags TypeScript features that *generate* JavaScript instead of disappearing. Node's type stripping works by deleting type syntax and leaving everything else; it can't invent code for an `enum`. Without the flag, you find that out at startup (`SyntaxError [ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX]: TypeScript enum is not supported in strip-only mode`). With it, you find out in your editor:
+
+```ts
+// "erasableSyntaxOnly": true
+enum Priority { Low, High }                      // ❌ This syntax is not allowed when 'erasableSyntaxOnly' is enabled.
+namespace Defaults { export const days = 7; }    // ❌ This syntax is not allowed when 'erasableSyntaxOnly' is enabled.
+class Repo { constructor(private url: string) {} } // ❌ This syntax is not allowed when 'erasableSyntaxOnly' is enabled.
+
+// ✅ Erasable alternatives: delete the types and valid JavaScript remains
+const Priority = { Low: "low", High: "high" } as const;
+type Priority = (typeof Priority)[keyof typeof Priority];
+class Repo2 { private url: string; constructor(url: string) { this.url = url; } }
+```
+
+The forbidden list is short: enums, namespaces containing runtime code, constructor parameter properties, and the CommonJS-only `import x = require()` and `export =` forms. Everything else in TypeScript is erasable.
+
+## 26.6 Path aliases
+
+Deep relative imports like `"../../../tasks/filters.js"` break whenever files move. **Path aliases** let you write `"@/tasks/filters.js"` instead. You declare them with `paths`, and the targets are resolved relative to the tsconfig file:
+
+```json
+{
+  "compilerOptions": {
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  }
+}
+```
+
+Here's the catch that bites everyone once: **`paths` changes how TypeScript *finds* files, not what it *emits*.** The compiler type-checks your alias happily and then writes it into the output unchanged, and the runtime has never heard of it:
+
+```js
+// dist/main.js, emitted by tsc: the alias is copied as-is
+import { isDone } from "@/tasks/filters.js";
+```
+
+```sh
+$ node dist/main.js
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@/tasks' imported from /app/dist/main.js
+```
+
+So an alias is a **contract between TypeScript and whatever loads your code**, and both sides must be configured. Vite needs a matching `resolve.alias` (or a plugin that reads your tsconfig), and Vitest inherits it from the Vite config. `tsx` reads `paths` itself. Node reads neither, but it does understand a standard alias mechanism in `package.json`, the `imports` field, which TypeScript also understands under `bundler` and `nodenext`:
+
+```ts
+// vite.config.ts: teach the bundler the same alias
+import { fileURLToPath, URL } from "node:url";
+import react from "@vitejs/plugin-react";
+import { defineConfig } from "vite";
+
+export default defineConfig({
+  plugins: [react()],
+  resolve: { alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) } },
+});
+```
+
+```json
+{
+  "type": "module",
+  "imports": {
+    "#tasks/*": "./src/tasks/*"
+  }
+}
+```
+
+With that `imports` entry, `import { isDone } from "#tasks/filters.ts"` works when Node runs your `.ts` files directly, and TypeScript resolves it with no `paths` at all. Subpath imports must start with `#`.
+
+> 🕰 **Legacy note.** Older configs paired `paths` with `"baseUrl": "."`. `baseUrl` also made *every* bare import resolve from the project root, so `import "tasks/filters"` worked by accident. TypeScript 6.0 deprecated it and TypeScript 7 removed it (`Option 'baseUrl' has been removed.`). Write `paths` targets starting with `./` and drop `baseUrl`.
+
+## 26.7 Extending configs
+
+Real projects rarely have one tsconfig. The web app, the scripts folder, and the tests all want slightly different environments, and copy-pasting a forty-line file three times guarantees they drift apart. Instead, put shared settings in a **base config** and have the others `extends` it:
+
+```json
+// tsconfig.base.json: the rules everyone shares
+{
+  "compilerOptions": {
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true,
+    "skipLibCheck": true
+  }
+}
+```
+
+```json
+// scripts/tsconfig.json: Node tooling scripts, no DOM, Node globals
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "nodenext",
+    "lib": ["es2023"],
+    "types": ["node"],
+    "noEmit": true
+  },
+  "include": ["."]
+}
+```
+
+The merge rules are worth memorizing, because they explain most surprises. `compilerOptions` merge **option by option**: the child overrides only what it mentions. `include`, `exclude`, and `files` are **replaced**, never merged. Relative paths are resolved against the config file that **wrote** them, not the one that extends it. For shared configs that need paths relative to *each* project, use the `${configDir}` placeholder, which always means "the folder of the config being compiled":
+
+```json
+{
+  "compilerOptions": {
+    "rootDir": "${configDir}/src",
+    "outDir": "${configDir}/dist"
+  }
+}
+```
+
+You don't have to write every base yourself. The community `@tsconfig/*` packages publish maintained presets: `@tsconfig/strictest`, `@tsconfig/vite-react`, and one per Node major version, such as `@tsconfig/node22`. `extends` also accepts an array, applied left to right:
+
+```json
+{
+  "extends": ["@tsconfig/node22/tsconfig.json", "./tsconfig.base.json"],
+  "compilerOptions": { "rootDir": "src", "outDir": "dist" },
+  "include": ["src"]
+}
+```
+
+> 💡 **Tip.** When you can't tell what a chain of `extends` produces, run `npx tsc --showConfig -p scripts`. It prints the fully merged result, with every inherited option and every matched file.
+
+## 26.8 Project references (introduction)
+
+As a repo grows, one big config starts to hurt. Every `tsc` run rechecks everything, and nothing stops the browser app from importing server-only code. **Project references** split the repo into smaller TypeScript projects with explicit dependencies between them. Each referenced project sets `"composite": true`, which turns on `declaration` and incremental builds and requires every file to be matched by `include` or `files`. A root "solution" config lists the projects and contains no files of its own:
+
+```json
+// tsconfig.json at the repo root: a solution config
+{
+  "files": [],
+  "references": [{ "path": "./packages/core" }, { "path": "./packages/web" }]
+}
+```
+
+```json
+// packages/web/tsconfig.json
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": { "composite": true, "rootDir": "src", "outDir": "dist" },
+  "include": ["src"],
+  "references": [{ "path": "../core" }]
+}
+```
+
+You build references with `tsc -b` (build mode), which compiles projects in dependency order and skips the ones that haven't changed since the last build:
+
+```sh
+$ npx tsc -b --verbose
+Projects in this build:
+    * packages/core/tsconfig.json
+    * packages/web/tsconfig.json
+    * tsconfig.json
+Building project 'packages/core/tsconfig.json'...
+Building project 'packages/web/tsconfig.json'...
+
+$ npx tsc -b --verbose        # again, with nothing changed
+Project 'packages/core/tsconfig.json' is up to date because newest input 'packages/core/src/index.ts' is older than output 'packages/core/tsconfig.tsbuildinfo'
+```
+
+You've probably met this already: Vite's React template ships a root `tsconfig.json` that references `tsconfig.app.json` (browser code) and `tsconfig.node.json` (the Vite config itself), and its build script runs `tsc -b`. That split is exactly the "no global type leakage" idea from 26.4. References, monorepos, and package boundaries get full treatment in [Chapter 94](/chapter/94).
+
+## 26.9 Recommended configs
+
+Here are three starting points, one per kind of project, with every line justified. tsconfig files allow comments, so keep the justifications in the file. They're the documentation your future teammates will actually read.
+
+**A Vite + React app.** Vite produces the JavaScript, so `tsc` only checks.
+
+```json
+{
+  "compilerOptions": {
+    "target": "es2022",                       // modern browsers; Vite handles the output
+    "lib": ["es2023", "dom", "dom.iterable"], // browser globals, no Node globals
+    "types": ["vite/client"],                 // import.meta.env and asset imports
+    "module": "esnext",
+    "moduleResolution": "bundler",            // Vite resolves imports, so model Vite
+    "jsx": "react-jsx",
+    "noEmit": true,                           // Vite emits; tsc is a pure checker
+    "verbatimModuleSyntax": true,             // esbuild transpiles file by file
+    "erasableSyntaxOnly": true,               // no enums or namespaces that need codegen
+    "moduleDetection": "force",               // every file is a module
+    "strict": true,
+    "noUncheckedIndexedAccess": true,         // array and record access may be undefined
+    "skipLibCheck": true                      // don't re-check node_modules declarations
+  },
+  "include": ["src"]
+}
+```
+
+**A Node service**, built with `tsc` and run from `dist/`. It's also runnable directly with Node's type stripping during development.
+
+```json
+{
+  "compilerOptions": {
+    "target": "es2023",          // what the Node version you deploy supports
+    "lib": ["es2023"],           // no DOM: document really doesn't exist here
+    "types": ["node"],           // process, Buffer, node:* modules
+    "module": "nodenext",        // Node loads the output, so model Node exactly
+    "rootDir": "src",
+    "outDir": "dist",
+    "sourceMap": true,           // run with node --enable-source-maps for .ts stack traces
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true,  // keeps type stripping an option
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "skipLibCheck": true
+  },
+  "include": ["src"]
+}
+```
+
+**A library** that other projects install. Its `.d.ts` output is part of its public API.
+
+```json
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "lib": ["es2022"],                  // assume only the language, no host globals
+    "types": [],                        // depend on no ambient globals
+    "module": "nodenext",               // the strictest model; output works for Node and bundlers
+    "rootDir": "src",
+    "outDir": "dist",
+    "declaration": true,                // consumers need types
+    "declarationMap": true,             // go-to-definition lands in your .ts source
+    "sourceMap": true,
+    "isolatedDeclarations": true,       // explicit export types; fast .d.ts generation
+    "verbatimModuleSyntax": true,
+    "strict": true,
+    "exactOptionalPropertyTypes": true, // consumers may rely on "absent vs undefined"
+    "noUncheckedIndexedAccess": true,
+    "skipLibCheck": true
+  },
+  "include": ["src"]
+}
+```
+
+Notice what the three share: `strict`, `noUncheckedIndexedAccess`, `verbatimModuleSyntax`, and an explicit `types` list. That shared core is your `tsconfig.base.json`. What differs is the answer to the environment question: who loads the code, and which globals exist there.
+
+## Common mistakes
+
+> ⚠️ **`skipLibCheck` hiding real problems.** It skips type-checking *every* `.d.ts` file, including the ones you wrote yourself. A typo like `Promise<Strng>` in `src/types/legacy-charts.d.ts` goes unreported. It's fine, and usually wise, for `node_modules`, where conflicting third-party declarations aren't yours to fix. Just know that your own declaration files lose checking too, and review them carefully ([Chapter 28](/chapter/28)).
+
+> ⚠️ **Path aliases that compile but fail at runtime.** `paths` never rewrites emitted imports. Configure the same alias in the bundler, or use `package.json` `imports`, which every tool understands.
+
+> ⚠️ **Enabling `allowJs` without `checkJs` and wondering why nothing is checked.** `allowJs` lets JavaScript files *into* the program, so TypeScript files can import them and output can include them. Only `checkJs` (or a `// @ts-check` comment) reports errors inside them ([Chapter 29](/chapter/29)).
+
+> ⚠️ **Tests outside `include`.** If `tsc --listFilesOnly` doesn't show your test files, their types are never checked, no matter how strict the config is.
+
+> ⚠️ **Stray nested configs.** Editors use the nearest `tsconfig.json` above an open file. A forgotten config in a subfolder silently changes the rules for every file below it.
+
+## How it connects
+
+> 🔗 **Connection.** [Chapter 5](/chapter/5) gave you a starter config with every line marked "explained in Ch 26"; now each one is. The module settings come from [Chapter 25](/chapter/25). [Chapter 27](/chapter/27) wires `tsc --noEmit` into the daily toolchain beside ESLint and Vitest. [Chapter 29](/chapter/29) uses `allowJs`, `checkJs`, and the strict family to migrate JavaScript one step at a time, and [Chapter 94](/chapter/94) takes project references to full monorepo scale.
+
+> 🌍 **Real world.** Mature repos usually have a small `tsconfig.base.json`, one config per environment (app, server, scripts, tests), and a solution-style root that references them all. Framework templates such as Vite's ship this layout by default, and `@tsconfig/*` presets are a common base layer.
+
+## Exercises
+
+### Level 1 — Recall
+
+Classify each option by the question it answers (**files**, **checking**, **output**, or **environment**), and say in one sentence what visibly changes when you flip it: `include`, `rootDir`, `strictNullChecks`, `noUncheckedIndexedAccess`, `target`, `sourceMap`, `declaration`, `lib`, `types`, `moduleResolution`.
+
+### Level 2 — Application
+
+Turn on `noUncheckedIndexedAccess` in your TaskFlow project. Fix every new error **without** using the non-null assertion `!` more than twice. For each fix, choose deliberately among optional chaining, an early `return`, a default value, and restructuring the code so the index access isn't needed. Note which fixes revealed real bugs.
+
+### Level 3 — Challenge
+
+Configure a repository where `src/` is browser code and `scripts/` is Node code, with **no global type leakage** in either direction: `document` must be an error in `scripts/`, `process` must be an error in `src/`, and both folders must pass `tsc -b` from the root. Prove the isolation by adding one deliberately wrong line to each folder and capturing the errors.
+
+*Hint: you need three config files, and the root one contains no files of its own.*
+
+### Level 4 — Real-world
+
+**Ticket TF-231: tsconfig decision record.** TaskFlow is about to become a monorepo with `web` (Vite + React), `api` (Node), and `shared` (a library both use). Write a decision record for the repo's TypeScript configuration.
+
+- Include the base config and one config per package, with a comment justifying every option.
+- State how each package answers the four questions (files, strictness, output, environment).
+- Explain how `shared` is consumed by the other two (references, `exports`, or both) and why.
+- List the commands CI will run, and show the expected output of `tsc --showConfig` for one package.
+
+## Key takeaways
+
+- A tsconfig answers four questions: **which files, how strict, what comes out, what environment.** Classify a setting before you change it.
+- `include` decides what gets checked; `exclude` only filters `include`; imported files are always pulled in. Use `--listFilesOnly` and `--explainFiles` to see the real program.
+- `strict` is a family of checks. Add `noUncheckedIndexedAccess` early, and `exactOptionalPropertyTypes` where "absent" and "undefined" differ.
+- `target` rewrites syntax; `lib` and `types` decide which globals exist. Set `types` explicitly.
+- `isolatedModules`, `verbatimModuleSyntax`, and `erasableSyntaxOnly` make `tsc` warn about code that single-file transpilers would mishandle.
+- `paths` aliases must be mirrored by whatever loads your code. Don't use `baseUrl`.
+- Share settings with `extends`, and split environments with project references and `tsc -b`.
+
+## What comes next
+
+Your tsconfig can now tell you whether the code is *consistent*. But Priya's next pull request type-checks perfectly and still contains a promise nobody awaited, three different formatting styles, and a regression no test caught. Types are only one of the questions a codebase needs answered. [Chapter 27: The Everyday Toolchain](/chapter/27) adds the tools that answer the others: ESLint, Prettier, and Vitest.

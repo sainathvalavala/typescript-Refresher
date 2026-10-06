@@ -1,0 +1,446 @@
+> 📖 **The problem.** TaskFlow's test suite has 400 green tests. They mock `fetch` with hand-written objects: `{ id: 1, title: "x", done: false }`. Six months ago the API renamed `done` to `status` and changed `id` to a string. The mocks were never updated, and neither were the tests. Everything is green, and every test is lying: they describe an API that no longer exists. In production, the board crashes on load. The test suite did not fail because it never talked to anything resembling the real server.
+
+Unit and component tests answer "does this piece work?". Two other questions are still open: "do the pieces work *together*?" and "does the whole app work in a real browser against a realistic backend?". This chapter answers the first with integration tests and a mock server that cannot drift from the real API, and the second with a small number of Playwright end-to-end tests. It closes with the unglamorous reality: flaky tests, and how to run all of this in CI.
+
+> 🧠 **Mental model.** **Mock at the network boundary, not inside your code.** Let your real components, hooks, cache, and API client run, and fake only what is truly outside: the server. Then keep the fake honest by building it from the **same schemas and types** as the real API, so a contract change breaks the test immediately.
+
+## 69.1 Integration tests
+
+A **unit test** exercises one function. A **component test** exercises one component. An **integration test** exercises a *feature*: the page, its child components, its hooks, the query cache, the API client, the router, all real, with only the network replaced. The test describes a user goal, and the app does everything in between.
+
+The difference shows in what you do *not* mock. A component test might pass `tasks` as a prop. An integration test renders the whole board page and lets the real `useQuery`, `fetchTasks`, schema validation, and mappers run.
+
+```tsx
+test("a member can complete a task from the board", async () => {
+  const { user } = renderWithProviders(<App />, { route: "/projects/p1" });
+
+  // The real fetch pipeline runs against the mock server (69.2)
+  expect(await screen.findByRole("heading", { name: "Write docs" })).toBeVisible();
+
+  await user.click(screen.getByRole("checkbox", { name: "Complete Write docs" }));
+
+  // The real mutation, optimistic update, and invalidation run
+  expect(await screen.findByRole("checkbox", { name: "Complete Write docs" })).toBeChecked();
+});
+```
+
+Notice what this single test would catch that no unit test would: a mapper that drops `status`, a query key mismatch that prevents invalidation, a schema stricter than the fixture, a route guard that blocks the page, and a button wired to the wrong mutation.
+
+That breadth is the trade-off. Integration tests are slower than unit tests and fail for more reasons, so they are fewer and aimed at **important user journeys**: sign in, create a task, complete a task, change a filter. They are the middle of the testing pyramid from [Chapter 66](/chapter/66), and for UI-heavy apps many teams find them the best return per test.
+
+> 🚫 **When not to.** Do not rewrite every unit test as an integration test. A date formatter has no need of a router and a query client. Test pure logic directly, and integrate where wiring is the risk.
+
+## 69.2 API mocking with MSW
+
+**MSW** (Mock Service Worker) intercepts requests at the network level. Your code calls the real `fetch`, and in tests MSW answers it. There is nothing to monkey-patch in your own modules, which is exactly why this is the recommended approach: the code under test is the code that ships.
+
+Handlers say "when a request matches this method and path, respond with this". With MSW v2, they are typed through generics: the second is the request body, the third the response body.
+
+```ts
+// test/handlers.ts
+import { http, HttpResponse } from "msw";
+import type { TaskDto, TaskListDto, CreateTaskBody } from "../src/features/tasks/api/dto";
+
+export const handlers = [
+  http.get<{ projectId: string }, never, TaskListDto>(
+    "/api/projects/:projectId/tasks",
+    ({ params }) => {
+      // params.projectId: string
+      return HttpResponse.json({
+        items: [buildTaskDto({ title: "Write docs" }), buildTaskDto({ title: "Fix bug" })],
+        nextCursor: null,
+      });
+    },
+  ),
+
+  http.post<never, CreateTaskBody, TaskDto>("/api/tasks", async ({ request }) => {
+    const body = await request.json(); // body: CreateTaskBody
+    return HttpResponse.json(buildTaskDto({ title: body.title }), { status: 201 });
+  }),
+];
+```
+
+Because the response is typed `TaskListDto`, returning `{ items: [], next: null }` is a compile error: the *mock* cannot drift from the DTO type.
+
+Wire the server into the test run once, in the setup file:
+
+```ts
+// test/server.ts
+import { setupServer } from "msw/node";
+import { handlers } from "./handlers";
+
+export const server = setupServer(...handlers);
+
+// test/setup.ts
+import { afterAll, afterEach, beforeAll } from "vitest";
+import { server } from "./server";
+
+beforeAll(() => server.listen({ onUnhandledRequest: "error" })); // a request nobody mocked fails the test
+afterEach(() => server.resetHandlers());                         // per-test overrides never leak
+afterAll(() => server.close());
+```
+
+`onUnhandledRequest: "error"` is the important setting: if the app calls an endpoint you did not mock, the test fails with a clear message instead of quietly hitting a real server.
+
+## 69.3 Preventing contract drift
+
+Typed handlers help, but a TypeScript type is erased and can itself be wrong: someone edits the `TaskDto` type by hand, and the mock follows, and both are stale compared to the real server. The stronger move is to build fixtures from the **runtime schemas** that your app already uses to validate real responses ([Chapter 61](/chapter/61)). If the schema says `status` must be one of three strings, a fixture violating that rule *throws while it is being built*.
+
+```ts
+// test/fixtures.ts
+import { TaskDtoSchema, type TaskDto } from "../src/features/tasks/api/dto";
+
+let nextId = 1;
+
+export function buildTaskDto(overrides: Partial<TaskDto> = {}): TaskDto {
+  return TaskDtoSchema.parse({         // validated: a stale fixture fails right here
+    id: `t${nextId++}`,
+    title: "A task",
+    status: "todo",
+    due_at: null,
+    assignee_id: null,
+    ...overrides,
+  });
+}
+
+buildTaskDto({ status: "finished" });
+// ❌ compile error: Type '"finished"' is not assignable to type '"todo" | "doing" | "done"'.
+// and, if someone casts around the type, a ZodError at runtime: Invalid option: expected one of "todo"|"doing"|"done"
+```
+
+Now the story from the opening cannot happen quietly. When the backend adds a required field and the schema is updated, every fixture that lacks it throws, and the whole suite points at the change. The fixtures, the app's parsing, and the mock server share one definition.
+
+Take it one step further and verify **handler responses** too, so a handler that builds its JSON by hand is also held to the schema:
+
+```ts
+function jsonValidated<S extends z.ZodType>(schema: S, data: z.input<S>, init?: ResponseInit) {
+  return HttpResponse.json(schema.parse(data) as z.output<S>, init);
+}
+
+http.get("/api/projects/:id/tasks", () =>
+  jsonValidated(TaskListDtoSchema, { items: [buildTaskDto()], nextCursor: null }),
+);
+```
+
+For the strongest guarantee, run **contract tests** against the real backend or a shared OpenAPI document in CI, so the *schema itself* cannot silently drift from the server.
+
+> 🌍 **Real world.** Teams often generate both the TypeScript types and the Zod schemas from an OpenAPI file, and generate MSW handlers from the same file. When the API spec changes, everything downstream fails together, loudly, in one place.
+
+## 69.4 Error and edge cases
+
+The default handlers describe the happy path. The value of a mock server is how cheaply it lets you create the *unhappy* ones. Override a handler for one test with `server.use(...)`; `resetHandlers()` in `afterEach` restores the defaults afterward.
+
+```tsx
+import { delay, http, HttpResponse } from "msw";
+
+test("shows an error panel and recovers on retry after a 500", async () => {
+  let calls = 0;
+  server.use(
+    http.get("/api/projects/p1/tasks", () => {
+      calls += 1;
+      return calls === 1
+        ? new HttpResponse(null, { status: 500 })               // first attempt fails
+        : HttpResponse.json({ items: [buildTaskDto({ title: "Write docs" })], nextCursor: null });
+    }),
+  );
+  const { user } = renderWithProviders(<App />, { route: "/projects/p1" });
+
+  expect(await screen.findByRole("alert")).toHaveTextContent(/something went wrong/i);
+  await user.click(screen.getByRole("button", { name: "Retry" }));
+  expect(await screen.findByRole("heading", { name: "Write docs" })).toBeVisible();
+});
+```
+
+Here is the catalog of cases worth having at least once per feature:
+
+```ts
+http.get(url, () => HttpResponse.error());                       // network failure: fetch rejects
+http.get(url, () => new HttpResponse(null, { status: 500 }));    // server error
+http.get(url, () => HttpResponse.json({ message: "no" }, { status: 403 })); // forbidden
+http.get(url, async () => { await delay(3000); return HttpResponse.json(ok); }); // slow response
+http.get(url, () => HttpResponse.json({ items: [], nextCursor: null }));   // empty data
+http.get(url, () => HttpResponse.json({ items: "oops" }));       // malformed body: schema must reject
+```
+
+The last one tests the *contract violation* path from [Chapter 61](/chapter/61): the app should show a calm error, not crash. The slow-response case pairs with fake timers to test timeouts, and with a quick check that stale responses do not overwrite fresh ones.
+
+For **rollback** of an optimistic update ([Chapter 62](/chapter/62)), the test needs the mutation to fail *after* the UI has already changed:
+
+```tsx
+test("rolls back the optimistic completion when the server rejects it", async () => {
+  server.use(
+    http.patch("/api/tasks/:id", async () => {
+      await delay(50); // long enough to observe the optimistic state
+      return new HttpResponse(null, { status: 500 });
+    }),
+  );
+  const { user } = renderWithProviders(<App />, { route: "/projects/p1" });
+  const box = await screen.findByRole("checkbox", { name: "Complete Write docs" });
+
+  await user.click(box);
+  expect(box).toBeChecked();                                   // optimistic
+  await waitFor(() => expect(box).not.toBeChecked());          // rolled back
+  expect(await screen.findByRole("alert")).toHaveTextContent(/couldn't update/i);
+});
+```
+
+> ⚠️ **Common mistake.** Asserting only the happy path and calling the feature tested. Every request your feature makes can be slow, empty, forbidden, or broken, and the user will meet each of those.
+
+## 69.5 Testing routing and auth flows
+
+Routing and auth are exactly the kinds of behavior that unit tests cannot see, because they come from *combining* a guard, a router, a context, and a server. Integration tests render the real route tree at a given URL with a given auth state, and assert where the user ends up.
+
+```tsx
+test("an anonymous visitor to a deep link is sent to login, then back after signing in", async () => {
+  server.use(http.post("/api/auth/login", () => HttpResponse.json(buildUserDto({ role: "member" }))));
+  const { user } = renderWithProviders(<AppRoutes />, {
+    route: "/projects/p1?status=doing",
+    auth: { status: "anonymous" },
+  });
+
+  expect(await screen.findByRole("heading", { name: "Sign in" })).toBeVisible();
+
+  await user.type(screen.getByLabelText("Email"), "ada@example.com");
+  await user.type(screen.getByLabelText("Password"), "correct horse");
+  await user.click(screen.getByRole("button", { name: "Sign in" }));
+
+  // returned to where they were headed, with the filter still in the URL
+  expect(await screen.findByRole("heading", { name: "Board" })).toBeVisible();
+});
+```
+
+Role-based access gets the same treatment: render with a `viewer` and check the controls are absent (a *usability* check), and, on the server side of your own tests, check the API refuses the request anyway ([Chapter 65](/chapter/65)).
+
+```tsx
+test("a viewer sees no delete controls", async () => {
+  renderWithProviders(<AppRoutes />, {
+    route: "/projects/p1",
+    auth: { status: "authenticated", user: buildUser({ role: "viewer" }) },
+  });
+  await screen.findByRole("heading", { name: "Write docs" });
+  expect(screen.queryByRole("button", { name: /delete/i })).not.toBeInTheDocument();
+});
+
+test("an expired session mid-use sends the user to login", async () => {
+  server.use(http.get("/api/projects/p1/tasks", () => new HttpResponse(null, { status: 401 })));
+  server.use(http.post("/api/auth/refresh", () => new HttpResponse(null, { status: 401 })));
+  renderWithProviders(<AppRoutes />, { route: "/projects/p1" });
+
+  expect(await screen.findByRole("heading", { name: "Sign in" })).toBeVisible();
+});
+```
+
+Notice the second test names the *situation* ("expired session"), not the code path. That is what makes it survive a rewrite of the client.
+
+## 69.6 End-to-end tests with Playwright
+
+All of the above still runs in jsdom, a simulation of a browser. **End-to-end (E2E) tests** run the real built app in a real browser, against a real (or realistic) backend. They are slow and few, and they catch what nothing else can: the bundle failing to load, CSS hiding a button, a cookie not being set, the server and client disagreeing for real.
+
+Playwright is the common tool. Its locators mirror Testing Library's priorities, and its assertions **auto-wait**: `expect(locator).toBeVisible()` retries until the element is visible or time runs out, so you almost never write sleeps.
+
+```ts
+// e2e/create-and-complete.spec.ts
+import { test, expect } from "@playwright/test";
+
+test("sign in, create a project, add a task, complete it", async ({ page }) => {
+  await page.goto("/login");
+  await page.getByLabel("Email").fill("e2e-user@taskflow.test");
+  await page.getByLabel("Password").fill(process.env.E2E_PASSWORD ?? "");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByRole("heading", { name: "Projects" })).toBeVisible();
+
+  const projectName = `E2E project ${Date.now()}`; // unique per run: no collisions
+  await page.getByRole("button", { name: "New project" }).click();
+  await page.getByLabel("Name").fill(projectName);
+  await page.getByRole("button", { name: "Create project" }).click();
+  await expect(page.getByRole("heading", { name: projectName })).toBeVisible();
+
+  await page.getByRole("button", { name: "Add task" }).click();
+  await page.getByLabel("Title").fill("Write docs");
+  await page.getByRole("button", { name: "Create task" }).click();
+
+  await page.getByRole("checkbox", { name: "Complete Write docs" }).check();
+  await expect(page.getByRole("checkbox", { name: "Complete Write docs" })).toBeChecked();
+});
+```
+
+The configuration decides where the app runs and how failures are reported:
+
+```ts
+// playwright.config.ts
+import { defineConfig, devices } from "@playwright/test";
+
+export default defineConfig({
+  testDir: "./e2e",
+  fullyParallel: true,
+  retries: process.env.CI ? 2 : 0,
+  reporter: process.env.CI ? [["html", { open: "never" }], ["github"]] : "list",
+  use: {
+    baseURL: "http://localhost:4173",
+    trace: "on-first-retry",   // a full recording of the failing run
+    screenshot: "only-on-failure",
+  },
+  webServer: {
+    command: "npm run build && npm run preview",
+    url: "http://localhost:4173",
+    reuseExistingServer: !process.env.CI,
+  },
+  projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
+});
+```
+
+Keep E2E for the **critical paths** only: sign in, the core create-and-complete journey, checkout-like flows. A rule of thumb is a handful to a few dozen, never hundreds. Run them against a **test environment** with seeded, disposable data and a dedicated test account, never production. For speed, sign in once in a setup step and reuse the saved `storageState`, rather than logging in through the UI in every test.
+
+> 💡 **Tip.** Playwright's `codegen` and trace viewer are worth learning on day one. `npx playwright codegen localhost:4173` writes locators as you click, and `npx playwright show-trace` replays a failed CI run step by step, with network and DOM snapshots.
+
+## 69.7 Flaky tests
+
+A **flaky** test sometimes passes and sometimes fails with no code change. It is worse than a failing test: it teaches the team to re-run and ignore red, and then a real failure slips through. Flakiness almost always has one of a few causes, and each has a cure.
+
+| Cause | What it looks like | Cure |
+|---|---|---|
+| **Fixed sleeps** | `await sleep(500)` and hope | Wait for a condition: `findBy*`, `waitFor`, Playwright auto-waiting `expect` |
+| **Shared state** | Passes alone, fails after another test | Fresh `QueryClient`, `resetHandlers()`, unique data per test, no test order assumptions |
+| **Real time** | A test that fails at midnight, on weekends, in other time zones | Inject `now`, use fake timers, fix the time zone in config |
+| **Real randomness / ids** | Snapshot or ordering differs per run | Seed or inject the random source; use counters in factories |
+| **Unawaited async work** | "Not wrapped in act" warnings, assertions that run too early | `await` every interaction; assert on the visible result |
+| **Network and environment** | Slow CI, a third-party API down | Mock the network (MSW); in E2E, use your own seeded backend |
+| **Animations and layout** | A click lands while an element is moving | Disable animations in test mode; rely on Playwright's actionability checks |
+
+The most common anti-pattern, and its fix, side by side:
+
+```ts
+// ❌ Flaky: sometimes 500 ms is enough, sometimes (a busy CI machine) it isn't
+await page.getByRole("button", { name: "Save" }).click();
+await page.waitForTimeout(500);
+expect(await page.getByText("Saved").isVisible()).toBe(true); // snapshot of one instant
+
+// ✅ Waits exactly as long as needed, up to a timeout, and says what it was waiting for
+await page.getByRole("button", { name: "Save" }).click();
+await expect(page.getByText("Saved")).toBeVisible();
+```
+
+Tests that depend on the clock should *receive* the clock, not read it:
+
+```ts
+// ❌ Different result tomorrow
+expect(isOverdue(task)).toBe(true);
+
+// ✅ Deterministic
+const now = new Date("2026-03-10T09:00:00Z");
+expect(isOverdue(task, now)).toBe(true);
+```
+
+When a flaky test appears, resist the quick patches. **Retries** (`retries: 2`) are a reasonable CI safety net, and Playwright reports a test that needed a retry as "flaky" so you can see it, but raising the retry count hides the cause. A good policy: when a test flakes, **quarantine** it immediately (skip with a ticket, so it no longer blocks others), find the cause, fix it, and restore it. Running a suspect test many times locally (`--repeat-each=50`) reproduces most timing flakes.
+
+> ⚠️ **Common mistake.** Making the timeout bigger. If a test needs a 30-second timeout to pass, either the app is slow (a real problem) or the test is waiting for the wrong thing.
+
+## 69.8 Tests in CI
+
+Tests only protect you if they run on every change, automatically, and quickly enough that people do not skip them. **Continuous integration** (CI) runs your pipeline on each pull request. Order it by speed, so the cheapest check fails first.
+
+```yaml
+# .github/workflows/test.yml
+name: test
+on: [pull_request]
+
+jobs:
+  fast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - run: npm run typecheck      # seconds: the cheapest safety net first
+      - run: npm run lint
+      - run: npm test -- --run      # unit, component, and integration (MSW)
+
+  e2e:
+    needs: fast                     # don't spend browser minutes on code that doesn't compile
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]         # four machines, each runs a quarter of the tests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npx playwright test --shard=${{ matrix.shard }}/4
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}     # keep reports and traces even when tests fail
+        with:
+          name: playwright-report-${{ matrix.shard }}
+          path: playwright-report/
+```
+
+Three ideas to take from that file. **Fast feedback**: type-check, lint, and component tests finish in about a minute and gate the slow suite. **Sharding** splits a long suite across parallel machines, so a 20-minute run becomes five. **Artifacts**: when an E2E test fails on a CI machine you cannot see, the saved HTML report, screenshots, and traces are your only evidence, so always upload them on failure.
+
+Two habits keep CI trustworthy: use `npm ci` (exact, locked installs) so CI matches your machine, and make the *same commands* runnable locally, so "works in CI only" is rare. [Chapter 76](/chapter/76) deepens the pipeline with caching, preview deployments, and release automation.
+
+> 🚫 **When not to.** Do not run the full E2E suite on every keystroke or every commit of a draft PR if it takes ten minutes. Run fast checks always, E2E on PRs ready for review and on `main`, and a nightly broader run for slow or cross-browser cases.
+
+## Common mistakes
+
+> ⚠️ **Mocking inside your code** (`vi.mock("../api")`, a hand-built `fetch` stub). The real API client, schemas, and mappers go untested. Mock the network with MSW instead.
+
+> ⚠️ **Hand-written fixtures that nobody validates.** They drift silently. Build them through the schemas.
+
+> ⚠️ **Leaving `onUnhandledRequest` on its default.** Unmocked calls only warn, so a test can pass while calling a request nobody intended.
+
+> ⚠️ **Too many E2E tests, or E2E for everything.** They are slow and expensive to keep stable. Cover critical paths, and push the rest down to integration and unit tests.
+
+> ⚠️ **Sleeping instead of waiting.** Fixed delays are the biggest source of flakes.
+
+> ⚠️ **Ignoring flaky tests.** "Just re-run it" teaches people to distrust red.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** correctness depends on layers cooperating: data fetching plus cache plus UI, guards plus router plus auth, optimistic updates plus rollback. Use E2E for the journeys the business cannot afford to break.
+
+> 🚫 **When not to.** Do not use E2E to test logic that a unit test can prove in milliseconds, and do not mock so deeply that an integration test is just a unit test with extra steps. Tests of a library's own behavior are not yours to write.
+
+## How it connects
+
+> 🔗 **Connection.** This is the top of the pyramid from [Chapter 66](/chapter/66), built from [Chapter 67](/chapter/67)'s factories and [Chapter 68](/chapter/68)'s custom `render`. The schemas are the ones from [Chapter 61](/chapter/61); optimistic rollback is [Chapter 62](/chapter/62); guards and `401`/`403` handling are [Chapter 65](/chapter/65). Project [P16](/projects/p16) assembles all of it into a suite for TaskFlow Web.
+
+> 🌍 **Real world.** Mature teams track "flake rate" and "time to green" as metrics, treat a flaky test as a bug with an owner, and use shared fixtures or contract tests (such as Pact or OpenAPI-based checks) so front end and back end learn about breaking changes in CI rather than in production.
+
+## Exercises
+
+### Level 1 — Recall
+
+Write a typed MSW handler for `GET /tasks` that returns a `TaskListDto`. Show what the compiler says if you return `{ items: [], next: null }`.
+
+### Level 2 — Application
+
+Test the "complete task" feature end to end with MSW, from the whole board page: the checkbox flips immediately, the request is sent, and the server's response settles the state. Then add the failure case, with the server returning `500`, and assert the rollback and the error message.
+
+### Level 3 — Challenge
+
+Make every MSW fixture fail its test if it stops matching the API schema. *Hint: build fixtures through `schema.parse`, and add one test per fixture builder that calls it with no overrides.* Then deliberately change a schema field and confirm which tests fail.
+
+### Level 4 — Real-world
+
+**Ticket TF-690: Critical-path E2E.** Nobody notices when sign-in breaks until a customer emails.
+
+- Playwright tests cover sign-in, create project, add task, and complete task, using role- and label-based locators only.
+- Tests use unique data per run, a dedicated test account, and no fixed sleeps.
+- CI runs the suite sharded across four jobs after the fast checks pass, and uploads the report and traces on failure.
+- The suite runs 20 times in a row without a single failure (`--repeat-each`), and the PR documents any flake found and fixed.
+
+## Key takeaways
+
+- Integration tests run real components, hooks, cache, and client against a faked **network**. Mock at the boundary, not inside your code.
+- MSW v2 handlers are typed (`http.get<Params, Body, Response>`), and fixtures built through your Zod schemas fail loudly when the contract changes.
+- Cover the unhappy paths: network error, `500`, `403`, slow, empty, malformed, and rollback.
+- Test routing and auth flows with the real route tree, and the same flows again in a few Playwright E2E tests of critical paths.
+- Flakiness has known causes (sleeps, shared state, real time, unawaited work); cure the cause, do not raise timeouts.
+- CI runs the cheap checks first, shards the slow suite, and uploads evidence when something fails.
+
+## What comes next
+
+With a suite you can trust, the question moves from "does it work?" to "how do we ship it?". [Chapter 70: Production Builds, Bundles & Code Splitting](/chapter/70) turns this tested app into something fast to download and safe to deploy.

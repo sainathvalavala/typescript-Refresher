@@ -1,0 +1,362 @@
+> 📖 **The problem.** You have a small JavaScript file that has worked for months. You rename `invoice.js` to `invoice.ts`, and three red squiggles appear. Did you just discover three bugs, or is the tool being fussy? Beginners tend to answer "fussy" and learn to ignore the squiggles, which throws away the whole point of the language.
+
+This chapter gets TypeScript onto your machine and into your fingers. You will install it correctly, compile a file and read the output, write a strict starter configuration, run TypeScript directly without a build step, and, most importantly, learn to **read compiler errors** like sentences instead of noise.
+
+Strict mode is on from the first line of this book. That means some of your first errors will feel harsh. They are the compiler doing its job.
+
+> 🧠 **Mental model.** The compiler is a **pessimistic code reviewer who reads every line, never runs anything, and only reports what it can prove might go wrong.** It doesn't know what your program does. It knows what your *declarations* promise, and it checks that every line keeps those promises.
+
+## 5.1 Installing TypeScript
+
+TypeScript is an npm package named `typescript`. It contains the compiler, called `tsc`, and the language service your editor uses. Install it **per project**, as a development dependency, so everyone on the team (and your CI server) uses the same version:
+
+```sh
+mkdir typed-calculator && cd typed-calculator
+npm init -y
+npm install --save-dev typescript
+npx tsc --version
+# Version 5.x.y (or newer)
+```
+
+`npx tsc` runs the copy inside `node_modules/.bin`. Your `package.json` now records the version:
+
+```json
+{
+  "devDependencies": {
+    "typescript": "^5.9.0"
+  }
+}
+```
+
+Why not `npm install -g typescript`? A global install is one version shared by every project on your machine. Project A needs 5.4, project B wants 5.9, and the global one is neither. Errors then differ between your laptop and the build server, which is the most confusing kind of bug. A per-project install pins the version in `package.json` and the lockfile.
+
+> ⚠️ **Common mistake.** Installing globally "to save typing". Use `npx tsc` or an npm script instead.
+
+> 🕰 **Legacy note.** Old tutorials say `npm i -g typescript` and `ts-node`. Today, a local install plus a runner such as `tsx` (section 5.4) is the standard setup.
+
+## 5.2 Running tsc
+
+`tsc` reads TypeScript files, **checks** them, and **emits** JavaScript. Create `calc.ts`:
+
+```ts
+type Op = "add" | "sub";
+
+export function calculate(a: number, b: number, op: Op): number {
+  return op === "add" ? a + b : a - b;
+}
+
+console.log(calculate(2, 3, "add"));
+```
+
+Compile it, and look at what comes out:
+
+```sh
+npx tsc calc.ts --strict --target es2022
+cat calc.js
+```
+
+```js
+export function calculate(a, b, op) {
+    return op === "add" ? a + b : a - b;
+}
+console.log(calculate(2, 3, "add"));
+```
+
+The type alias, the annotations, and the return type are simply **gone**. This is *type erasure* ([Chapter 3](/chapter/3)): the JavaScript output is your file with the types removed. (The exact wrapper lines at the top, such as module boilerplate, depend on your configuration.)
+
+Three flags you will use constantly:
+
+```sh
+npx tsc --watch            # recompile whenever a file changes
+npx tsc --noEmit           # check only: report errors, write nothing
+npx tsc --noEmit --watch   # live type-checking while you code
+```
+
+`--noEmit` is the one to remember. In modern projects, another tool (a bundler, `tsx`, Vite) produces the JavaScript, and `tsc` serves purely as the **type checker**.
+
+> 💡 **Tip.** When you pass filenames on the command line, `tsc` ignores `tsconfig.json`. That is why real projects run plain `tsc` and let the config decide (next section).
+
+## 5.3 A starter tsconfig
+
+A `tsconfig.json` file at the project root tells `tsc` what to check and how. Generate a starting point with `npx tsc --init`, or write this minimal strict one yourself:
+
+```json
+{
+  "compilerOptions": {
+    "target": "es2022",            // which JS version to emit (Ch 26)
+    "module": "nodenext",          // how files import each other (Ch 25, 26)
+    "strict": true,                // the whole family of strict checks (Ch 26)
+    "noUncheckedIndexedAccess": true, // arr[0] may be undefined (Ch 7)
+    "skipLibCheck": true,          // don't re-check .d.ts files in node_modules (Ch 26)
+    "noEmit": true                 // type-check only; another tool emits JS (Ch 26)
+  },
+  "include": ["src"]
+}
+```
+
+(`tsconfig.json` allows comments even though plain JSON doesn't.) Every line is explained in [Chapter 26](/chapter/26); for now, only two matter:
+
+- **`strict: true`** switches on a bundle of checks, including `noImplicitAny` and `strictNullChecks`. Turning it on later is painful; start with it on.
+- **`include`** lists where your source lives. With this file in place, `npx tsc` with no arguments checks everything under `src/`.
+
+Add scripts so nobody has to remember flags:
+
+```json
+{
+  "scripts": {
+    "typecheck": "tsc"
+  }
+}
+```
+
+> 🔗 **Connection.** [Chapter 26](/chapter/26) goes through every option that matters, and why `target`, `module`, and `moduleResolution` are separate decisions.
+
+## 5.4 Running TypeScript directly
+
+Compiling to a `.js` file and then running it is two steps. For scripts and development you can skip the first one. Two tools run `.ts` files directly.
+
+**`tsx`** is a small runner that strips types on the fly:
+
+```sh
+npm install --save-dev tsx
+npx tsx src/index.ts          # run once
+npx tsx watch src/index.ts    # re-run when files change
+```
+
+**Node itself** can run TypeScript by *type stripping*. From Node 22.18 and 23.6 this works with no flags (older Node 22 versions need `--experimental-strip-types`):
+
+```sh
+node src/index.ts
+```
+
+Here is the crucial point. Both tools **remove the types and run the rest, without checking them**. Create `bad.ts`:
+
+```ts
+const n: number = "oops"; // ❌ Type 'string' is not assignable to type 'number'.
+console.log(n);
+```
+
+```sh
+npx tsx bad.ts   # prints: oops   (runs happily)
+npx tsc --noEmit bad.ts   # error TS2322: Type 'string' is not assignable to type 'number'.
+```
+
+Both behaviors are correct. Running and type-checking are separate jobs, which is the lesson of erasure from [Chapter 3](/chapter/3). So a healthy project has two commands: one that **runs** (`tsx`, `node`, Vite) and one that **checks** (`tsc --noEmit`).
+
+Node's type stripping only supports syntax that can be erased by deleting characters. Features that generate code (`enum`, `namespace`, constructor parameter properties) fail:
+
+```ts
+enum Status { Todo, Done }
+// ❌ SyntaxError [ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX]: TypeScript enum is not supported in strip-only mode
+```
+
+Setting `"erasableSyntaxOnly": true` in `tsconfig.json` makes `tsc` flag those features for you, so you find out in the editor instead of at runtime. Also, relative imports must include the `.ts` extension when Node runs the file: `import { calculate } from "./calc.ts"`.
+
+> ⚠️ **Common mistake.** Seeing your program run and concluding it is "type-correct". It only means the JavaScript ran.
+
+## 5.5 The editor as your teacher
+
+Your editor (VS Code, WebStorm, and others) runs the same TypeScript engine as `tsc`, continuously, on every keystroke. It is the fastest feedback loop you have, and four features will teach you more than any tutorial:
+
+- **Hover** over any identifier to see its type. When you wonder "what does TypeScript think this is?", hover.
+- **Quick fix** (the lightbulb, or `Ctrl+.` / `Cmd+.`) offers repairs: add a missing import, add a missing property, make a function `async`.
+- **Go to definition** (`F12`, or `Cmd`/`Ctrl` + click) jumps to where something is declared, including into library type files. Reading library types is how you learn how they work.
+- **Rename symbol** (`F2`) renames a variable, property, or type everywhere, understanding scope, which find-and-replace never will.
+
+```ts
+interface Task {
+  id: string;
+  title: string;
+  done: boolean;
+}
+
+const tasks: Task[] = [];
+const first = tasks[0];
+//    ^? hover: const first: Task | undefined   (with noUncheckedIndexedAccess)
+
+first.title; // ❌ 'first' is possibly 'undefined'.
+//    ^ quick fix offers: first?.title
+```
+
+> 💡 **Tip.** Make hovering a habit. After every non-trivial line, hover the result and confirm the type matches what you meant. This catches most misunderstandings before they spread.
+
+> ⏭ **Safe to skip.** If you use another editor, enable its TypeScript language server (via `typescript-language-server`), and the same features appear.
+
+## 5.6 Reading TypeScript error messages
+
+A TypeScript error has a consistent anatomy:
+
+```text
+src/main.ts(7,7): error TS2322: Type '{ id: string; title: string; done: string; }' is not assignable to type 'Task'.
+  Types of property 'done' are incompatible.
+    Type 'string' is not assignable to type 'boolean'.
+```
+
+Take it apart:
+
+- **Location**: `src/main.ts(7,7)` is file, line, and column.
+- **Code**: `TS2322` is a stable ID. Search it online and you will find explanations.
+- **Headline**: what failed at the top level ("this object isn't a `Task`").
+- **Chain**: each indented line goes one level deeper into *why*.
+
+**Read nested errors bottom-up.** The headline is the *consequence*; the last line is the *cause*. Here, the cause is that `done` has a `string` where a `boolean` was expected. Fix that, and the whole chain disappears.
+
+```ts
+interface Task { id: string; title: string; done: boolean }
+
+const draft = { id: "t1", title: "Write docs", done: "no" };
+const task: Task = draft;
+// ❌ Type '{ id: string; title: string; done: string; }' is not assignable to type 'Task'.
+//      Types of property 'done' are incompatible.
+//        Type 'string' is not assignable to type 'boolean'.
+```
+
+A few messages you will meet daily:
+
+```ts
+function area(w: number, h: number) { return w * h; }
+
+area(5);      // ❌ Expected 2 arguments, but got 1.
+const el = document.getElementById("total");
+el.textContent = "5"; // ❌ 'el' is possibly 'null'.
+task.titel;   // ❌ Property 'titel' does not exist on type 'Task'. Did you mean 'title'?
+```
+
+Notice that the message often **tells you the fix**. Read it slowly, twice, before searching the internet.
+
+## 5.7 The TypeScript Playground
+
+The [TypeScript Playground](https://www.typescriptlang.org/play) is a web page that runs the compiler in your browser. No install is needed. It has three jobs for you:
+
+1. **Minimal reproductions.** When you can't understand an error, cut your code down to the smallest snippet that still fails. Half the time you find the cause while cutting. The other half, you have something small enough to ask about.
+2. **Sharing.** The URL contains your entire code and settings. Paste it into a chat, a pull request, or a bug report, and the other person sees exactly what you see.
+3. **Inspecting output.** The right-hand panel can show the emitted **JavaScript**, the generated **declaration file**, and the **errors**. The Options panel toggles `strict` and other flags, and a version picker lets you test against older or newer TypeScript.
+
+A good repro looks like this: no imports, no framework, domain-neutral names, and a comment that says what you expected.
+
+```ts
+// Expected: no error. Actual: error on the last line (TS 5.9, strict).
+type Status = "todo" | "doing" | "done";
+
+function label(s: Status): string {
+  return s.toUpperCase();
+}
+
+let current = "todo";
+label(current); // ❌ Argument of type 'string' is not assignable to parameter of type 'Status'.
+```
+
+Because `let` widens `"todo"` to `string`, the call fails. This is an everyday puzzle you can paste in the Playground and fix by trying `const current = "todo"`. You will study the reason in [Chapter 6](/chapter/6).
+
+> 💡 **Tip.** Use `// ^?` comments in the Playground. Write `//  ^?` under a variable and the Playground shows its type inline. It is a hover you can share.
+
+## 5.8 Project: Typed Calculator (kickoff)
+
+[P01](/projects/p01), the Typed Calculator, is your first project, and you will build it across Part II as each chapter hands you a new tool. Today you only create the skeleton and prove the toolchain works end to end.
+
+```text
+p01-typed-calculator/
+  package.json
+  tsconfig.json
+  src/
+    evaluate.ts      # pure arithmetic: no input, no output
+    cli.ts           # the only file that talks to the terminal
+```
+
+Start with a single typed function and a runner script:
+
+```ts
+// src/evaluate.ts
+export type Operator = "+" | "-" | "*" | "/";
+
+export function evaluate(left: number, operator: Operator, right: number): number {
+  switch (operator) {
+    case "+": return left + right;
+    case "-": return left - right;
+    case "*": return left * right;
+    case "/": return left / right;
+  }
+}
+```
+
+```json
+{
+  "scripts": {
+    "dev": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit"
+  }
+}
+```
+
+Check it works: `npm run typecheck` should print nothing (silence means success), and `npm run dev` should run. Then break something on purpose, such as calling `evaluate(1, "plus", 2)`, and read the error with what you learned in 5.6.
+
+> 🔗 **Connection.** In [Chapter 9](/chapter/9) you will handle untrusted input, and in [Chapter 8](/chapter/8) you will meet literal unions properly. By the end of Part II, P01 will reject bad input politely and never crash.
+
+## Common mistakes
+
+> ⚠️ **Installing globally and drifting versions.** Two machines, two TypeScript versions, two different sets of errors. Install per project and run through `npx` or npm scripts.
+
+> ⚠️ **Treating every red squiggle as noise.** Early on, most squiggles are real findings (a possible `null`, a missing argument). Read the message. If it's truly wrong, it's usually because your *declaration* is inaccurate, and fixing the declaration is a fix too.
+
+> ⚠️ **Confusing "it runs" with "it type-checks".** `tsx`, `node file.ts`, and Vite all skip type-checking. Add a `typecheck` script and run it in your editor, pre-commit hook, and CI.
+
+> ⚠️ **Fixing the nested error from the top.** Read the chain bottom-up. The last line is the cause.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** you start any new project: local `typescript`, a strict `tsconfig.json`, `tsc --noEmit` as the checker, and a runner such as `tsx` or Vite for execution.
+
+> 🚫 **When not to.** Don't compile with `tsc` to produce files you never needed (a `dist/` folder that duplicates what a bundler already creates). Don't add a build step for a ten-line script when `node script.ts` is enough. And don't turn `strict` off to make the first errors go away. It only postpones them.
+
+## How it connects
+
+> 🔗 **Connection.** Erasure ([Chapter 3](/chapter/3)) is why running and checking are separate commands. Every flag in `tsconfig.json` returns in [Chapter 26](/chapter/26); `erasableSyntaxOnly` comes back with enums in [Chapter 8](/chapter/8) and classes in [Chapter 15](/chapter/15). The scripts you set up here grow into a full toolchain in [Chapter 27](/chapter/27).
+
+> 🌍 **Real world.** Most production TypeScript projects look just like this: a strict `tsconfig.json`, `tsc --noEmit` in CI as a required check, and a separate tool producing the runnable output.
+
+## Exercises
+
+### Level 1 — Recall
+
+Compile a file of about twenty lines that contains an interface, a type alias, two annotated functions, and a `console.log`. Open the emitted `.js`. For every line of the output, point to the input line it came from. Then list which input lines produced **no** output at all, and say why.
+
+### Level 2 — Application
+
+Without searching the internet at first, decode each error. For each one, name the code, the location, the *cause* (the last line of the chain), and write the one-line fix.
+
+```ts
+interface User { id: string; name: string; email?: string }
+
+const a: User = { id: 1, name: "Ada" };
+const b: User[] = [{ id: "u1" }];
+function greet(user: User) { return `Hello ${user.name.toUpperCase()}`; }
+greet({ id: "u2", name: "Lin", nickname: "L" });
+```
+
+### Level 3 — Challenge
+
+Write a program that `tsx` runs happily (it prints a result and exits normally) but that `tsc --noEmit` rejects. Then write three or four sentences explaining why **both behaviors are correct**, using the words "erasure" and "check".
+
+*Hint: a wrong annotation on a value that happens to work at runtime is enough.*
+
+### Level 4 — Real-world
+
+**Ticket TF-005: Team starter repo.** Every new project in the team currently begins with an hour of copy-pasting config. Create a reusable starter repository.
+
+- Scripts: `dev` (run with `tsx`), `typecheck` (`tsc --noEmit`), `test` (Vitest), and `build` (emits to `dist/`).
+- A strict `tsconfig.json` with `noUncheckedIndexedAccess` and `erasableSyntaxOnly`, with a comment on each option.
+- A README with: how to run each script, and which command catches which kind of problem.
+- Keep it. You will use this exact repo for Parts II to IV, and [Chapter 27](/chapter/27) explains Vitest in detail.
+
+## Key takeaways
+
+- Install TypeScript **per project**; run it with `npx` or npm scripts, never from a drifting global.
+- `tsc` both checks and emits; `tsc --noEmit` checks only, and is how modern projects use it.
+- `tsx` and `node file.ts` run TypeScript by erasing types. They do **not** type-check, so you need both a runner and a checker.
+- The editor is the fastest teacher: hover, quick fix, go to definition, rename.
+- Read errors by their anatomy (location, code, headline, chain), and **read chains bottom-up**.
+- The Playground is for minimal, shareable repros.
+
+## What comes next
+
+You can now compile, run, and read errors. But what *is* a type, and when should you write one versus letting TypeScript work it out? A beginner who annotates everything and one who annotates nothing are both wrong, in different ways. That is [Chapter 6: Types, Annotations & Inference](/chapter/6).

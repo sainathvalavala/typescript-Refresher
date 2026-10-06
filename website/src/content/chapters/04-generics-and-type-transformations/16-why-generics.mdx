@@ -1,0 +1,254 @@
+> 📖 **The problem.** You're building TaskFlow's utility module. You write `firstTask(tasks)` to grab the first task in a list. Then you need `firstProject`, then `firstUser`. The bodies are identical, and only the types differ. So you write one function typed with `any`, and it "works". A week later, `first(scores).toUpperCase()` compiles and crashes in production.
+
+This chapter is about writing code **once** that works for **many types** without throwing away what TypeScript knows. By the end, you'll be able to read and write generic functions, explain how TypeScript fills in the type for you, and spot generics that are pointless or quietly lying.
+
+> 🧠 **Mental model.** A **type parameter is a function parameter for types.** A function takes values as arguments; a generic function also takes a *type* as an argument. You almost never pass it yourself: TypeScript infers it from the values at each call.
+
+## 16.1 The duplication problem
+
+Look at what these three functions have in common:
+
+```ts
+function firstTask(items: Task[]): Task | undefined {
+  return items[0];
+}
+function firstProject(items: Project[]): Project | undefined {
+  return items[0];
+}
+function firstUser(items: User[]): User | undefined {
+  return items[0];
+}
+```
+
+The *logic* is identical; only the *type* changes. Copy-pasting means every bug fix and every improvement must be applied three, then thirty, times.
+
+The tempting "fix" is `any`:
+
+```ts
+function first(items: any[]): any {
+  return items[0];
+}
+
+const score = first([90, 72, 85]); // score: any
+score.toUpperCase();               // ✅ compiles…
+                                   // 💥 TypeError at runtime: score.toUpperCase is not a function
+```
+
+`any` didn't make the function flexible. It made TypeScript **forget** what went in, so nothing it knows can flow out. Autocomplete dies, refactors stop being safe, and the bug ships. We want both things at once: one implementation, *and* full type information.
+
+## 16.2 You've used generics already
+
+Before writing one, notice that you've been *using* generics since [Chapter 7](/chapter/7). The angle brackets are type arguments:
+
+```ts
+const titles: Array<string> = ["Write docs", "Fix bug"]; // same as string[]
+const lookup = new Map<string, Task>();                  // keys are strings, values are Tasks
+const tags = new Set<string>(["urgent", "frontend"]);
+const pending: Promise<Task[]> = loadTasks();            // will eventually produce Task[]
+
+lookup.get("t1");    // Task | undefined. Map "remembers" its value type
+pending.then((ts) => ts.length); // ts: Task[]. Promise "remembers" what it resolves to
+```
+
+`Array`, `Map`, `Set`, and `Promise` are each written **once** in TypeScript's standard library, and each works with whatever type you give it. That's exactly what we want for `first`.
+
+> 💡 **Tip.** Hover over `map` on any array in your editor. You'll see `map<U>(callbackfn: (value: T, …) => U): U[]`. The standard library is full of generics.
+
+## 16.3 Type parameters
+
+A generic function declares one or more **type parameters** in angle brackets right after its name, then uses them like ordinary types:
+
+```ts
+function first<T>(items: T[]): T | undefined {
+  //          ^^^ declare a type parameter called T
+  //                    ^^^ use it to describe the input
+  //                                ^^^^^^^^^^^^^ …and the output
+  return items[0];
+}
+```
+
+Read it aloud: *"for any type `T`, `first` takes an array of `T` and returns a `T` or `undefined`."* The name `T` is just a convention. Descriptive names such as `Item` or `TValue` are fine, and better when there are several parameters.
+
+The point of `T` is to **connect** the input to the output. Whatever kind of array goes in, that kind of element comes out:
+
+```ts
+const n = first([90, 72, 85]);        // n: number | undefined
+const s = first(["todo", "done"]);    // s: string | undefined
+const t = first(taskList);            // t: Task | undefined
+
+n?.toFixed(1);       // ✅
+n?.toUpperCase();    // ❌ Property 'toUpperCase' does not exist on type 'number'.
+```
+
+The bug from 16.1 is now a compile error, and we still wrote the function only once.
+
+## 16.4 Inference at the call site
+
+Notice that we never wrote `first<number>(…)`. At each call, TypeScript looks at the arguments, matches them against the parameter types, and **infers** `T`:
+
+```ts
+first([1, 2, 3]);              // T inferred as number
+first<number>([1, 2, 3]);      // explicit type argument: allowed, but redundant
+first<string>([1, 2, 3]);      // ❌ Type 'number' is not assignable to type 'string'.
+```
+
+Explicit type arguments are for the cases where there's **nothing to infer from**, usually when a value starts empty:
+
+```ts
+function createList<T>(): T[] {
+  return [];
+}
+
+const tasks = createList<Task>(); // nothing to infer T from, so say it explicitly
+const oops = createList();        // T falls back to unknown: unknown[]
+```
+
+> 🧠 **Mental model.** Inference flows from **values** to **types**. If a type parameter appears in a parameter, the argument teaches TypeScript what it is. If it appears only in the return type, there's nothing to learn from, which leads us to the golden rule.
+
+## 16.5 The golden rule
+
+> **A type parameter earns its place by appearing at least twice**, because its whole job is to connect two things (an input and an output, or two inputs).
+
+```ts
+// ❌ Pointless: T appears once. It connects nothing.
+function logValue<T>(value: T): void {
+  console.log(value);
+}
+// ✅ Same behavior, more honest:
+function logValue2(value: unknown): void {
+  console.log(value);
+}
+
+// ✅ Earns its place: both inputs must agree on T.
+function includesItem<T>(items: T[], item: T): boolean {
+  return items.includes(item);
+}
+includesItem(["todo", "done"], "doing"); // ✅ T is string
+includesItem([1, 2, 3], "3");            // ❌ Argument of type 'string' is not assignable to parameter of type 'number'.
+```
+
+The sneakiest violation is the **lying generic**: a type parameter that appears *only* in the return type.
+
+```ts
+async function fetchJson<T>(url: string): Promise<T> {
+  const response = await fetch(url);
+  return response.json(); // returns any, so it silently becomes T
+}
+
+const user = await fetchJson<User>("/api/me"); // user: User, but nothing checked it!
+```
+
+This compiles, and it *looks* safe, but `T` is just a type assertion wearing a disguise: the caller picks a type and TypeScript believes it. If the server sends something else, you'll crash later, far from the cause. [Chapter 32](/chapter/32) fixes this properly by making the type *earned* through validation.
+
+## 16.6 Generics vs unions vs unknown
+
+Generics are one of three tools for "this works with more than one type". Pick by asking: **does the caller's specific type need to flow through?**
+
+```ts
+// Union: a fixed, known set of types. Output doesn't depend on which one came in.
+function formatId(id: string | number): string {
+  return `#${id}`;
+}
+
+// unknown: "anything at all", and I won't use its type afterward.
+function isPresent(value: unknown): boolean {
+  return value !== null && value !== undefined;
+}
+
+// Generic: the caller's type must come back out, preserved.
+function last<T>(items: T[]): T | undefined {
+  return items[items.length - 1];
+}
+
+const id = formatId(42);           // string
+const ok = isPresent(task);        // boolean
+const newest = last(taskList);     // Task | undefined, the specific type is preserved
+```
+
+| Situation | Reach for |
+|---|---|
+| A small, fixed set of input types | A union |
+| Any input; you only test it or pass it along opaquely | `unknown` |
+| The output type depends on the input type | A generic |
+| Two inputs must have matching types | A generic |
+
+## Common mistakes
+
+> ⚠️ **Single-use type parameters.** `function save<T>(item: T): void` adds noise and no safety. Use `unknown` or a concrete type.
+
+> ⚠️ **Writing type arguments everywhere.** `first<number>([1, 2])` is redundant. Let inference work, and add explicit arguments only when there's nothing to infer from.
+
+> ⚠️ **The lying generic.** A `T` that appears only in the return type (`fetchJson<T>`, `parse<T>`) is an unchecked assertion. Prefer a parser parameter that *produces* the type.
+
+> ⚠️ **Assuming `T` exists at runtime.** Types are erased ([Chapter 3](/chapter/3)), so `if (T === String)` is impossible. If behavior must differ by type, pass a value (a function or a schema) that carries the difference.
+
+```ts
+function describe<T>(value: T): string {
+  if (typeof T === "string") return "a string"; // ❌ 'T' only refers to a type, but is being used as a value here.
+  return "something else";
+}
+```
+
+## When to use it, and when not to
+
+> ✅ **Use it when** the output type depends on the input type (`first`, `last`, `map`), when several parameters must agree (`includesItem`), or when building containers (`Stack<T>`, `ApiResponse<T>`, covered in [Chapter 18](/chapter/18)).
+
+> 🚫 **When not to.** Every caller uses the same type: use that type. A fixed set of types: use a union. You never use the type afterward: use `unknown`. And don't generalize on the *first* use. Write the concrete version, and extract a generic when the second or third copy appears.
+
+## How it connects
+
+> 🔗 **Connection.** Generic syntax first appeared with `Array<T>` ([Chapter 7](/chapter/7)) and `Promise<T>` ([Chapter 11](/chapter/11)). Next, [Chapter 17](/chapter/17) adds **constraints** ("T must have an `id`") and `keyof`. In React, you'll meet the same idea in `useState<T>` ([Chapter 52](/chapter/52)) and generic components ([Chapter 57](/chapter/57)).
+
+> 🌍 **Real world.** Nearly every library API you use daily is generic: `Array.prototype.map`, `Promise.all`, `Object.groupBy`, `useState`, TanStack Query's `useQuery`. Their call sites rarely need angle brackets, because the libraries are designed for inference.
+
+## Exercises
+
+### Level 1 — Recall
+
+Predict the inferred type of `T` (and of the result) for each call, then check by hovering in your editor:
+
+```ts
+function first<T>(items: T[]): T | undefined { return items[0]; }
+
+first([true, false]);
+first(["a", 1]);
+first([]);
+first([[1, 2], [3]]);
+first([{ id: "t1", done: false }]);
+first<string | null>([null]);
+```
+
+### Level 2 — Application
+
+Your utility toolkit from [P03](/projects/p03) has `uniqueStrings(items: string[])`, `uniqueNumbers(items: number[])`, and `chunkNumbers(items: number[], size: number)`. Replace them with generic `unique` and `chunk` functions. Update every call site. **None of them should need explicit type arguments.**
+
+### Level 3 — Challenge
+
+Write `zip`, which pairs up two arrays element by element and stops at the shorter one:
+
+```ts
+zip(["a", "b", "c"], [1, 2]); // should be typed [string, number][] and equal [["a", 1], ["b", 2]]
+```
+
+*Hint: you need two type parameters, one per array.*
+
+### Level 4 — Real-world
+
+**Ticket TF-142: Retry flaky network calls.** The TaskFlow API client sometimes fails on the first request after a deploy. Implement `retry(fn, attempts)` in the utility library.
+
+- `fn` is any function returning a promise; `retry` returns a promise of the **same result type** (`retry(() => loadTasks(), 3)` resolves to `Task[]`).
+- It retries up to `attempts` times and rethrows the last error if every attempt fails.
+- Write tests for both success-after-failure and all-attempts-fail.
+- No `any` anywhere, including in the tests.
+
+## Key takeaways
+
+- `any` makes code "flexible" by making TypeScript forget. Generics make it flexible while **remembering**.
+- A type parameter is a parameter for types. TypeScript usually infers it from the arguments at each call.
+- A type parameter must appear **at least twice**, because it exists to connect things.
+- A generic that appears only in the return type is an **unchecked assertion** in disguise.
+- Choose between a union, `unknown`, and a generic by asking whether the caller's type must flow through.
+
+## What comes next
+
+Try writing `getProperty(task, "title")`. With what you know so far, TypeScript can't stop you from asking for `getProperty(task, "titel")`, and it can't tell you the result is a `string`. To fix that, a type parameter needs **rules**: "the key must be one of the object's keys". That's [Chapter 17: Generic Functions, Constraints & keyof](/chapter/17).

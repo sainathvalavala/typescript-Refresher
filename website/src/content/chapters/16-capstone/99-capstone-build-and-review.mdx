@@ -1,0 +1,386 @@
+> 📖 **The problem.** "Deploy something on day one." It sounds absurd. You have a design document, a contract package, and a head full of features, and your senior colleague tells you to spend the first day shipping a page that does almost nothing: it shows a version number, calls one endpoint, and the endpoint validates one request. It's deployed to a real URL, built by CI, with checks that can fail. You feel like you've wasted a day. Three weeks later, when other teams discover that their deploy pipeline needed a secret nobody had set, a database that nobody had provisioned, and a CORS rule nobody had written, you're the only one whose release goes out on time.
+
+This chapter takes you from design to a shipped, reviewed system. You'll build the skeleton, grow it in vertical slices, harden it, measure it against your budgets, make it operable, document it, grade it honestly against the rubric, and present it. And then, because the book ends here, I'll say a few words about where to go next.
+
+> 🧠 **Mental model.** **Ship thin vertical slices.** Each slice crosses every layer (contract, API, client, UI, tests) and leaves the system deployable.
+
+## 99.1 The walking skeleton
+
+A **walking skeleton** is the smallest implementation that exercises the whole architecture end to end. It does almost nothing useful, but every moving part exists: the monorepo, CI, a deploy target, environment validation, one API endpoint behind a schema, one client call, and one test at each level. Its purpose is to move *risk* to the beginning, when change is cheap.
+
+Start with **environment validation**, because misconfiguration is the most common first-deploy failure. Parse `process.env` once, at startup, and crash early with a clear message ([Chapter 32](/chapter/32)):
+
+```ts
+// apps/api/src/config.ts
+import { z } from "zod";
+
+const Env = z.object({
+  NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
+  PORT: z.coerce.number().int().positive().default(3000),
+  DATABASE_URL: z.url(),
+  SESSION_SECRET: z.string().min(32),
+});
+
+export const env = Env.parse(process.env); // throws with a readable list of problems; the app never starts misconfigured
+export type Env = z.infer<typeof Env>;
+```
+
+Then the thinnest end-to-end path. A health endpoint whose response shape lives in the **contracts** package, and the web app calling it with validation:
+
+```ts
+// packages/contracts/src/health.ts
+import { z } from "zod";
+export const HealthResponse = z.object({ status: z.literal("ok"), version: z.string(), time: z.iso.datetime() });
+export type HealthResponse = z.infer<typeof HealthResponse>;
+
+// apps/web/src/api/health.ts
+import { HealthResponse } from "@teamboard/contracts";
+export async function getHealth(): Promise<HealthResponse> {
+  const res = await fetch("/api/health");
+  if (!res.ok) throw new Error(`Health check failed: ${res.status}`);
+  return HealthResponse.parse(await res.json()); // validated at the boundary
+}
+```
+
+Finally, **CI and deploy from the first commit**. Every quality gate you promised in the design is automated now, while there's almost nothing to check:
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm turbo run typecheck lint test build
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm turbo run e2e
+  preview:
+    needs: check
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/deploy-preview.sh   # prints the preview URL on the PR
+```
+
+The review question for this milestone: *Is every quality gate automated from day one?*
+
+## 99.2 Building feature slices end to end
+
+After the skeleton, every feature is a **vertical slice**: a thin cut through all layers, finished before the next begins. For "move an issue between states", the slice has five parts in this order:
+
+1. **Contract**: `MoveIssueRequest`, the `conflict` and `transition_not_allowed` error shapes.
+2. **Domain**: the transition table and `moveToReview`, with unit tests for every pair.
+3. **API**: route to service to repository, enforcing permission and version, returning the contract's errors.
+4. **Client and UI**: a typed client function, a mutation with optimistic update and rollback, and a board that handles every state in your inventory.
+5. **Tests**: an integration test on the endpoint; a component test for the UI; an E2E test if it's one of the critical paths.
+
+```ts
+// apps/api/src/services/issues.ts: the service is where the rules meet I/O
+export async function moveIssue(
+  actor: Actor,
+  issueId: IssueId,
+  req: MoveIssueRequest,
+  repo: IssueRepository,
+): Promise<Result<IssueDto, ApiError>> {
+  if (!can(actor, "issue:move")) return { ok: false, error: { code: "forbidden", permission: "issue:move" } };
+
+  const issue = await repo.get(actor.workspaceId, issueId);   // always scoped by tenant
+  if (!issue) return { ok: false, error: { code: "not_found" } };
+  if (issue.version !== req.expectedVersion) return { ok: false, error: { code: "conflict", currentVersion: issue.version } };
+
+  const moved = applyTransition(issue, req);                   // pure domain function
+  if (!moved.ok) return { ok: false, error: { code: "transition_not_allowed", from: issue.status, to: req.to } };
+
+  return { ok: true, value: toDto(await repo.save(moved.value)) };
+}
+```
+
+Write the **definition of done** for a slice before starting, and don't call a slice finished until it's met. Being half-done in five layers is worth nothing:
+
+```md
+## Definition of done: a feature slice
+- [ ] Contract schemas and error shapes merged first, with a test for malformed payloads
+- [ ] Domain logic unit-tested, including every illegal case
+- [ ] API: authorization, validation, and tenant scoping covered by an integration test
+- [ ] UI: loading, empty, error, partial, and success states all reachable and tested
+- [ ] Keyboard and screen-reader pass on any new interaction
+- [ ] No new `any`, `as`, or `!` outside the documented allowlist
+- [ ] Docs/ADR updated if a decision changed; deployed to preview
+```
+
+## 99.3 Hardening
+
+A feature that works on the happy path is about 60% finished. Hardening is the pass where you attack your own system. Go slice by slice and ask the milestone's review question: *what breaks first under hostile input, slow networks, or a screen reader?*
+
+**Error paths.** Make each failure reachable on purpose: kill the API, return a 500, return malformed JSON, time out. Does every screen in your inventory have a sensible behavior? MSW ([Chapter 69](/chapter/69)) makes this easy to script.
+
+**Edge cases.** Empty strings, 10,000-character titles, emoji, two users moving the same card, a deleted project open in another tab, a clock in the wrong timezone. Write each as a test the first time it bites you.
+
+**Security review.** Walk your checklist against the real code. The most valuable single test in a multi-tenant system is the **tenant isolation test**: user A of workspace 1 must never read or change anything in workspace 2, for every repository method.
+
+```ts
+// apps/api/test/tenant-isolation.test.ts
+import { describe, expect, test } from "vitest";
+
+describe("tenant isolation", () => {
+  test("a user cannot read another workspace's issue by id", async () => {
+    const { api, workspaceA, workspaceB, issueInB } = await seedTwoWorkspaces();
+    const res = await api.as(workspaceA.owner).get(`/issues/${issueInB.id}`);
+    expect(res.status).toBe(404); // not 403: don't confirm that it exists
+  });
+
+  test("moving an issue in another workspace is rejected", async () => {
+    const { api, workspaceA, issueInB } = await seedTwoWorkspaces();
+    const res = await api.as(workspaceA.owner).post(`/issues/${issueInB.id}/move`, { to: "todo", expectedVersion: 0 });
+    expect(res.status).toBe(404);
+  });
+});
+```
+
+```md
+## Hardening log (keep it; it is evidence for the rubric)
+| Finding                                   | Severity | Fix                              | Test added |
+|-------------------------------------------|----------|----------------------------------|------------|
+| Markdown comment rendered raw HTML        | High     | Sanitize on render, allowlist tags| yes        |
+| Moving a card twice quickly double-fires  | Medium   | Disable during mutation, version check | yes   |
+| Board unusable with 2,000 issues          | Medium   | Virtualize columns               | perf test  |
+```
+
+## 99.4 Performance and accessibility passes
+
+Now compare reality with the **budgets** you set in the plan. Measure, don't guess ([Chapter 72](/chapter/72), [Chapter 95](/chapter/95)).
+
+**Performance.** Run a production build and inspect the bundle. Is initial JavaScript under budget? If not, find the biggest dependency and route-split what isn't needed on first paint. Profile the slowest interaction (probably dragging a card in a long column) with the React Profiler, and fix only what the profile shows. Put the measurements in CI so regressions fail the build.
+
+```yaml
+# CI steps that make the budgets real
+- run: pnpm --filter @teamboard/web build
+- run: pnpm exec size-limit            # fails if initial JS exceeds the budget in package.json
+- run: pnpm exec tsc --noEmit --extendedDiagnostics | tee tsc.log && node scripts/check-budget.mjs tsc.log
+```
+
+```json
+{
+  "size-limit": [{ "path": "apps/web/dist/assets/index-*.js", "limit": "200 kB", "gzip": true }]
+}
+```
+
+**Accessibility.** Automated checks (axe in component and E2E tests) find the easy third. The rest you do by hand: unplug the mouse and complete every critical path using only the keyboard; zoom to 200%; use a screen reader on the board and listen to what's announced when a card moves. A drag-and-drop board is the classic failure, so the keyboard-move alternative and a live-region announcement ("Moved *Write docs* to In review") are part of "done".
+
+```tsx
+// An announcement for assistive tech when a card moves
+<div role="status" aria-live="polite" className="sr-only">
+  {lastMove && `Moved ${lastMove.title} to ${lastMove.statusLabel}`}
+</div>
+```
+
+## 99.5 Observability and operations
+
+A system you can't see is a system you can't fix. Before launch, make sure you can answer *"is it healthy?"* and *"what did the user experience?"* without logging into a server ([Chapter 75](/chapter/75)).
+
+- **Error tracking** with source maps uploaded in CI, so a stack trace points at your TypeScript, plus release tagging so you know which deploy introduced an error.
+- **Structured server logs** with a request ID that also appears in the response, so a user's bug report can be traced.
+- **A typed analytics event catalog**, so event names and payloads can't drift.
+- **A runbook**: a short document that tells whoever is on call what to do.
+
+```ts
+// A typed catalog: unknown events and wrong payloads fail to compile
+export interface AnalyticsEvents {
+  issue_created: { projectId: string };
+  issue_moved: { from: IssueStatus; to: IssueStatus };
+  comment_added: { hasMention: boolean };
+}
+
+export function track<K extends keyof AnalyticsEvents>(event: K, payload: AnalyticsEvents[K]): void {
+  sink({ event, payload, at: Date.now() });
+}
+
+track("issue_moved", { from: "todo", to: "in_progress" }); // ✅
+track("issue_moved", { from: "todo" });                    // ❌ Property 'to' is missing in type '{ from: "todo"; }' but required in type '{ from: IssueStatus; to: IssueStatus; }'.
+```
+
+```md
+## Runbook: "Users see conflict errors constantly"
+1. Check error dashboard for spike in `conflict` after the latest deploy.
+2. Compare `version` handling in the last release's changelog.
+3. Rollback: re-deploy the previous release tag (`./scripts/rollback.sh <tag>`).
+4. Write up in `docs/incidents/` within 48 hours.
+```
+
+## 99.6 Documentation and the architecture review
+
+Documentation is how your work survives contact with other people. The test: **can a new developer become productive in an hour?** Give them only the repository and watch where they get stuck.
+
+You need four things:
+
+- **README**: what it is, a screenshot, how to run it in three commands, how to run the tests, and a map of the repository.
+- **ADRs**: every decision that was expensive to make or would be expensive to reverse, including the ones you rejected ([Chapter 97](/chapter/97)).
+- **CONTRIBUTING.md**: branch and commit conventions, the review checklist, and how to add a feature slice.
+- **A "not built" list**: what you chose *not* to do, and why. This is the single most underrated page in a portfolio, because it shows judgment.
+
+```md
+# Teamboard
+
+Multi-tenant issue tracker. React 19 + Node + shared Zod contracts, in a pnpm monorepo.
+
+## Run it
+pnpm install && pnpm db:migrate && pnpm dev
+
+## Map
+- apps/web: SPA (features/*)   - apps/api: HTTP → services → repositories
+- packages/contracts: the only place API shapes are defined
+- docs/adr: why things are the way they are
+
+## Deliberately not built
+- Custom workflows: the transition table is fixed (ADR-004). Revisit if two customers ask.
+- Offline mode: out of scope for v1; the state map already isolates server state to make it possible.
+```
+
+Then hold an **architecture review**: walk through the system as if explaining it to a skeptical senior engineer. Pick one feature and trace it from domain type to deployed UI, naming every boundary it crosses and what validates it there. Defend the three decisions you're proudest of, and name the one you'd change. The goal isn't to be right about everything; it's to know where your design is weakest before someone else points it out.
+
+## 99.7 Self-review against the rubric
+
+Score yourself on the capstone rubric, 1 to 4 on each of twelve dimensions. A professional-quality capstone scores 3 or higher everywhere.
+
+| Dimension | 3 means (Professional) |
+|---|---|
+| Domain types | Illegal states unrepresentable; branded IDs |
+| Boundaries | Every boundary parsed; one source of truth |
+| Architecture | Features + layers + enforced rules |
+| React design | Correct state homes, minimal effects, typed APIs |
+| UI states | Loading, empty, error, partial, success everywhere |
+| Testing | Unit + component + integration + E2E paths |
+| Accessibility | WCAG AA, keyboard-complete |
+| Performance | Budgets met and enforced in CI |
+| Security | Checklist complete, CSP, safe sessions |
+| Operability | Tracking + typed analytics + runbook |
+| Simplicity | Abstractions justified |
+| Documentation | README, ADRs, CONTRIBUTING |
+
+Score honestly, and **attach evidence to every number**: a link to the test, the CI job, the ADR, the screenshot. A score without evidence is a feeling. Then the useful part: fix your three lowest. The rubric's lowest dimension maps back to a part of the book, so reread it.
+
+```md
+## Self-review (v1.0)
+| Dimension  | Score | Evidence                                         | Gap / next step              |
+|------------|-------|--------------------------------------------------|------------------------------|
+| Boundaries | 3     | contracts pkg; boundary test list in docs/qa.md  | Env file parse untested      |
+| Testing    | 2     | 71 unit, 12 integration, 1 E2E                   | 3 more E2E paths (see plan)  |
+| Security   | 3     | docs/security-checklist.md, CSP in apps/api      | No threat model yet (→ 4)    |
+```
+
+> ⚠️ **Common mistake.** Giving yourself a 3 because "it mostly works". The rubric is about *evidence*: if a reviewer can't verify a claim in five minutes, it doesn't count.
+
+## 99.8 Presenting your work
+
+A project nobody understands might as well not exist. Prepare three artifacts, each for a different reader.
+
+**The demo** (five minutes). Show one complete story: sign in, create an issue, move it to review (and trigger the "needs a reviewer" rule on purpose), see a conflict handled gracefully, switch to keyboard-only. Rehearse it and record a backup video, because live demos fail.
+
+**The write-up** (one page). Problem, approach, three decisions with their alternatives, what the types caught that tests wouldn't have (and the reverse), and what you'd do next. Write it for an engineer who has never seen the project.
+
+**The portfolio entry.** A short description, a link to the running deployment, a link to the repository with a good README, and one diagram. Pin the repository, and make the first screen of the README count.
+
+```md
+## Write-up outline
+1. The brief and my interpretation (3 sentences)
+2. Architecture in one diagram
+3. Decision 1: Schemas as the single source of truth. Alternatives: OpenAPI codegen. Cost: one more package.
+4. Decision 2: The state machine as shared data. What it prevented: 2 illegal moves caught at compile time.
+5. Decision 3: Optimistic concurrency via `version`. What I'd change: add per-field merge.
+6. What TypeScript caught that tests missed, and the reverse
+7. What I deliberately did not build
+8. Next steps
+```
+
+## 99.9 What's next
+
+You've now taken a vague requirement to production on your own and can explain every choice. That is what "ready" means. Here are ways to keep growing, in rough order of payoff.
+
+- **Get a real review.** Ask a developer you respect to read the repository for 30 minutes and tell you what surprised them. Address the comments in public, in the pull request.
+- **Contribute to something you depend on.** A typed fix or a documentation improvement to an open-source TypeScript project teaches you to read unfamiliar code, which is most of the job.
+- **Go deep on one specialty.** Type-level programming and library design (Part XIII), design systems and frontend architecture (Parts XIV and XV), full-stack and platform work (Parts VI and XII), or the Library track (C3).
+- **Teach.** Write up one topic you struggled with; explain it to someone one level behind you. You'll find the gaps.
+- **Keep the habits.** Measure before optimizing, parse at boundaries, make illegal states unrepresentable, and defend simplicity.
+
+```md
+## 90-day plan (example)
+- Weeks 1–2: get one review of the capstone; fix the top 3 comments
+- Weeks 3–6: ship a small typed contribution to an OSS project
+- Weeks 7–12: build C3 (publish a library to npm with provenance) OR add real-time/offline to Teamboard
+- Ongoing: one written post per month, reread one hard chapter per month
+```
+
+## Common mistakes
+
+> ⚠️ **Building layer by layer.** "All the API first, then the UI" delays the integration problems until they're expensive. Always finish a vertical slice.
+
+> ⚠️ **Skipping the skeleton.** A first deploy in week six is a first deploy full of surprises. Deploy empty on day one.
+
+> ⚠️ **Scope-cutting quality.** Under time pressure, cut features, not validation, tests, or keyboard support.
+
+> ⚠️ **Self-scoring without evidence.** If you can't link to proof, the score is a guess.
+
+> ⚠️ **Polishing the demo, not the foundation.** A reviewer will open the code. A clean contract package, good tests, and a README that works beat a flashy animation.
+
+```ts
+// ❌ A "slice" that stops at the API: no UI state handles it, nothing tests the failure.
+app.post("/issues/:id/move", async (req, res) => {
+  res.json(await db.issue.update({ where: { id: req.params.id }, data: req.body })); // no validation, no authorization, no tenant scoping
+});
+```
+
+## When to use it, and when not to
+
+> ✅ **Use it when** you're building anything that will be deployed and maintained: the skeleton-first, slice-by-slice approach is how most professional teams deliver.
+
+> 🚫 **When not to.** For a throwaway script or a one-day spike, a CI pipeline, a runbook, and an architecture review are overkill. Match the ceremony to the lifetime. And if the requirements are truly unknown, spend a *short* time-boxed spike learning, then restart with a skeleton rather than hardening the spike.
+
+## How it connects
+
+> 🔗 **Connection.** This chapter is the book in motion: boundaries ([Chapter 32](/chapter/32)), testing ([Chapters 67–69](/chapter/69)), production ([Chapters 70–76](/chapter/76)), architecture ([Chapter 90](/chapter/90)), monorepos ([Chapter 94](/chapter/94)), and team practice ([Chapter 97](/chapter/97)). The plan it executes was made in [Chapter 98](/chapter/98).
+
+> 🌍 **Real world.** "Walking skeleton" comes from agile practice, and "thin vertical slices" is how continuous-delivery teams reduce risk. Teams that deploy on day one tend to find their environment problems in week one, when it is cheap.
+
+## Exercises
+
+### Level 1 — Recall
+
+Write the definition of done for one feature slice of your capstone. It must cover the contract, domain logic, API, UI states, tests, accessibility, and documentation, with each item checkable by someone else.
+
+### Level 2 — Application
+
+Ship the walking skeleton: a monorepo with CI running type-check, lint, unit tests, build, and one E2E test; a validated environment config; one contract-backed health endpoint called from the web app; and a deployed preview URL for pull requests.
+
+### Level 3 — Challenge
+
+Run a full self-review against the rubric with evidence links for every score. Then fix your three weakest dimensions and re-score, recording what changed. *Hint: the lowest score tells you which part of the book to reread.*
+
+### Level 4 — Real-world
+
+**Ticket CAP-9: External review and retrospective.**
+
+- Ask another developer to review your repository, and give them the README and nothing else.
+- Respond to every comment publicly: fix it, or explain with an ADR why you won't.
+- Write a one-page retrospective: what went well, what you'd change, what TypeScript caught that tests wouldn't have (and the reverse), and what you chose not to build.
+- Acceptance: a new developer can run the project and make a change in under an hour using only your docs.
+
+## Key takeaways
+
+- Deploy a **walking skeleton** first; automate every quality gate while there's little to check.
+- Build in **vertical slices** (contract, domain, API, client, UI, tests) and define "done" before starting.
+- Hardening is a deliberate attack on your own system; the tenant isolation test is the one you cannot skip.
+- Measure performance and accessibility against budgets, and keep the budgets in CI.
+- Make the system observable: error tracking with source maps, typed analytics, a runbook.
+- Document for a stranger: README, ADRs, CONTRIBUTING, and a "not built" list.
+- Score yourself against the rubric with evidence, then fix the lowest three.
+
+## What comes next
+
+This is where the book ends and your work begins. Return to any chapter when a problem calls for it, and keep the capstone as a living project: a place to try new ideas, with types, contracts, and tests that make change safe. The best next step is to put your work in front of another developer, and to answer their questions with the code, the docs, and the decisions you wrote down along the way.

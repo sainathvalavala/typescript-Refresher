@@ -1,0 +1,397 @@
+> 📖 **The problem.** Monday: the deploy script, an old CommonJS file, calls `require("@taskflow/date-utils")` right after you made that package ESM-only, and the build server's older Node prints `Error [ERR_REQUIRE_ESM]: require() of ES Module … not supported`. Tuesday: a teammate adds one `import` line to a file in the API package and gets `SyntaxError: Cannot use import statement outside a module`. Wednesday: the app dies at startup with `SyntaxError: The requested module './types.ts' does not provide an export named 'Task'`, because an import of a *type* survived into the JavaScript that Node actually ran. Three days, three module errors, and not one bug in the actual logic.
+
+Module errors feel random because several independent systems are involved and each one has opinions: the runtime (Node or the browser) decides how files load, TypeScript decides what it checks and what it emits, and transpilers like esbuild decide what to strip. When they disagree, you get an error that seems to have nothing to do with the line you just changed.
+
+This chapter gives you the map. By the end, you'll be able to tell which module system any file is in, configure TypeScript to match your runtime, write imports that erase cleanly, read interop errors without guessing, and decide where barrel files help and where they hurt.
+
+> 🧠 **Mental model.** There are **two module systems** (ESM and CommonJS), **one compiler** that must be told which one your runtime expects, and **type imports that must disappear cleanly** when types are erased. Almost every module error is a disagreement between two of those three.
+
+## 25.1 Why two module systems exist
+
+In the browser of 2005, there were no modules. Every `<script>` tag dumped its top-level variables into one shared global scope, and "dependency management" meant getting the tag order right. When Node arrived in 2009 it needed modules on day one, and the language had no standard, so Node adopted a community convention called **CommonJS** (CJS). In CommonJS, `require()` is an ordinary function: it reads a file from disk, runs it, and returns whatever that file put on `module.exports`. That's simple and synchronous, which is fine on a server with a local disk.
+
+In 2015 the language finally got its own standard: **ES Modules** (ESM). Here `import` and `export` are *syntax*, not function calls. That one difference matters a lot: because imports are declared statically, tools can see the whole dependency graph before running any code, browsers can fetch modules asynchronously over the network, and bundlers can remove unused exports (tree-shaking).
+
+```js
+// task-utils.cjs: CommonJS. require is a function; exports is an object you fill in.
+const { randomUUID } = require("node:crypto");
+
+function createTask(title) {
+  return { id: randomUUID(), title, status: "todo" };
+}
+module.exports = { createTask };
+```
+
+```js
+// task-utils.mjs: ES Modules. import/export are syntax, analyzed before any code runs.
+import { randomUUID } from "node:crypto";
+
+export function createTask(title) {
+  return { id: randomUUID(), title, status: "todo" };
+}
+```
+
+ESM is the standard and the future, but npm holds fifteen years of CommonJS packages, so Node supports both. It decides **per file**, using the file extension first and then the `"type"` field of the nearest `package.json`:
+
+```json
+{
+  "name": "@taskflow/api",
+  "type": "module"
+}
+```
+
+| File | Nearest `package.json` | Node treats it as |
+|---|---|---|
+| `.mjs` | anything | ESM |
+| `.cjs` | anything | CommonJS |
+| `.js` | `"type": "module"` | ESM |
+| `.js` | `"type": "commonjs"` | CommonJS |
+
+TypeScript mirrors this: `.mts` compiles to `.mjs`, `.cts` compiles to `.cjs`, and a plain `.ts` file follows the `"type"` field. Now Tuesday's error makes sense. The teammate's file was a `.js` file in a `"type": "commonjs"` package, so Node parsed it as CommonJS, where `import` is not valid syntax:
+
+```sh
+$ node src/server.js
+import { createTask } from "./task-utils.js";
+^^^^^^
+SyntaxError: Cannot use import statement outside a module
+```
+
+> 🆕 **Modern note.** Recent Node versions also *detect* ESM syntax in a `.js` file when the `package.json` has **no** `"type"` field, and retry the file as ESM. Treat that as a safety net, not a strategy: set `"type"` explicitly so that Node, TypeScript, and your teammates all agree.
+
+## 25.2 How TypeScript sees a module
+
+TypeScript has its own version of the same split. A file that contains at least one top-level `import` or `export` is a **module**: its top-level names are private to that file unless exported. A file with neither is a **script**: its top-level declarations are global, shared with every other script in the project. That's the old `<script>`-tag world, and it's the default for any file that doesn't say otherwise.
+
+This produces one of the most confusing errors a beginner meets: two files that never mention each other, colliding.
+
+```ts
+// src/seed.ts: no import, no export, so this is a *script*
+const tasks = [{ id: "t1", title: "Seed the database" }];
+
+// src/report.ts: also a script, sharing the same global scope
+const tasks = buildReport(); // ❌ Cannot redeclare block-scoped variable 'tasks'.
+```
+
+Neither file imports the other, yet TypeScript sees one global `tasks` declared twice. The fix is to make the file a module. Any import or export does it; when a file has nothing to export, the conventional marker is an empty `export {}`:
+
+```ts
+// src/report.ts
+const tasks = buildReport(); // ✅ now private to this file
+
+export {}; // marks the file as a module, and emits nothing meaningful
+```
+
+Rather than sprinkling markers around, you can tell TypeScript to treat **every** non-declaration file as a module, which matches how modern code is written anyway:
+
+```json
+{
+  "compilerOptions": {
+    "moduleDetection": "force"
+  }
+}
+```
+
+By default (`"auto"`), TypeScript also treats files as modules when they use `import.meta`, when they're JSX files compiled with `"jsx": "react-jsx"`, and, under `"module": "nodenext"`, when Node itself would load them as ESM. Scripts still have one legitimate home: declaration files that *intentionally* describe globals, which you'll write in [Chapter 28](/chapter/28).
+
+## 25.3 Type-only imports and exports
+
+You learned in [Chapter 3](/chapter/3) that types are erased: annotations, interfaces, and type aliases vanish from the JavaScript output. But an `import` statement is not a type annotation. It is runtime code that loads a file. So when an import brings in **only** types, someone has to notice and delete the whole statement.
+
+The full TypeScript compiler (`tsc`) can do that, because it reads your entire program and knows that `Task` is an interface. Most of the tools that actually run your code don't. esbuild (used by Vite and `tsx`), SWC, Babel, and Node's built-in type stripping are **single-file transpilers**: they look at one file at a time and never open `./types.ts` to see what `Task` is. That's exactly how Wednesday's crash happened:
+
+```ts
+// src/main.ts, run directly with Node's type stripping: node src/main.ts
+import { Task } from "./types.ts"; // looks harmless
+
+const welcome: Task = { id: "t1", title: "Write docs", status: "todo" };
+console.log(welcome.title);
+```
+
+```sh
+$ node src/main.ts
+SyntaxError: The requested module './types.ts' does not provide an export named 'Task'
+```
+
+Node removed the `: Task` annotation, because that's obviously a type. It kept the import, because without reading `types.ts` it can't know `Task` isn't a value. At runtime `types.ts` exports nothing called `Task` (interfaces don't exist at runtime), so loading fails. The fix is to **say** it's a type, in syntax every tool understands:
+
+```ts
+// 1. The whole statement is type-only, and it's removed entirely.
+import type { Task, Status } from "./types.ts";
+
+// 2. Inline modifier: mix values and types in one statement.
+import { createTask, type Task } from "./tasks.ts";
+
+// 3. Type-only re-exports, for barrels and public APIs.
+export type { Task, Status } from "./types.ts";
+export { createTask } from "./tasks.ts";
+```
+
+The `type` keyword is a promise to every tool in the chain: "this name exists only in type space, so delete it." Re-exports need it too. A transpiler seeing `export { Task } from "./types.ts"` would otherwise emit a runtime re-export of something that doesn't exist.
+
+> 💡 **Tip.** Your editor's auto-import and the typescript-eslint rule `consistent-type-imports` can add the `type` keyword for you. You'll rarely type it by hand once your setup is right ([Chapter 27](/chapter/27)).
+
+## 25.4 verbatimModuleSyntax
+
+Without any flag, TypeScript decides for itself which imports to drop: an import used only as a type gets removed silently. That sounds helpful, but it's a guess based on whole-program knowledge, and single-file tools can't make the same guess. The result is code that works under `tsc` and breaks under esbuild or Node, or the reverse.
+
+`verbatimModuleSyntax` replaces the guess with a rule you can apply by reading one line: **an import or export without `type` is kept exactly as written; anything marked `type` is removed.** What you write is what you get. To make that rule safe, TypeScript now reports an error whenever you import a type without marking it:
+
+```json
+{
+  "compilerOptions": {
+    "verbatimModuleSyntax": true
+  }
+}
+```
+
+```ts
+import { Task } from "./types.js";
+// ❌ 'Task' is a type and must be imported using a type-only import when 'verbatimModuleSyntax' is enabled.
+
+import { createTask, type Task } from "./tasks.js"; // ✅
+```
+
+Here is exactly what survives erasure under this flag, verified against the compiler's output. Notice the second line: an inline `type` removes the *name*, but the statement stays.
+
+```ts
+// What you write                                     // What is emitted
+import type { Task } from "./types.js";               // (nothing at all)
+import { type Task } from "./types.js";               // import {} from "./types.js";
+import { createTask, type Task } from "./tasks.js";   // import { createTask } from "./tasks.js";
+export type { Task } from "./types.js";               // (nothing at all)
+export { Task } from "./types.js";                    // ❌ Re-exporting a type when 'verbatimModuleSyntax' is enabled requires using 'export type'.
+```
+
+That leftover `import {} from "./types.js"` still loads the file at runtime. Usually that's harmless, but if the module is heavy, has side effects, or is part of an import cycle, prefer the statement-level `import type` so the whole line disappears.
+
+The flag has one more consequence. TypeScript used to let you write ESM syntax in a CommonJS file and quietly rewrite it into `require` calls. Rewriting is exactly what "verbatim" forbids, so in a CommonJS file you now get an error like `ECMAScript imports and exports cannot be written in a CommonJS file under 'verbatimModuleSyntax'`. In practice, that pushes you toward the combination this book uses everywhere: `"type": "module"` plus `verbatimModuleSyntax`.
+
+> 🕰 **Legacy note.** Older configs controlled import elision with `importsNotUsedAsValues` and `preserveValueImports`. Both were replaced by `verbatimModuleSyntax` and no longer exist in current TypeScript. If you see them, delete them and turn on `verbatimModuleSyntax`.
+
+## 25.5 Module resolution
+
+An import specifier like `"./tasks"` or `"date-fns"` is just a string. **Module resolution** is the algorithm that turns that string into a file on disk. Node has one algorithm, Vite has another, and TypeScript can imitate several. The rule is simple: **TypeScript must resolve imports the same way the tool that will actually load your code does.** If it doesn't, TypeScript will approve imports that crash, or reject imports that work.
+
+Modern TypeScript gives you two real choices. `bundler` models tools like Vite, webpack, esbuild, and Bun: extensionless relative imports are fine, and `package.json` `exports` are respected. `nodenext` models Node itself, rule for rule, including the strict rules for ESM files. Each pairs with a `module` setting:
+
+```json
+{
+  "compilerOptions": {
+    // Code a bundler will process (a Vite + React app)
+    "module": "esnext",
+    "moduleResolution": "bundler"
+  }
+}
+```
+
+```json
+{
+  "compilerOptions": {
+    // Code Node will run directly (an API server, a CLI)
+    "module": "nodenext" // implies "moduleResolution": "nodenext"
+  }
+}
+```
+
+The difference you'll feel first is **file extensions**. Node's ESM loader does not guess extensions, so under `nodenext` a relative import in an ESM file must name the exact file:
+
+```ts
+import { createTask } from "./tasks";
+// ❌ Relative import paths need explicit file extensions in ECMAScript imports when '--moduleResolution' is 'node16' or 'nodenext'. Did you mean './tasks.js'?
+
+import { createTask } from "./tasks.js"; // ✅
+```
+
+Yes, `.js`, even though the file on disk is `tasks.ts`. You're writing the path Node will load **after compilation**, and TypeScript maps `./tasks.js` back to `tasks.ts` while type-checking. If you run `.ts` files directly with Node's type stripping, write `./tasks.ts` instead and enable `allowImportingTsExtensions` (only with `noEmit`) or `rewriteRelativeImportExtensions`, which rewrites `.ts` to `.js` when `tsc` emits.
+
+The other half of resolution is the package side. A package's `exports` field declares its public entry points, and both Node and TypeScript (under `bundler` and `nodenext`) refuse anything else:
+
+```json
+{
+  "name": "@taskflow/utils",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./dates": {
+      "types": "./dist/dates.d.ts",
+      "default": "./dist/dates.js"
+    }
+  }
+}
+```
+
+Each entry maps a subpath to files under **conditions**: `types` tells TypeScript where the declarations are (list it first), and `default` is what runtimes load. A deep import of an unlisted file now fails in both worlds:
+
+```ts
+import { formatDue } from "@taskflow/utils/dates";               // ✅ listed in "exports"
+import { secret } from "@taskflow/utils/dist/internal.js";       // ❌ Cannot find module '@taskflow/utils/dist/internal.js' or its corresponding type declarations.
+// At runtime, Node agrees:
+// 💥 Error [ERR_PACKAGE_PATH_NOT_EXPORTED]: Package subpath './dist/internal.js' is not defined by "exports"
+```
+
+> 🕰 **Legacy note.** Old tutorials use `"moduleResolution": "node"` (later renamed `node10`), which modeled Node 10's CommonJS rules and ignored `exports` entirely. TypeScript 6.0 deprecated it and TypeScript 7 removed it: you'll see `Option 'moduleResolution=node10' has been removed.` Replace it with `bundler` or `nodenext`, depending on who loads your code.
+
+## 25.6 ESM/CJS interoperability
+
+The two systems have different shapes. A CommonJS module exports **one value**, `module.exports`, which is often a single function. An ES module exports **named bindings**, plus an optional special one called `default`. Whenever the two meet, something has to translate one shape into the other, and most interop confusion comes from not knowing which translation is happening.
+
+**ESM importing CommonJS** is the easy direction, and it works natively in Node: `module.exports` becomes the default import, and named imports work when Node can detect them statically.
+
+```js
+// node_modules/slugify-lite/index.js (CommonJS)
+module.exports = function slugify(text) {
+  return text.toLowerCase().replaceAll(" ", "-");
+};
+```
+
+```ts
+// src/urls.ts (ESM)
+import slugify from "slugify-lite"; // ✅ the default import is module.exports
+
+const url = `/tasks/${slugify("Fix login bug")}`; // "/tasks/fix-login-bug"
+```
+
+**TypeScript compiled to CommonJS** is where it used to go wrong. A default import compiles to a property read of `.default`, and a plain CommonJS module has no `default` property. The `esModuleInterop` option fixes this by wrapping the required module in a small helper that supplies one. Here is the real emitted output with `"module": "commonjs"`:
+
+```js
+const slugify_lite_1 = __importDefault(require("slugify-lite"));
+// __importDefault wraps a plain CJS export as { default: module.exports }
+const url = `/tasks/${(0, slugify_lite_1.default)("Fix login bug")}`;
+```
+
+Before `esModuleInterop` existed, people worked around the problem with `import * as slugify from "slugify-lite"` and then called `slugify(...)`. That was never valid ESM, because a namespace object can't be called, and TypeScript now says so: `This expression is not callable.` Use a default import.
+
+> 🕰 **Legacy note.** `esModuleInterop` is on by default, and TypeScript 7 no longer lets you turn it off (`Option 'esModuleInterop=false' has been removed.`). If an old config sets it to `false`, delete the line.
+
+The reverse confusion bites library authors. If your TypeScript library uses a default export and ships as CommonJS, it compiles to `exports.default = taskUrl`, so plain JavaScript consumers must write `require("your-lib").default`. Named exports translate cleanly in both directions, which is why most library guides recommend them.
+
+**CommonJS requiring ESM** was simply impossible for years. That was Monday's `ERR_REQUIRE_ESM`. Modern Node (22.12+ and 20.19+) can `require()` an ES module as long as nothing in its import graph uses top-level `await`:
+
+```js
+// scripts/deploy.cjs (CommonJS)
+const dates = require("@taskflow/date-utils"); // ✅ on modern Node, returns the module namespace
+dates.formatDue(new Date());                   // named exports are properties
+dates.default(new Date());                     // a default export lives on .default
+
+// If the ESM package uses top-level await anywhere in its graph:
+// 💥 Error [ERR_REQUIRE_ASYNC_MODULE]: require() cannot be used on an ESM graph with top-level await. Use import() instead.
+
+async function main() {
+  const { formatDue } = await import("@taskflow/date-utils"); // ✅ works from CJS in any Node version
+  console.log(formatDue(new Date()));
+}
+```
+
+## 25.7 Barrel files
+
+A **barrel** is an `index.ts` file whose only job is to re-export things from its siblings, so callers can write one tidy import:
+
+```ts
+// src/tasks/index.ts: the barrel
+export * from "./defaults.ts";
+export * from "./factory.ts";
+export * from "./filters.ts";
+
+// anywhere else
+import { createTask, isOverdue } from "./tasks/index.ts"; // one import instead of three
+```
+
+That convenience has three costs, and they grow with the codebase. The first is **import cycles**. It's easy for a file *inside* the folder to import from its own barrel, which creates a loop. In ESM, a loop means some module runs before the bindings it imports have been initialized:
+
+```ts
+// src/tasks/factory.ts
+export const createTask = (title: string) => ({ id: crypto.randomUUID(), title, status: "todo" as const });
+
+// src/tasks/defaults.ts
+import { createTask } from "./index.ts"; // ❌ imports its own folder's barrel
+export const welcomeTask = createTask("Welcome to TaskFlow");
+```
+
+```sh
+$ node src/main.ts
+ReferenceError: Cannot access 'createTask' before initialization
+    at file:///app/src/tasks/defaults.ts:2:28
+```
+
+Trace it: `main.ts` loads the barrel; the barrel loads `defaults.ts` first; `defaults.ts` asks the barrel for `createTask`, but the barrel hasn't loaded `factory.ts` yet, so the binding is still uninitialized. Reorder the barrel's lines and the bug vanishes, which is exactly what makes cycle bugs so hard to diagnose. The fix is to import from the defining file: `import { createTask } from "./factory.ts"`.
+
+The second cost is **load time**. Importing one function from a barrel loads every module the barrel mentions. Bundlers can trim that in production, but dev servers and test runners don't tree-shake, so every test that touches the barrel pays for the whole folder. The third is **tree-shaking**: a bundler may only drop unused re-exports if it can prove those modules have no side effects, which packages declare with `"sideEffects": false` in `package.json`.
+
+A policy that keeps the benefits and avoids the costs: **barrels only at package boundaries.** A package's public entry point (the file its `exports` points to) is a fine barrel. Inside a package, import from the file that defines the thing, and never import your own barrel.
+
+```ts
+// packages/utils/src/index.ts: the package's public API, and the only barrel ✅
+export { formatDue, isOverdue } from "./dates.js";
+export { createTask } from "./tasks.js";
+export type { Task, Status } from "./types.js";
+```
+
+> 🌍 **Real world.** Large codebases often remove internal barrels for speed, and they enforce the rule with lint (`import/no-cycle` from eslint-plugin-import or its faster fork, eslint-plugin-import-x). Some frameworks also rewrite imports from very large barrels, such as icon libraries, at build time for the same reason.
+
+## Common mistakes
+
+> ⚠️ **Mixing module systems by accident.** Writing `require` in an ESM file fails with `ReferenceError: require is not defined in ES module scope, you can use import instead`, and writing `import` in a CommonJS file fails with `Cannot use import statement outside a module`. Check the file extension and the nearest `"type"` field before anything else.
+
+> ⚠️ **Missing `.js` extensions under `nodenext`.** If Node runs your output, relative imports in ESM files need the extension of the file Node will load. Writing `./tasks.js` in a `.ts` file is correct, not a typo.
+
+> ⚠️ **Barrel files that create cycles.** A module importing its own folder's `index.ts` works until someone reorders exports. Import from the defining file inside a package.
+
+> ⚠️ **Using inline `type` when you meant `import type`.** Under `verbatimModuleSyntax`, `import { type Task } from "./types.js"` still emits `import {} from "./types.js"`. If you want the module not to load at all, mark the whole statement.
+
+> ⚠️ **Copying `"moduleResolution": "node"` from an old blog post.** It ignores `exports` and has been removed from current TypeScript. Choose `bundler` or `nodenext` based on who loads your code.
+
+## How it connects
+
+> 🔗 **Connection.** This chapter builds on type erasure from [Chapter 3](/chapter/3): type-only imports are erasure applied to import statements. [Chapter 26](/chapter/26) places `module`, `moduleResolution`, and `verbatimModuleSyntax` inside a full tsconfig. [Chapter 27](/chapter/27) runs `.ts` files with `tsx` and Node's type stripping, which is why erasable imports matter. [Chapter 28](/chapter/28) covers the `types` condition and declaration files, and [Chapter 30](/chapter/30) builds a real Node service with `nodenext`.
+
+> 🌍 **Real world.** The ecosystem is moving steadily toward ESM-only packages. Modern Node's `require(esm)` support exists to soften that transition for CommonJS code that can't move yet. Bundle size and tree-shaking come back in [Chapter 70](/chapter/70), and publishing packages that work for both ESM and CommonJS consumers is part of [Chapter 92](/chapter/92).
+
+## Exercises
+
+### Level 1 — Recall
+
+Assume `verbatimModuleSyntax` is on and the file is ESM. For each line, write exactly what survives in the JavaScript output, or the error TypeScript reports:
+
+```ts
+import type { Task } from "./types.js";
+import { type Status } from "./types.js";
+import { createTask, type Task } from "./tasks.js";
+import { Priority } from "./types.js"; // Priority is a type alias
+export type { Project } from "./projects.js";
+import "./polyfills.js";
+```
+
+### Level 2 — Application
+
+You're given a small CommonJS package with three files that use `require`, `module.exports`, and one `exports.default`. Convert it to ESM: add `"type": "module"`, switch to `import`/`export`, configure `"module": "nodenext"` with `verbatimModuleSyntax`, and fix every error that appears (missing extensions, type imports, default-export call sites). The package must still run with `node` and pass `tsc --noEmit`.
+
+### Level 3 — Challenge
+
+Reproduce the barrel-cycle bug from 25.7 in a fresh folder: a barrel, a factory using `const`, and a defaults file that imports through the barrel. Confirm the `ReferenceError`, then show that reordering the barrel's lines makes it "go away". Finally, fix it properly and explain in two sentences why reordering was not a real fix.
+
+*Hint: draw the order in which modules start and finish evaluating, starting from `main.ts`.*
+
+### Level 4 — Real-world
+
+**Ticket TF-210: Module strategy for the TaskFlow repository.** TaskFlow will soon contain a Vite web app, a Node API, and a shared utilities package. Write a one-page module strategy for the README.
+
+- State the `module` and `moduleResolution` settings for each of the three parts, with one sentence of justification each.
+- Define the import-extension rule for each part (`.js`, `.ts`, or none) and how it's enforced.
+- Define the barrel policy (where barrels are allowed, where they're banned) and name the lint rule that enforces it.
+- Include the `exports` field for the shared package, with a `types` condition.
+
+## Key takeaways
+
+- Node supports two module systems and decides **per file** using the extension and the nearest `package.json` `"type"`. Set `"type"` explicitly.
+- A TypeScript file with no top-level `import` or `export` is a global **script**. Use `moduleDetection: "force"` to make every file a module.
+- Single-file transpilers can't tell types from values across files, so mark type imports and re-exports with `type`.
+- `verbatimModuleSyntax` makes emit predictable: unmarked imports stay, `type`-marked ones go.
+- Pick `bundler` resolution when a bundler loads your code and `nodenext` when Node does. Under `nodenext`, relative ESM imports need extensions.
+- Prefer named exports across the ESM/CJS boundary, and keep barrels at package boundaries only.
+
+## What comes next
+
+You've now met half a dozen compiler options without seeing where they live or how they interact. Why does one teammate's editor show errors that another's doesn't? Which files does `tsc` even check? Why does `document` "not exist" in one folder and exist in another? [Chapter 26: tsconfig Demystified](/chapter/26) answers all of it with four questions that every tsconfig answers.

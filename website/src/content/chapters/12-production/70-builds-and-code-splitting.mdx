@@ -1,0 +1,499 @@
+> 📖 **The problem.** TaskFlow Web is feature-complete, so you deploy it and send the link to your product manager. She opens it on a mid-range Android phone on the train and stares at a white screen for six seconds. The Network tab shows why: one JavaScript file, 2.4 MB, containing every page, every chart, every date locale, and an entire icon library. The same week, a teammate's pull request ships `task.dueDate.toLocaleDateString()` without a check. CI ran `vite build`, the build was green, and the page crashed for every task without a due date. The code had a type error the whole time; nothing in the pipeline ever looked for it.
+
+Up to now, "the app works" meant "it works in the dev server on my laptop". This chapter is about the artifact users actually download. By the end, you'll know what a production build does to your code (and the one thing it doesn't do), how to configure modes and environment variables, how to see what's inside your bundle, how to split it so users download only what they need, and how to deploy the result so caching helps you instead of breaking you.
+
+> 🧠 **Mental model.** A production build **transforms, bundles, and minifies**, but it does **not type-check**. Type-checking is a separate step you must run yourself. Code splitting means users download only the code for what they're looking at right now; the rest arrives when (or just before) they need it.
+
+## 70.1 What a production build does
+
+The code you write is not the code users download. When you run `vite build`, your source goes through four transformations. **Transpiling** strips TypeScript annotations, turns JSX into ordinary function calls, and rewrites any syntax your target browsers don't support. **Bundling** starts at the entry point (`index.html`, which loads `src/main.tsx`), follows every import, and combines hundreds of modules into a few files called **chunks**. **Minifying** removes whitespace and comments and renames local variables to single letters. **Tree-shaking** drops exports that nothing imports.
+
+Here is one component before and after, so you can see the first and third steps at work:
+
+```tsx
+// src/features/tasks/TaskBadge.tsx (what you write)
+type TaskBadgeProps = { status: TaskStatus };
+
+export function TaskBadge({ status }: TaskBadgeProps) {
+  return <span className={`badge badge-${status}`}>{status}</span>;
+}
+```
+
+```js
+// What ships (simplified): types gone, JSX turned into calls, names shortened
+import{jsx as n}from"react/jsx-runtime";function a({status:s}){return n("span",{className:`badge badge-${s}`,children:s})}
+```
+
+Notice what is *missing* from that list: checking types. Vite's transformer processes **one file at a time**, which is why it's fast. It deletes `TaskBadgeProps` without asking whether it's correct. Type-checking needs the **whole program** at once, because an error in one file can be caused by a change in another. That whole-program work is exactly what the transpiler is designed to skip (it's the `isolatedModules` design from [Chapter 26](/chapter/26)). The result is a build that happily succeeds on broken code:
+
+```sh
+$ npx tsc --noEmit
+src/features/tasks/formatDue.ts:4:10 - error TS18048: 'task.dueDate' is possibly 'undefined'.
+Found 1 error.
+
+$ npx vite build
+✓ 1284 modules transformed.
+dist/index.html                    0.48 kB
+dist/assets/index-C3x9fQ2a.js  2,412.30 kB │ gzip: 731.18 kB
+(!) Some chunks are larger than 500 kB after minification.
+✓ built in 5.12s
+# exit code 0: the type error ships to production
+```
+
+Tree-shaking deserves one more word, because it decides how much of your dependencies you pay for. It works on **ES module** `import`/`export` statements, which the bundler can analyze without running the code:
+
+```ts
+// src/shared/lib/dates.ts
+export function formatDue(date: Date): string {
+  return new Intl.DateTimeFormat("en", { dateStyle: "medium" }).format(date);
+}
+export function businessDaysBetween(a: Date, b: Date): number {
+  /* … 40 lines nobody imports … */
+  return 0;
+}
+
+// src/features/tasks/TaskRow.tsx
+import { formatDue } from "../../shared/lib/dates"; // only formatDue ends up in the bundle
+```
+
+A module whose top-level code has side effects (it patches a global, registers something, or imports CSS) can't be dropped safely, so the bundler keeps it. Libraries declare `"sideEffects": false` in their `package.json` to promise they're safe to shake.
+
+> 🆕 **Modern note.** Vite 8 bundles with Rolldown; earlier versions used Rollup for builds and esbuild for transforms. TypeScript 7's native compiler makes `tsc` dramatically faster, but it's still a separate step. No mainstream bundler type-checks your code during a build.
+
+## 70.2 Build configuration
+
+Vite runs in a **mode**: the dev server uses `development`, `vite build` uses `production`, and you can add your own with `--mode staging`. The mode decides which **env files** load. Vite reads `.env` first, then `.env.local`, then `.env.[mode]`, then `.env.[mode].local`, with later files overriding earlier ones. The `.local` files are for your machine and belong in `.gitignore`.
+
+```ini
+# .env (shared defaults, committed)
+VITE_APP_NAME=TaskFlow
+
+# .env.staging (used by: vite build --mode staging)
+VITE_API_URL=https://api.staging.taskflow.dev
+
+# .env.production (used by: vite build)
+VITE_API_URL=https://api.taskflow.dev
+DATABASE_URL=postgres://…   # no VITE_ prefix: never exposed to browser code
+```
+
+Only variables starting with `VITE_` reach your code, through `import.meta.env`, along with built-ins such as `MODE`, `DEV`, and `PROD`. They are **replaced as text at build time**, so their values are baked into the JavaScript file. That has a big consequence for secrets, which [Chapter 74](/chapter/74) takes up. TypeScript doesn't know your variable names, so declare them, then validate them once at startup. The declaration alone is a promise nobody checks, just like the lying generic from [Chapter 16](/chapter/16).
+
+```ts
+// src/vite-env.d.ts
+/// <reference types="vite/client" />
+interface ImportMetaEnv {
+  readonly VITE_API_URL: string;
+  readonly VITE_RELEASE: string;
+}
+
+// src/shared/config/env.ts: the boundary where the promise gets checked
+import { z } from "zod";
+
+const EnvSchema = z.object({
+  VITE_API_URL: z.url(),
+  VITE_RELEASE: z.string().min(1),
+});
+
+export const env = EnvSchema.parse(import.meta.env); // throws at startup if misconfigured
+// env.VITE_API_URL: string, and now it's actually been checked
+```
+
+Finally, the fix for the opening story. The build script must run the type-checker first, and stop if it fails. Vite's `react-ts` template already does this with `tsc -b`, which checks every project in your `tsconfig.json` references (`tsconfig.app.json` for the app, `tsconfig.node.json` for config files):
+
+```json
+{
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "tsc -b",
+    "build": "tsc -b && vite build",
+    "build:staging": "tsc -b && vite build --mode staging",
+    "preview": "vite preview"
+  }
+}
+```
+
+The `&&` is the important character: `vite build` runs only if `tsc` exits successfully. If your project has a single `tsconfig.json` without references, `tsc --noEmit && vite build` does the same job.
+
+> 💡 **Tip.** Run `npm run build && npm run preview` before you trust a deploy. `vite preview` serves the real `dist/` folder, so you test the production bundle instead of the dev server, which behaves differently (no bundling, no minification).
+
+## 70.3 Source maps in production
+
+A user hits a bug, and your error tracker receives this stack trace:
+
+```text
+TypeError: Cannot read properties of undefined (reading 'toLocaleDateString')
+    at a (index-C3x9fQ2a.js:1:48213)
+    at Xo (index-C3x9fQ2a.js:1:112907)
+```
+
+Minification made that useless: there is no function called `a` in your code, and line 1 column 48213 is somewhere inside 2 MB of one-line JavaScript. A **source map** is a file (`index-C3x9fQ2a.js.map`) that maps every position in the minified output back to a file, line, and name in your original source. With it, `a` at column 48213 becomes `formatDue` at `src/features/tasks/formatDue.ts:4`.
+
+You have three realistic choices:
+
+| `build.sourcemap` | What happens | Use it for |
+|---|---|---|
+| `false` (default) | No maps at all | Nothing you need to debug |
+| `true` | Maps are generated and the JS links to them, so anyone can read your original source in DevTools | Open-source or internal apps |
+| `"hidden"` | Maps are generated but the JS doesn't link to them | Upload to your error tracker, then delete before deploying |
+
+The `"hidden"` option gives you readable stack traces without publishing readable source. Your error tracker stores the maps privately and uses them to translate incoming errors ([Chapter 75](/chapter/75)):
+
+```ts
+// vite.config.ts
+import react from "@vitejs/plugin-react";
+import { defineConfig } from "vite";
+
+export default defineConfig({
+  plugins: [react()],
+  build: {
+    sourcemap: "hidden", // generate .map files, but don't reference them from the JS
+  },
+});
+```
+
+```sh
+# In the deploy job, after the build (Sentry shown; other trackers have similar CLIs)
+npx sentry-cli sourcemaps inject ./dist
+npx sentry-cli sourcemaps upload --release "$RELEASE" ./dist
+find dist -name "*.map" -delete   # the maps never reach the public server
+```
+
+> ⚠️ **Common mistake.** Treating hidden source maps as a security measure. They keep your *readable* code private, but the minified JavaScript is still public and can be reformatted by anyone. Never rely on minification or missing maps to hide a secret or a business rule.
+
+## 70.4 Analyzing bundles
+
+You can't shrink what you can't see. Vite prints each output file's size after a build, which tells you *that* the bundle is big. To learn *why*, use a **bundle visualizer**: a plugin that draws a treemap where each rectangle is a module, sized by how many bytes it contributes. One glance shows which dependencies dominate.
+
+```ts
+// vite.config.ts
+import react from "@vitejs/plugin-react";
+import { visualizer } from "rollup-plugin-visualizer";
+import { defineConfig } from "vite";
+
+export default defineConfig(({ mode }) => ({
+  plugins: [
+    react(),
+    // only when you ask for it: vite build --mode analyze
+    mode === "analyze" && visualizer({ filename: "dist/stats.html", gzipSize: true, open: true }),
+  ],
+}));
+```
+
+When you open the treemap for TaskFlow Web, ask three questions of every large rectangle. **Is it needed on the first screen?** If not, it's a candidate for splitting (70.5). **Is there a lighter alternative**, or does the platform already do this? **Is it there twice?** Two versions of the same library often sneak in when packages depend on different major versions. A typical first analysis reads like this:
+
+```text
+TaskFlow Web — main chunk, 731 kB gzip
+  chart library + its date adapter   212 kB   used only on /reports
+  moment + locale files               58 kB   used to format due dates
+  icon library (entire set)           96 kB   app uses 23 icons
+  markdown editor                     88 kB   used only when editing a comment
+  lodash (CommonJS build)             24 kB   app uses groupBy and debounce
+  react + react-dom + router          71 kB   needed everywhere
+```
+
+Every line except the last is something you can act on. Check a dependency's cost *before* you install it, too. Sites like Bundlephobia and pkg-size.dev show a package's minified and gzipped size, and whether it supports tree-shaking. Measure in **gzip** (or brotli) sizes, because that's what actually crosses the network; parse and execute time scales with the uncompressed size.
+
+```sh
+npm ls date-fns          # is it installed twice, at different versions?
+npm run build -- --mode analyze
+```
+
+## 70.5 Code splitting
+
+**Code splitting** means breaking the bundle into several chunks so the browser downloads some of them later, or never. The mechanism is the **dynamic `import()`**: a function-like expression that loads a module on demand and returns a promise of it. When the bundler sees one, it puts the imported module (and everything only it uses) into a separate chunk.
+
+```ts
+// src/features/tasks/exportTasks.ts
+export async function exportTasksToCsv(tasks: Task[]): Promise<Blob> {
+  // csv.ts and its dependencies become their own chunk, fetched on first click
+  const { toCsv } = await import("../../shared/lib/csv");
+  return new Blob([toCsv(tasks)], { type: "text/csv" });
+}
+```
+
+The type of the awaited value is the module's real export types, so `toCsv` is fully typed. For components, React provides `lazy`. You give it a function that returns a dynamic import of a module with a **default export** that is a component. React won't call that function until the component first renders. Until the chunk arrives, the component **suspends**, and the nearest `Suspense` boundary above it shows its `fallback`:
+
+```tsx
+import { lazy, Suspense, useState } from "react";
+
+// Module scope: created once. The props type comes from the module's default export.
+const CommentEditor = lazy(() => import("./CommentEditor"));
+
+export function TaskComments({ taskId }: { taskId: string }) {
+  const [editing, setEditing] = useState(false);
+  return (
+    <section>
+      <button onClick={() => setEditing(true)}>Add comment</button>
+      {editing && (
+        <Suspense fallback={<p>Loading editor…</p>}>
+          <CommentEditor taskId={taskId} onDone={() => setEditing(false)} />
+        </Suspense>
+      )}
+    </section>
+  );
+}
+```
+
+The 88 kB markdown editor now downloads only for people who actually write a comment. If the module uses a named export, map it to `default` inside the loader:
+
+```tsx
+const ReportsChart = lazy(() =>
+  import("./ReportsChart").then((m) => ({ default: m.ReportsChart })),
+);
+```
+
+> ⚠️ **Common mistake.** Calling `lazy` inside a component. Every render creates a *new* component type, so React unmounts the old one, throws away its state, and suspends again.
+
+```tsx
+function TaskComments() {
+  const Editor = lazy(() => import("./CommentEditor")); // ❌ new component type on every render
+  return <Editor />;
+}
+```
+
+## 70.6 Route-based splitting and preloading
+
+Where should you split? **Routes** are the natural seam. A user looks at one page at a time, and pages rarely share their heavy parts: the reports page has the charts, the settings page has the forms. Splitting by route means the board page doesn't pay for the chart library. Put the `Suspense` boundary *inside* the layout, around the `Outlet`, so the header and sidebar stay on screen while a page's chunk loads:
+
+```tsx
+// src/app/routes.tsx
+import { lazy, Suspense } from "react";
+import { Outlet, Route, Routes } from "react-router";
+
+const BoardPage = lazy(() => import("../pages/BoardPage"));
+const ReportsPage = lazy(() => import("../pages/ReportsPage"));
+const SettingsPage = lazy(() => import("../pages/SettingsPage"));
+
+function AppLayout() {
+  return (
+    <div className="app-shell">
+      <Sidebar />
+      <main>
+        <Suspense fallback={<PageSkeleton />}>
+          <Outlet /> {/* only this area shows the fallback */}
+        </Suspense>
+      </main>
+    </div>
+  );
+}
+
+export function AppRoutes() {
+  return (
+    <Routes>
+      <Route element={<AppLayout />}>
+        <Route index element={<BoardPage />} />
+        <Route path="reports" element={<ReportsPage />} />
+        <Route path="settings" element={<SettingsPage />} />
+      </Route>
+    </Routes>
+  );
+}
+```
+
+Splitting adds a delay at navigation time: the click starts the download. **Preloading** hides that delay by starting the download a moment earlier, when the user shows intent. Hovering or focusing a link usually happens 100 to 300 ms before the click. Because the browser caches modules, calling the same `import()` twice downloads once, so you can share the loader function:
+
+```tsx
+const loadReports = () => import("../pages/ReportsPage");
+const ReportsPage = lazy(loadReports);
+
+<NavLink to="/reports" onMouseEnter={loadReports} onFocus={loadReports}>
+  Reports
+</NavLink>;
+```
+
+If you use React Router's data router ([Chapter 59](/chapter/59)), give a route a `lazy` function instead. The router then loads the route's code *and* runs its `loader` in parallel, which avoids a **waterfall** (download code, render, *then* start fetching data):
+
+```tsx
+// src/pages/reports.tsx exports `loader` and `Component`
+const router = createBrowserRouter([
+  {
+    path: "/",
+    Component: AppLayout,
+    children: [
+      { index: true, Component: BoardPage },              // in the main chunk: it's the first screen
+      { path: "reports", lazy: () => import("../pages/reports") },
+    ],
+  },
+]);
+```
+
+> 🚫 **When not to.** Don't lazy-load the page most users land on, or anything visible on the first screen. That just adds a second round trip before the user sees anything. And don't split every small component: each chunk has request overhead, and fifty 2 kB chunks are slower than one 100 kB chunk.
+
+## 70.7 Bundle considerations
+
+Splitting moves code around; it doesn't make it smaller. Many of the biggest wins come from asking whether a dependency needs to be there at all. The browser platform now covers a lot of what libraries used to: `Intl.DateTimeFormat` and `Intl.RelativeTimeFormat` format dates without shipping locale data, `structuredClone` deep-copies, and `fetch` replaces most HTTP clients.
+
+```ts
+// ❌ a large library that can't be tree-shaken, just to format a date
+import moment from "moment";
+const label = moment(task.dueDate).format("MMM D, YYYY");
+
+// ✅ 0 kB: the browser already knows how to do this
+const dueFormatter = new Intl.DateTimeFormat("en", { dateStyle: "medium" });
+const label2 = dueFormatter.format(task.dueDate);
+
+// ❌ the CommonJS build can't be tree-shaken: you get all of lodash
+import _ from "lodash";
+// ✅ the ES module build: you get groupBy and nothing else
+import { groupBy } from "lodash-es";
+```
+
+**Icons** are a classic trap. A tree-shakable icon package lets you pay per icon, but only if you import icons by name. Looking icons up dynamically by string forces the bundler to keep every one, because it can't know which strings will appear at runtime:
+
+```tsx
+// ✅ Named imports and an explicit map: exactly three icons in the bundle
+import { CheckCircle, Circle, Clock } from "lucide-react";
+
+const statusIcons = { todo: Circle, doing: Clock, done: CheckCircle } as const;
+
+function StatusIcon({ status }: { status: TaskStatus }) {
+  const Icon = statusIcons[status]; // typed lookup, no cast
+  return <Icon aria-hidden="true" />;
+}
+```
+
+```tsx
+// ❌ A lookup by arbitrary string: the bundler must keep all ~1,500 icons
+import * as Icons from "lucide-react";
+
+const Icon = Icons[iconName as keyof typeof Icons]; // ...and an unchecked cast besides
+```
+
+**Browser targets** decide how much syntax must be rewritten. Vite's default target (`"baseline-widely-available"`, features supported across major browsers for at least 30 months) needs almost no rewriting. One subtlety catches people: the build **transforms syntax but does not add missing APIs**. Optional chaining can be rewritten into older code; `Object.groupBy` can't, because it's a function the browser must provide. If you support older browsers, you need **polyfills** (code that adds missing APIs), which cost bytes. Vite's `@vitejs/plugin-legacy` generates a separate legacy bundle so modern browsers don't pay for them. Decide your targets deliberately, from your real users' browsers:
+
+```ts
+// vite.config.ts
+export default defineConfig({
+  build: {
+    target: "baseline-widely-available", // the default, written out so it's a visible decision
+    chunkSizeWarningLimit: 300,          // warn earlier than the default 500 kB
+  },
+});
+```
+
+## 70.8 Deploying a static SPA
+
+A Vite build produces a folder of plain files. There's no server code: any static host (Netlify, Cloudflare Pages, Vercel, an S3 bucket behind a CDN, or nginx) can serve it.
+
+```sh
+$ ls -R dist
+dist:
+assets  index.html  favicon.svg
+
+dist/assets:
+index-C3x9fQ2a.js  ReportsPage-B81kdZ0e.js  CommentEditor-Dk2pQx7m.js  index-a91Fe3cd.css
+```
+
+The random-looking part of each filename is a **content hash**: it changes only when the file's contents change. That makes caching simple and safe. A hashed file can be cached **forever**, because a new version gets a new name. `index.html` is the opposite: it has a fixed name and points to the current hashes, so browsers must **revalidate it on every visit**. Cache it for a year by accident, and users keep loading last month's app.
+
+The second deployment issue is routing. A user bookmarks `/projects/42/tasks/7`. In the dev server it works, but the static host looks for a file at that path, finds none, and returns 404. You need an **SPA fallback**: any path that isn't a real file gets `index.html`, and React Router takes over from there. Most hosts configure both rules in a small file:
+
+```text
+# public/_headers (Netlify / Cloudflare Pages)
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+/index.html
+  Cache-Control: no-cache
+
+# public/_redirects: serve index.html for any path that isn't a real file
+/*  /index.html  200
+```
+
+```nginx
+# The same two rules in nginx
+location /assets/ {
+  add_header Cache-Control "public, max-age=31536000, immutable";
+  try_files $uri =404;            # a missing chunk is a real 404, never index.html
+}
+location / {
+  add_header Cache-Control "no-cache";
+  try_files $uri /index.html;     # SPA fallback
+}
+```
+
+One failure is specific to split apps. A user opens TaskFlow at 9:00. You deploy at 9:30, and the old `ReportsPage-B81kdZ0e.js` is deleted. At 9:45 they click Reports, and their (old) app requests a chunk that no longer exists. Keep the previous deploy's assets around for a while, and handle the case in code: Vite fires a `vite:preloadError` event when a chunk fails to load, and reloading picks up the new `index.html`.
+
+```ts
+// src/main.tsx
+window.addEventListener("vite:preloadError", (event) => {
+  if (sessionStorage.getItem("reloaded-for-chunk")) return; // avoid a reload loop
+  sessionStorage.setItem("reloaded-for-chunk", "1");
+  event.preventDefault();
+  window.location.reload();
+});
+```
+
+> 💡 **Tip.** If the app is served from a subpath (`https://example.com/taskflow/`), set `base: "/taskflow/"` in `vite.config.ts` and pass the same value to the router's `basename`. Otherwise every asset URL points at the domain root.
+
+## Common mistakes
+
+> ⚠️ **Treating a green build as a type check.** `vite build` strips types without reading them. The build script must be `tsc -b && vite build` (or `tsc --noEmit && vite build`), and CI must run it ([Chapter 76](/chapter/76)).
+
+> ⚠️ **Putting secrets in `VITE_` variables.** Anything in `import.meta.env` is pasted into the public JavaScript file. API keys that must stay secret belong on a server.
+
+> ⚠️ **Lazy-loading the first screen.** Splitting the landing page adds a round trip before anything appears. Split what users reach *later*.
+
+> ⚠️ **Caching `index.html` like an asset.** Hashed assets get `immutable`; `index.html` gets `no-cache`. Mixing them up either defeats caching or freezes users on an old release.
+
+> ⚠️ **Shipping without source maps, or shipping them publicly.** No maps means unreadable production errors. Public maps publish your readable source. Generate hidden maps and upload them to your error tracker.
+
+```jsonc
+// ❌ "it built, ship it"
+"build": "vite build"
+// ✅ the type-checker gets a veto
+"build": "tsc -b && vite build"
+```
+
+## When to use it, and when not to
+
+> ✅ **Use it when** a route or feature is heavy and not needed on the first screen (reports with charts, rich-text editors, admin pages, export tools), when the analyzer shows one dependency dominating a page most users never visit, or when your main chunk is over your budget ([Chapter 72](/chapter/72)).
+
+> 🚫 **When not to.** Don't split small apps whose whole bundle is already under about 150 kB gzip; the extra requests cost more than they save. Don't split components that render on almost every page. And don't optimize by guessing: run the analyzer first, because the dependency you suspect is rarely the one that dominates.
+
+## How it connects
+
+> 🔗 **Connection.** The reason the bundler can't type-check is `isolatedModules` from [Chapter 26](/chapter/26). Lazy routes first appeared in [Chapter 59](/chapter/59). When a chunk fails to load, `lazy` throws, and [Chapter 71](/chapter/71) shows how an error boundary turns that into a friendly retry. Environment variables come back in [Chapter 74](/chapter/74) as a security problem, source maps in [Chapter 75](/chapter/75) as an observability tool, and the `tsc -b && vite build` pipeline in [Chapter 76](/chapter/76) as a required CI check. Frameworks that render on the server change the deployment story; that's [Chapter 96](/chapter/96).
+
+> 🌍 **Real world.** Most production React apps split at the route level and lazy-load a handful of heavy widgets (editors, charts, maps). Teams typically keep a size budget for the main chunk and fail CI when a pull request exceeds it, which turns "the app got slow" from a discovery into a review comment.
+
+## Exercises
+
+### Level 1 — Recall
+
+In your own words, explain why `vite build` succeeds on code that has type errors. Then:
+
+1. Add a deliberate type error to any TaskFlow Web component and confirm that `vite build` still exits with code 0.
+2. Change the `build` script so the same error fails the build, and confirm the new exit code.
+3. Explain what `tsc -b` checks that `tsc --noEmit` would not, in a project with `tsconfig.app.json` and `tsconfig.node.json` references.
+
+### Level 2 — Application
+
+Split TaskFlow Web ([P14](/projects/p14)) by route. Lazy-load every page except the board, keep the layout visible during loading with a `Suspense` boundary around the `Outlet`, and preload the reports page on hover and focus of its nav link. Record the main chunk's gzip size and the first-load time (DevTools, "Slow 4G" throttling) before and after, and write down the difference.
+
+### Level 3 — Challenge
+
+Cut TaskFlow Web's total first-load JavaScript by at least 30% by replacing or lazy-loading **two** dependencies. Use the bundle visualizer to choose them, and keep a short note for each: what it cost, what you did, what you saved.
+
+*Hint: check date formatting, icons, and anything only one page uses before you touch React itself.*
+
+### Level 4 — Real-world
+
+**Ticket TF-310: Deploy TaskFlow Web to a static host.** We're moving off the dev server demo to a real static deployment.
+
+- Deep links (`/projects/42/tasks/7`) load correctly on refresh, and a request for a missing `/assets/*` file returns a real 404, not `index.html`.
+- Hashed assets are served with `Cache-Control: public, max-age=31536000, immutable`; `index.html` with `no-cache`. Verify both with `curl -I`.
+- Source maps are uploaded to the error tracker (or a private location) and absent from the public deployment.
+- After a new deploy, a tab that was open before it recovers from a missing chunk without a manual refresh loop.
+
+## Key takeaways
+
+- A production build transpiles, bundles, minifies, and tree-shakes. It **never type-checks**; run `tsc -b && vite build`.
+- Only `VITE_`-prefixed variables reach the browser, and they're pasted into the bundle at build time. Declare them, then validate them once.
+- Use **hidden** source maps uploaded to your error tracker: readable stack traces without publishing readable source.
+- Analyze before you optimize. Ask of every large module: needed on the first screen? lighter alternative? included twice?
+- Dynamic `import()` creates a chunk; `lazy` plus `Suspense` turns that into a component. Split by route, preload on intent.
+- Hashed assets are cached forever; `index.html` is revalidated every time; unknown paths fall back to `index.html`.
+
+## What comes next
+
+Your bundle is small and your deploy is cached correctly. Then a user opens the dashboard, one widget receives `null` where it expected a project, and the **entire app goes blank**. Or the chunk for the reports page fails to download, and `lazy` throws. React's default response to any rendering error is to unmount everything. [Chapter 71: Error Boundaries & Resilient UIs](/chapter/71) shows how to contain a failure to the smallest piece of UI that can fail on its own.

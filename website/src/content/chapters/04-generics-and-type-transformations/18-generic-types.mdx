@@ -1,0 +1,410 @@
+> 📖 **The problem.** TaskFlow's API client has a `types.ts` file. In it are `TaskResponse`, `UserResponse`, and `ProjectResponse`, three types that are identical except for the type of their `data` property. When the backend team adds a `requestId` to every response, someone updates two of the three. The third keeps compiling, and the bug report says the project page's request IDs are missing from the logs.
+
+```ts
+type TaskResponse = { data: Task; meta: { requestId: string; durationMs: number } };
+type UserResponse = { data: User; meta: { requestId: string; durationMs: number } };
+type ProjectResponse = { data: Project; meta: { durationMs: number } }; // forgot one
+```
+
+You already know the fix for duplicated *functions*: a type parameter. This chapter shows that *types* can take type parameters too. By the end, you'll be able to write generic type aliases, interfaces, and classes; give type parameters sensible defaults; model success and failure with a `Result` type; predict how TypeScript infers type arguments in trickier calls; and recognize why "a box of urgent tasks" is not always a "box of tasks".
+
+> 🧠 **Mental model.** A **generic type is a type-level function**: give it a type, and it gives you back a type. `ApiResponse<User>` means "`ApiResponse` applied to `User`", just as `format(user)` means "`format` applied to `user`".
+
+## 18.1 Generic type aliases
+
+A **generic type alias** declares type parameters after its name, then uses them in its body, exactly like a generic function does:
+
+```ts
+type ApiResponse<T> = {
+  data: T;
+  meta: { requestId: string; durationMs: number };
+};
+
+type TaskResponse = ApiResponse<Task>;        // { data: Task; meta: … }
+type TaskListResponse = ApiResponse<Task[]>;  // { data: Task[]; meta: … }
+
+declare const res: ApiResponse<User>;
+res.data.email;     // ✅ data is a User
+res.meta.requestId; // ✅
+```
+
+Now there's one definition of the envelope. Add a field to `meta` and every response type gets it, because there's only one place to change.
+
+There is one difference from generic functions. For a *type*, TypeScript has nothing to infer from: there's no argument value to look at. So when you name a generic type in an annotation, you must supply its type arguments:
+
+```ts
+const response: ApiResponse = await fetchTasks(); // ❌ Generic type 'ApiResponse' requires 1 type argument(s).
+```
+
+Generic aliases work for any type shape, not just objects. A discriminated union ([Chapter 14](/chapter/14)) is a common and very useful case:
+
+```ts
+type Loadable<T> =
+  | { state: "loading" }
+  | { state: "ready"; data: T }
+  | { state: "error"; message: string };
+
+function describeLoad(tasks: Loadable<Task[]>): string {
+  switch (tasks.state) {
+    case "loading": return "Loading…";
+    case "ready":   return `${tasks.data.length} tasks`; // ✅ data: Task[]
+    case "error":   return `Failed: ${tasks.message}`;
+  }
+}
+```
+
+One `Loadable<T>` now describes the loading state of tasks, projects, the current user, and anything else the app fetches.
+
+## 18.2 Generic interfaces
+
+Interfaces take type parameters the same way. Use them when you're describing an object's shape, especially one that classes will implement or other interfaces will extend. A **repository** (an object that hides where data is stored behind a small set of methods) is the textbook case:
+
+```ts
+interface Repository<T> {
+  getById(id: string): Promise<T | undefined>;
+  list(): Promise<T[]>;
+  save(item: T): Promise<T>;
+  remove(id: string): Promise<void>;
+}
+
+async function archiveDone(repo: Repository<Task>): Promise<number> {
+  const all = await repo.list();                    // all: Task[]
+  const done = all.filter((t) => t.status === "done");
+  await Promise.all(done.map((t) => repo.remove(t.id)));
+  return done.length;
+}
+```
+
+`archiveDone` doesn't care whether tasks live in memory, in IndexedDB, or behind an HTTP API. It only needs *some* `Repository<Task>`. Generic interfaces can also extend each other, passing their type parameter along: `interface CachedRepository<T> extends Repository<T> { … }`.
+
+Pay attention to **where a type parameter lives**, because it decides *who* picks the type. A parameter on the interface is chosen once, when someone writes the type's name. A parameter on a method is chosen fresh at every call:
+
+```ts
+interface Formatter<T> {
+  format(value: T): string;       // T fixed when you write Formatter<Date>
+}
+interface Logger {
+  log<T>(value: T, label: string): T; // T chosen by each call
+}
+
+declare const dateFormatter: Formatter<Date>;
+declare const logger: Logger;
+
+dateFormatter.format(new Date());     // ✅
+dateFormatter.format("2026-10-06");   // ❌ Argument of type 'string' is not assignable to parameter of type 'Date'.
+logger.log(task, "loaded");           // ✅ returns Task
+logger.log(42, "count");              // ✅ returns number
+```
+
+## 18.3 Generic classes
+
+A class can declare type parameters after its name. They're available to every instance member: properties, constructor parameters, and methods. Here's the smallest useful example, a stack:
+
+```ts
+class Stack<T> {
+  #items: T[] = [];
+
+  push(item: T): void {
+    this.#items.push(item);
+  }
+  pop(): T | undefined {
+    return this.#items.pop();
+  }
+}
+
+const undo = new Stack<Task>();
+undo.push(task);       // ✅
+undo.push("oops");     // ❌ Argument of type 'string' is not assignable to parameter of type 'Task'.
+const last = undo.pop(); // last: Task | undefined
+```
+
+When the constructor receives a value of type `T`, TypeScript infers `T` from it, just as it does for functions. When the constructor receives nothing, there's nothing to infer, so write the type arguments yourself. Otherwise each parameter falls back to `unknown`.
+
+Here's a more realistic class with two type parameters: a cache with expiry, which TaskFlow could use to avoid refetching projects on every page view.
+
+```ts
+class TypedCache<K, V> {
+  #entries = new Map<K, { value: V; expiresAt: number }>();
+  readonly #ttlMs: number;
+
+  constructor(ttlMs: number) {
+    this.#ttlMs = ttlMs;
+  }
+
+  set(key: K, value: V): void {
+    this.#entries.set(key, { value, expiresAt: Date.now() + this.#ttlMs });
+  }
+
+  get(key: K): V | undefined {
+    const entry = this.#entries.get(key);
+    if (!entry || entry.expiresAt < Date.now()) {
+      this.#entries.delete(key);
+      return undefined;
+    }
+    return entry.value;
+  }
+}
+
+const projectCache = new TypedCache<string, Project>(60_000);
+const cached = projectCache.get("p1"); // cached: Project | undefined
+const vague = new TypedCache(60_000);  // vague: TypedCache<unknown, unknown>, so be explicit
+```
+
+> ⚠️ **Common mistake.** Static members belong to the class itself, not to any one instance, so they can't use the class's type parameters. There's only one `Stack.empty`, shared by `Stack<Task>` and `Stack<number>`, so what would its `T` be?
+>
+> `class Stack<T> { static empty: T; }` fails with *"Static members cannot reference class type parameters."* Make a static *method* generic instead: `static of<U>(...items: U[]): Stack<U>`.
+
+## 18.4 Generic defaults
+
+A type parameter can have a **default**, written `<T = SomeType>`. When the user doesn't supply that type argument, and in a function call there's nothing to infer it from, TypeScript uses the default:
+
+```ts
+type ApiResponse<T = unknown, M = { requestId: string }> = {
+  data: T;
+  meta: M;
+};
+
+type Health = ApiResponse;               // data: unknown, meta: { requestId: string }
+type Tasks = ApiResponse<Task[]>;         // meta still uses the default
+type Timed = ApiResponse<Task[], { requestId: string; durationMs: number }>;
+```
+
+Two rules govern defaults. First, **parameters with defaults must come after those without**, just as optional function parameters must come after required ones. Second, **a default must satisfy its parameter's constraint**:
+
+```ts
+type Pair<A = string, B> = [A, B];         // ❌ Required type parameters may not follow optional type parameters.
+type Keyed<T extends object = string> = T; // ❌ Type 'string' does not satisfy the constraint 'object'.
+type Keyed2<T extends object = Task> = T;  // ✅
+```
+
+Defaults matter most to **library authors**, because they let the common case stay short. React's types declare `useState<S = undefined>()` for the no-argument call, so `useState()` still produces a usable type. TanStack Query's result types take a data type plus an error type that defaults to a standard error. The rule of thumb: choose a default that is **safe** (usually `unknown`), never one that silently switches off checking.
+
+```ts
+type LooseEvent<T = any> = { name: string; detail: T };
+type SafeEvent<T = unknown> = { name: string; detail: T };
+
+declare const loose: LooseEvent;
+declare const safe: SafeEvent;
+
+loose.detail.anything.goes; // compiles, so the default turned checking off
+safe.detail.anything;       // ❌ 'safe.detail' is of type 'unknown'.
+```
+
+> 🌍 **Real world.** The DOM's own `CustomEvent<T = any>` has exactly this weakness: `new CustomEvent("task-moved").detail` is `any`. When you use it, always pass the type argument.
+
+## 18.5 `Result<T, E>`
+
+Here's a generic type you'll use for the rest of the book. Many operations can fail in *expected* ways: a due date the user typed might not parse, a project might be archived. Throwing exceptions for those cases hides the failure from the type system, because a function's type says nothing about what it throws. **`Result<T, E>`** makes failure part of the return type instead:
+
+```ts
+type Result<T, E = Error> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+const ok = <T>(value: T): Result<T, never> => ({ ok: true, value });
+const err = <E>(error: E): Result<never, E> => ({ ok: false, error });
+```
+
+`Result` is a discriminated union with `ok` as its tag. The success case carries a `value` of type `T`; the failure case carries an `error` of type `E`, which defaults to `Error`. The helpers use `never` for the side they don't produce: `ok(…)` never contains an error, so its result fits *any* `Result<T, E>`.
+
+Now a function can tell the truth about how it fails:
+
+```ts
+type DateError = "empty" | "invalid" | "in-the-past";
+
+function parseDueDate(input: string, now = new Date()): Result<Date, DateError> {
+  if (input.trim() === "") return err("empty");
+  const date = new Date(input);
+  if (Number.isNaN(date.getTime())) return err("invalid");
+  if (date < now) return err("in-the-past");
+  return ok(date);
+}
+
+const parsed = parseDueDate("2026-12-01");
+parsed.value;            // ❌ Property 'value' does not exist on type 'Result<Date, DateError>'.
+if (parsed.ok) {
+  parsed.value.toISOString();     // ✅ narrowed: value is a Date
+} else {
+  showFieldError(parsed.error);   // ✅ error: "empty" | "invalid" | "in-the-past"
+}
+
+declare function showFieldError(code: DateError): void;
+```
+
+The caller *can't* use the date without checking `ok` first, and the error is a precise union, so an exhaustive `switch` over it ([Chapter 14](/chapter/14)) will tell you when a new error code appears. [Chapter 33](/chapter/33) builds a whole error-handling strategy on this type.
+
+## 18.6 Generic inference in depth
+
+Most of the time inference just works. When it surprises you, it helps to know the four mechanisms involved.
+
+**Inference from multiple sites.** When a type parameter appears in several parameters, each argument offers a **candidate**. TypeScript picks the best common type. If the candidates don't fit together, it chooses one and reports the other as the error:
+
+```ts
+function pickOne<T>(a: T, b: T): T {
+  return Math.random() < 0.5 ? a : b;
+}
+
+const name = pickOne(task.title, project.name); // name: string
+pickOne(task.title, taskList.length); // ❌ Argument of type 'number' is not assignable to parameter of type 'string'.
+const either = pickOne<string | number>(task.title, taskList.length); // ✅ explicitly allow both
+```
+
+**Contextual typing.** A callback with unannotated parameters can't offer a candidate until its parameters have types. So TypeScript infers from the *other* arguments first, then types the callback, wherever it sits in the parameter list:
+
+```ts
+function select<S, R>(selector: (state: S) => R, state: S): R {
+  return selector(state);
+}
+
+const title = select((s) => s.title, task); // ✅ S inferred from task, then s: Task; title: string
+```
+
+**`const` type parameters.** Inference normally widens literals in arrays and objects: `["/", "/tasks"]` becomes `string[]`. Adding the `const` modifier to a type parameter asks TypeScript to infer the most specific type it can, as if the caller had written `as const`:
+
+```ts
+function defineRoutes<T extends readonly string[]>(paths: T): T {
+  return paths;
+}
+function defineRoutesExact<const T extends readonly string[]>(paths: T): T {
+  return paths;
+}
+
+const loose = defineRoutes(["/", "/tasks"]);      // loose: string[]
+const exact = defineRoutesExact(["/", "/tasks"]); // exact: readonly ["/", "/tasks"]
+```
+
+**`NoInfer`.** Sometimes one argument should *define* `T`, and another should only be *checked* against it. Without help, both arguments vote, and a typo widens the type instead of producing an error. Wrapping a parameter in `NoInfer<T>` takes away its vote:
+
+```ts
+function createPicker<T extends string>(options: T[], initial: T) {
+  return { options, selected: initial };
+}
+createPicker(["low", "medium", "high"], "urgent"); // no error: T quietly became "low" | "medium" | "high" | "urgent"
+
+function createSafePicker<T extends string>(options: T[], initial: NoInfer<T>) {
+  return { options, selected: initial };
+}
+createSafePicker(["low", "medium", "high"], "urgent"); // ❌ Argument of type '"urgent"' is not assignable to parameter of type '"low" | "medium" | "high"'.
+```
+
+> 🆕 **Modern note.** `const` type parameters arrived in TypeScript 5.0 and `NoInfer` in TypeScript 5.4. In older codebases you'll see workarounds such as asking callers to write `as const`, or the trick `initial: T & {}` to lower an argument's inference priority.
+
+## 18.7 Variance intuition (preview)
+
+Suppose `UrgentTask` is a `Task` with one extra field. Every urgent task *is* a task. So is a "box of urgent tasks" a "box of tasks"? The surprising answer is: **it depends on what the box does with its contents.** That property is called **variance**.
+
+If the box only *gives out* values (you can read from it), then yes: anything you read is an urgent task, which is a fine task. If the box *accepts* values (you can write into it), then no: someone could put a plain task into a collection that promised only urgent ones. TypeScript gets the read-only case right and, for arrays, deliberately lets the writable case through for convenience:
+
+```ts
+interface UrgentTask extends Task {
+  escalatedTo: string;
+}
+
+const urgent: UrgentTask[] = [];
+const all: Task[] = urgent;   // ✅ allowed: arrays are treated as "read-like"
+all.push(task);               // ✅ compiles, but urgent now holds a non-urgent task
+urgent[0].escalatedTo.trim(); // 💥 TypeError at runtime: escalatedTo is undefined
+```
+
+Functions that *consume* values work the other way around. A handler that can handle any task can certainly handle urgent ones, but a handler that needs urgent-only fields can't handle every task:
+
+```ts
+type Handler<T> = (item: T) => void;
+
+const logTitle: Handler<Task> = (t) => console.log(t.title);
+const page: Handler<UrgentTask> = (u) => notify(u.escalatedTo);
+
+const forUrgent: Handler<UrgentTask> = logTitle; // ✅ Task handler accepts urgent tasks
+const forAll: Handler<Task> = page;              // ❌ Type 'Handler<UrgentTask>' is not assignable to type 'Handler<Task>'.
+
+declare function notify(person: string): void;
+```
+
+The intuition to carry forward: **outputs follow the direction of the type** (a producer of urgent tasks is a producer of tasks), and **inputs reverse it** (a consumer of tasks is a consumer of urgent tasks). This is why `readonly` arrays in function parameters ([Chapter 7](/chapter/7)) are not just style: they make the safe direction explicit.
+
+> ⏭ **Safe to skip.** TypeScript lets you annotate variance explicitly with `in` and `out` modifiers (`interface Producer<out T>`). You'll rarely need them in application code. [Chapter 77](/chapter/77) covers variance and soundness in full.
+
+## Common mistakes
+
+> ⚠️ **Generic types with unused parameters.** If `T` doesn't appear in the body, the type ignores it. `Id<Task>` and `Id<User>` below are the same type, so mixing them up is not an error. The parameter *looks* like safety and provides none. ([Chapter 78](/chapter/78) shows how branded types make IDs genuinely distinct.)
+
+```ts
+type Id<T> = string; // T is never used
+
+const taskId: Id<Task> = "t1";
+const userId: Id<User> = taskId; // ✅ compiles, because both are just string
+```
+
+> ⚠️ **Defaults that hide errors.** `<T = any>` means "if you forget the type argument, stop checking". Default to `unknown` so that forgetting is a visible error rather than a silent hole.
+
+> ⚠️ **Confusing generic types with generic functions.** `type Mapper<T> = (value: T) => T` is a generic *type* whose `T` is chosen when you write `Mapper<string>`. `type Mapper = <T>(value: T) => T` is a non-generic type for a generic *function* whose `T` is chosen at every call. They are not interchangeable:
+
+```ts
+type FixedMapper<T> = (value: T) => T;
+type AnyMapper = <T>(value: T) => T;
+
+const trimOnly: FixedMapper<string> = (v) => v.trim();
+const identity: AnyMapper = (v) => v;
+
+trimOnly(42);              // ❌ Argument of type 'number' is not assignable to parameter of type 'string'.
+const n = identity(42);    // n: 42, because this call chose T = 42
+```
+
+## When to use it, and when not to
+
+> ✅ **Use it when** several types share a shape that varies in one or two slots: response envelopes (`ApiResponse<T>`), state containers (`Loadable<T>`), data structures (`Stack<T>`, `TypedCache<K, V>`), contracts (`Repository<T>`), and outcomes (`Result<T, E>`).
+
+> 🚫 **When not to.** If a type will only ever be used with one argument, write the concrete type. A `Repository<T>` with a single implementation, `Repository<Task>`, is ceremony until a second entity needs it. Never add a type parameter that the body doesn't use. And if you're reaching for a default, make sure it's `unknown` or a genuinely common case, not `any`.
+
+## How it connects
+
+> 🔗 **Connection.** This chapter applies the type parameters of [Chapter 16](/chapter/16) and the constraints of [Chapter 17](/chapter/17) to types. The `Result` type returns in [Chapter 33](/chapter/33) as the backbone of error handling, and `Loadable<T>` previews the UI-state modeling of [Chapter 52](/chapter/52). Every utility type in [Chapter 21](/chapter/21), from `Partial<T>` to `Record<K, V>`, is a generic type alias like the ones you just wrote. Variance returns in depth in [Chapter 77](/chapter/77).
+
+> 🌍 **Real world.** The types you use every day are generic types: `Promise<T>`, `Map<K, V>`, `ReadonlyArray<T>`, React's `RefObject<T>` and `Dispatch<SetStateAction<S>>`. Data-fetching libraries return generic result objects parameterized by data and error types, with defaults so that most call sites never mention them.
+
+## Exercises
+
+### Level 1 — Recall
+
+Define a generic `Paginated<T>` type with `items: T[]`, `page`, `pageSize`, and `total`. Use it to type a paginated list of tasks and a paginated list of users, then confirm that `items[0].email` compiles for users and fails for tasks.
+
+### Level 2 — Application
+
+Implement `Stack<T>` (with `push`, `pop`, `peek`, `size`, and `isEmpty`) and `Queue<T>` (with `enqueue`, `dequeue`, `peek`, and `size`) as generic classes.
+
+- Neither class exposes its internal array.
+- Write tests showing both work with tasks and with numbers, and that pushing the wrong type is a compile error (use `// @ts-expect-error`).
+
+### Level 3 — Challenge
+
+Starting from the `Result<T, E>` type and the `ok` and `err` helpers in 18.5, implement three functions:
+
+- `map(result, fn)` transforms the value if the result is ok, and passes errors through unchanged.
+- `mapError(result, fn)` transforms the error if the result is not ok, and passes values through unchanged.
+- `unwrapOr(result, fallback)` returns the value if the result is ok, and otherwise the fallback.
+
+Each must infer all of its types from its arguments. `map(parseDueDate(input), (d) => d.getFullYear())` should be typed `Result<number, DateError>`.
+
+*Hint: `map` needs three type parameters: the old value type, the new value type, and the error type.*
+
+### Level 4 — Real-world
+
+**Ticket TF-171: One repository contract for every entity.** The tasks and projects features each talk to storage differently, which makes testing them painful. Introduce a shared contract.
+
+- Design `Repository<T, Id>` where `Id` is the type of the entity's identifier, and decide whether `Id` deserves a default.
+- Implement `InMemoryRepository` for tasks and for projects, sharing as much code as possible.
+- `getById` with an id of the wrong type is a compile error.
+- Feature code depends only on the interface, never on the in-memory class.
+
+## Key takeaways
+
+- A generic type is a **type-level function**: `ApiResponse<User>` is `ApiResponse` applied to `User`.
+- Type aliases, interfaces, and classes can all take type parameters. In annotations you must supply them, since there's no value to infer from.
+- Where a type parameter lives decides who chooses it: on the type, when it's named; on a method or function, at every call.
+- Defaults keep common cases short. Put them last, make them satisfy the constraint, and prefer `unknown` to `any`.
+- `Result<T, E>` turns expected failures into data the compiler forces callers to handle.
+- Inference uses candidates from every site, types callbacks from context, and can be tuned with `const` type parameters and `NoInfer`.
+
+## What comes next
+
+You now have all the pieces: generic functions, constraints, `keyof`, generic types, and defaults. That's exactly when things go wrong. A teammate's "flexible" helper has five type parameters, and nobody on the team can call it without a wall of angle brackets and a red squiggle. Knowing the syntax isn't the same as designing a good API. [Chapter 19: Designing Reusable Generic APIs](/chapter/19) is about the difference.

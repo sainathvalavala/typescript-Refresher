@@ -1,0 +1,325 @@
+> 📖 **The problem.** A designer asks for "the TaskFlow blue" and the team realizes there are five: `#2563eb` on buttons, `#2461e8` in the header, `#3b82f6` in links, and two more in charts. There are three different modal implementations, each with its own focus bug. Marketing wants a rebrand and engineering estimates six months, because every color, spacing, and font size is copy-pasted into hundreds of files.
+
+A **design system** is how teams stop paying that tax. But the interesting part for an engineer is that it's a *product*, with developers as the customers. You'll learn what the pieces are, how to turn design decisions into typed data, how to build components in layers, when to build on headless primitives instead of from scratch, how to make themes type-safe, and how to document, test, version, and migrate a component library so people actually adopt it.
+
+> 🧠 **Mental model.** **A design system is a product for other developers.** It has four parts: **tokens** (decisions), **components** (implementations), **patterns** (guidance), and **governance** (how it evolves).
+
+## 93.1 What a design system is
+
+Think of it as four layers, each depending on the one before:
+
+- **Tokens** are named design decisions: colors, spacing, type sizes, radii, shadows. `color.brand.primary` instead of `#2563eb`.
+- **Components** implement those decisions in code: `Button`, `TextField`, `Dialog`. They consume tokens and never hard-code values.
+- **Patterns** are guidance for combining components: "destructive actions need a confirmation dialog", "forms show errors under the field".
+- **Governance** is the process: who can add a component, how breaking changes are announced, how teams request features.
+
+A style guide in a PDF is not a design system, because code can drift from it unnoticed. A shared component folder with no ownership is not one either; it's the `shared/` folder from [Chapter 90](/chapter/90). The value comes from the layers *enforcing* each other.
+
+```text
+packages/
+  tokens/     # decisions: the single source of truth
+  ui/         # components: consume tokens, never raw values
+  ui-docs/    # patterns + live documentation
+.github/      # governance: CODEOWNERS, RFC template, changeset rules
+```
+
+> 🚫 **When not to.** A single small app with one team doesn't need a separate design system package. Start with a `components/ui` folder and tokens as CSS variables. Extract when a second product or team needs the same pieces.
+
+## 93.2 Design tokens as typed data
+
+Keep tokens in **one source file**, then generate everything else: CSS custom properties for the browser, a typed object for TypeScript, and later Figma or native outputs. One source means the colors in CSS and the colors in your chart library can't disagree.
+
+```ts
+// packages/tokens/src/tokens.ts
+export const tokens = {
+  color: {
+    brand: { primary: "#2563eb", primaryHover: "#1d4ed8" },
+    text: { default: "#0f172a", muted: "#475569" },
+    status: { todo: "#64748b", doing: "#d97706", done: "#16a34a" },
+  },
+  space: { 1: "4px", 2: "8px", 3: "12px", 4: "16px" },
+  radius: { sm: "4px", md: "8px" },
+} as const;
+```
+
+A small build script flattens it into CSS variables:
+
+```ts
+// packages/tokens/scripts/build-css.ts
+import { tokens } from "../src/tokens";
+
+function flatten(obj: Record<string, unknown>, prefix = ""): [string, string][] {
+  return Object.entries(obj).flatMap(([key, value]) =>
+    typeof value === "object" && value !== null
+      ? flatten(value as Record<string, unknown>, `${prefix}${key}-`)
+      : [[`--${prefix}${key}`, String(value)] as [string, string]],
+  );
+}
+
+const css = `:root {\n${flatten(tokens).map(([k, v]) => `  ${k}: ${v};`).join("\n")}\n}\n`;
+// --color-brand-primary: #2563eb; --space-2: 8px; …
+```
+
+Components then use `var(--color-brand-primary)`, and TypeScript users can derive a union of token names (`keyof typeof tokens.space`) to restrict a prop like `gap` to `1 | 2 | 3 | 4` instead of any string.
+
+## 93.3 Primitives vs composites
+
+Components come in two kinds, and mixing them up is the main cause of design-system bloat.
+
+**Primitives** are small, general building blocks with no product knowledge: `Button`, `Text`, `Stack`, `Dialog`. They take props about *appearance and behavior*, and they have a stable, narrow API.
+
+**Composites** are assembled from primitives and *do* know the product: `TaskCard`, `ProjectPicker`, `StatusBadge`. They take domain data. They're useful, but they change whenever the product changes.
+
+```tsx
+// Primitive: knows nothing about tasks
+export function Badge({ tone, children }: { tone: "neutral" | "success" | "warning"; children: React.ReactNode }) {
+  return <span className={`badge badge-${tone}`}>{children}</span>;
+}
+
+// Composite: built from primitives, speaks the domain
+const toneByStatus = { todo: "neutral", doing: "warning", done: "success" } as const satisfies Record<Task["status"], "neutral" | "success" | "warning">;
+
+export function StatusBadge({ status }: { status: Task["status"] }) {
+  return <Badge tone={toneByStatus[status]}>{status}</Badge>;
+}
+```
+
+Keep the design-system package for primitives and a small set of truly shared composites. Domain composites usually belong in the *app* (`features/tasks/`). When a primitive needs a product concept (a prop like `taskStatus`), that's the signal it's actually a composite.
+
+## 93.4 Building on accessible headless primitives
+
+A dialog looks simple until you list the requirements: trap focus, restore it on close, close on Escape, block background scrolling, announce itself to screen readers, and portal into the body. Tabs, comboboxes, and menus are harder still. Getting these right is a *behavior* problem, separate from styling.
+
+**Headless** libraries (Radix UI, React Aria, Ark UI, Base UI) ship exactly that behavior with no visual style ([Chapter 88](/chapter/88)). You supply the styles and tokens.
+
+**Buy or build?**
+
+| Choose | When |
+|---|---|
+| Build on headless | Almost always for dialogs, menus, selects, tabs, tooltips, and comboboxes |
+| Build yourself | Simple, static pieces: `Button`, `Badge`, `Stack`, `Text` |
+| Use a full styled kit | You don't need a custom visual identity and want speed |
+
+```tsx
+import * as Dialog from "@radix-ui/react-dialog";
+
+export function ConfirmDialog({ title, onConfirm, trigger }: {
+  title: string;
+  onConfirm: () => void;
+  trigger: React.ReactNode;
+}) {
+  return (
+    <Dialog.Root>
+      <Dialog.Trigger asChild>{trigger}</Dialog.Trigger>
+      <Dialog.Portal>
+        <Dialog.Overlay className="overlay" />
+        <Dialog.Content className="dialog">
+          <Dialog.Title>{title}</Dialog.Title>
+          <Dialog.Close asChild><button onClick={onConfirm}>Confirm</button></Dialog.Close>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+}
+```
+
+Focus management, Escape handling, and ARIA wiring all come from the primitive, and your design system owns the look and the typed API.
+
+> 💡 **Tip.** Wrap the headless library behind your own component. Consumers import `@taskflow/ui`'s `Dialog`, not Radix's, so you can swap the engine later without a breaking change.
+
+## 93.5 Theming with types
+
+A **theme** is a set of values for the tokens, such as light, dark, and high-contrast. Type safety enters in two places.
+
+First, a **theme contract**: one type that every theme must satisfy, so a missing token is a compile error rather than an invisible UI bug.
+
+```ts
+export interface Theme {
+  color: { background: string; text: string; primary: string };
+  space: Record<1 | 2 | 3 | 4, string>;
+}
+
+export const light: Theme = {
+  color: { background: "#ffffff", text: "#0f172a", primary: "#2563eb" },
+  space: { 1: "4px", 2: "8px", 3: "12px", 4: "16px" },
+};
+export const dark: Theme = {
+  color: { background: "#0b1220", text: "#e2e8f0", primary: "#60a5fa" },
+  space: { 1: "4px", 2: "8px", 3: "12px" },
+  // ❌ Property '4' is missing in type '{ 1: string; 2: string; 3: string; }' but required in type 'Record<1 | 2 | 3 | 4, string>'.
+};
+```
+
+Second, **module augmentation** lets an *app* extend the library's theme type without forking it. The library declares an empty extension point; each app fills it in ([Chapter 28](/chapter/28)).
+
+```ts
+// in @taskflow/ui
+export interface CustomTokens {}
+export type ThemeTokens = Theme & CustomTokens;
+
+// in the app, any file included by tsconfig
+declare module "@taskflow/ui" {
+  interface CustomTokens {
+    color: { brandAccent: string };
+  }
+}
+```
+
+Now `ThemeTokens["color"]` includes `brandAccent` wherever that app uses the library, and apps that don't augment see nothing extra.
+
+> ⚠️ **Common mistake.** Switching themes by changing class names that hold *hard-coded* colors in each component. Switch by changing the values of CSS variables on a root element, so components never need to know which theme is active.
+
+## 93.6 Documentation
+
+A component nobody can discover or understand doesn't get adopted. **Storybook** (or a similar tool) renders each component in isolation with live, interactive examples, and it reads your TypeScript props to auto-generate a controls panel. Each component gets **stories**, small typed examples of each state.
+
+```tsx
+// Button.stories.tsx
+import type { Meta, StoryObj } from "@storybook/react-vite";
+import { Button } from "./Button";
+
+const meta = {
+  title: "Primitives/Button",
+  component: Button,
+  args: { children: "Save task" },
+} satisfies Meta<typeof Button>;
+export default meta;
+
+type Story = StoryObj<typeof meta>;
+
+export const Primary: Story = { args: { variant: "primary" } };
+export const Danger: Story = { args: { variant: "danger" } };
+export const Disabled: Story = { args: { disabled: true } };
+export const BadVariant: Story = {
+  args: { variant: "pink" }, // ❌ Type '"pink"' is not assignable to type '"primary" | "secondary" | "danger" | undefined'.
+};
+```
+
+Because stories are typed against the component, **docs can't drift**: rename the `variant` prop and every stale story fails to compile. Write TSDoc on props ([Chapter 91](/chapter/91)) and they show up in the docs table automatically. Add short "Do and don't" notes, an accessibility section (keyboard behavior, ARIA), and a usage snippet. Good documentation answers "which component should I use?" before "what are its props?".
+
+## 93.7 Testing a component library
+
+Component libraries need three kinds of tests, each catching a different failure.
+
+**Interaction tests** verify behavior: keyboard navigation, focus, callbacks. Use Testing Library ([Chapter 68](/chapter/68)), or Storybook's `play` functions, which run the same interactions inside the story.
+
+**Accessibility tests** run automated checks (`axe`) for the issues machines can find: missing labels, low contrast, invalid ARIA. They catch roughly a third of real problems. You still test keyboard flow and screen readers by hand ([Chapter 73](/chapter/73)).
+
+**Visual regression tests** screenshot every story and compare it to an approved baseline, so an accidental padding change in `Button` is caught across all fifty places it's used.
+
+```tsx
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { axe } from "vitest-axe";
+import { ConfirmDialog } from "./ConfirmDialog";
+
+test("closes on Escape and returns focus to the trigger", async () => {
+  const user = userEvent.setup();
+  const { container } = render(
+    <ConfirmDialog title="Delete task?" onConfirm={() => {}} trigger={<button>Delete</button>} />,
+  );
+  await user.click(screen.getByRole("button", { name: "Delete" }));
+  expect(await axe(container)).toHaveNoViolations();
+  await user.keyboard("{Escape}");
+  expect(screen.getByRole("button", { name: "Delete" })).toHaveFocus();
+});
+```
+
+```sh
+# CI: screenshot every story and diff against the approved baseline
+npx playwright test --project=visual
+```
+
+> 💡 **Tip.** Visual diffs are noisy when fonts or animations differ between machines. Run them in one fixed CI container, disable animations, and require a human to approve changed baselines.
+
+## 93.8 Versioning, migration, and adoption
+
+A design system succeeds when people *use* it, and people stay when upgrades are cheap. Three practices build that trust.
+
+**A deprecation policy.** Write it down: "We deprecate for at least one minor release, with a console warning in development and a migration note, before removing in the next major." Use `@deprecated` ([Chapter 91](/chapter/91)) so editors flag usage.
+
+**Codemods.** For mechanical changes, ship an automated migration. A **codemod** is a script that parses source into a syntax tree, rewrites it, and writes it back. Libraries like `jscodeshift` and `ts-morph` make this practical.
+
+```ts
+// codemods/button-kind-to-variant.ts (ts-morph)
+import { Project, SyntaxKind } from "ts-morph";
+
+const project = new Project({ tsConfigFilePath: "tsconfig.json" });
+for (const file of project.getSourceFiles("src/**/*.tsx")) {
+  for (const attr of file.getDescendantsOfKind(SyntaxKind.JsxAttribute)) {
+    const el = attr.getFirstAncestorByKind(SyntaxKind.JsxOpeningElement) ?? attr.getFirstAncestorByKind(SyntaxKind.JsxSelfClosingElement);
+    if (el?.getTagNameNode().getText() === "Button" && attr.getNameNode().getText() === "kind") {
+      attr.getNameNode().replaceWithText("variant");
+    }
+  }
+}
+await project.save();
+```
+
+**Measuring adoption.** Count usages: how many files import `@taskflow/ui` versus hand-written buttons, and which versions are installed where. A lint rule banning raw `<button>` in app code, with an autofix to the design-system component, both measures and *drives* adoption.
+
+## Common mistakes
+
+> ⚠️ **Tokens that are values, not decisions.** `blue500` tells you the color; `color.action.primary` tells you its *purpose*. Name tokens by role so a rebrand changes one file.
+
+> ⚠️ **Too many props, too soon.** Each prop is API surface. Start with a small set of variants and add when real use demands it ([Chapter 89](/chapter/89)).
+
+> ⚠️ **Domain logic in primitives.** A `Button` that knows about `Task` can't be reused. Keep primitives pure and put domain composites in apps.
+
+> ⚠️ **A component library with no owner.** Without governance, it becomes the dumping ground that `shared/` was. Someone must review additions and say no.
+
+```tsx
+// ❌ A primitive that has absorbed product logic
+function Button({ task, ...rest }: { task?: Task } & React.ComponentProps<"button">) {
+  return <button {...rest} disabled={task?.status === "done"} />;
+}
+```
+
+## When to use it, and when not to
+
+> ✅ **Use it when** multiple teams or products need consistent UI, when accessibility must be correct once and reused, or when rebrands and theming are real requirements.
+
+> 🚫 **When not to.** A design system is ongoing work: someone must maintain it, document it, and support its users. For one app and one team, a good `components/ui` folder and CSS variables give you most of the benefit at a fraction of the cost.
+
+## How it connects
+
+> 🔗 **Connection.** Everything from Part XIV goes in here: polymorphic and compound components ([Chapter 86](/chapter/86), [Chapter 87](/chapter/87)), headless patterns ([Chapter 88](/chapter/88)), and API design ([Chapter 89](/chapter/89)). Packaging comes from [Chapter 92](/chapter/92), and the monorepo that hosts it from [Chapter 94](/chapter/94). You'll build one in [P20](/projects/p20).
+
+> 🌍 **Real world.** Radix UI, React Aria, and shadcn/ui show the split in practice: behavior from headless primitives, appearance from tokens and your own styles.
+
+## Exercises
+
+### Level 1 — Recall
+
+Split these ten style values into **tokens** (shared decisions) and **component-specific** values: `#2563eb`, `8px` gap between all form fields, `24px` button icon size, `16px` base font size, `#e2e8f0` card border, `3px` focus ring on every control, `40px` height of `TextField` only, `#fff` page background, `150ms` transition used everywhere, `12` columns in `DataTable`.
+
+### Level 2 — Application
+
+Create one token file (`tokens.ts`). From it, generate a `tokens.css` of CSS variables and a typed object that lets a `Stack` component accept `gap: keyof typeof tokens.space`. Show that `gap={5}` is a compile error.
+
+### Level 3 — Challenge
+
+Support **light**, **dark**, and **high-contrast** themes through a typed theme contract. Missing a token in any theme must be a compile error, and switching themes must not re-render components (CSS variables only). *Hint: apply the theme by setting a `data-theme` attribute on the root element.*
+
+### Level 4 — Real-world
+
+**Ticket UI-77: Rename `Button`'s `kind` prop to `variant`.**
+
+- Ship the new prop and keep `kind` working with `@deprecated` for one minor release.
+- Write a codemod that migrates every `<Button kind="…">` across TaskFlow Web, including spread cases it cannot handle (reported, not guessed).
+- Add a changeset and a short migration guide.
+- A lint rule or CI check reports remaining uses of `kind`.
+
+## Key takeaways
+
+- A design system is a product with four layers: tokens, components, patterns, governance.
+- Keep tokens as **one typed source** that generates CSS variables and TypeScript types.
+- Primitives are general and stable; composites speak the domain and live closer to the app.
+- Buy behavior from accessible headless primitives; own the look and the API.
+- Type your theme contract, and use module augmentation for app-specific extensions.
+- Stories, interaction tests, accessibility checks, and visual regression keep a library trustworthy.
+- Make upgrades cheap: deprecation policy, codemods, and measured adoption.
+
+## What comes next
+
+A design system usually lives next to the apps that consume it, and so do shared schemas, configs, and utilities. Putting all of that in one repository, without letting it turn into a tangle, is the subject of [Chapter 94: Monorepos & Package Boundaries](/chapter/94).

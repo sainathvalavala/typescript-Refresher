@@ -1,0 +1,347 @@
+> 📖 **The problem.** Your team owns a 15,000-line JavaScript app. Features still ship every week, nobody can stop for a month, and leadership has said: "move to TypeScript." The naive plan (rename every file to `.ts`, turn on `strict`, fix the 4,000 errors) would freeze the team and ship a giant, unreviewable change. There has to be a way to adopt TypeScript while the product keeps moving.
+
+There is, and it works because TypeScript was designed for it. JavaScript files and TypeScript files can live side by side, types can start life as *comments* in the JavaScript, and strictness can be raised one flag at a time. This chapter gives you the tools (`allowJs`, `checkJs`, JSDoc) and a strategy for using them, ending with how to measure progress and keep `any` from creeping back.
+
+> 🧠 **Mental model.** **Migration is a ratchet, not a rewrite.** Each step makes the codebase strictly safer, never worse, and is shippable on its own. You can stop after any step and still be better off than you were.
+
+## 29.1 allowJs and checkJs
+
+Two `tsconfig.json` settings are the doorway. `allowJs` lets TypeScript *include* `.js` files in the program (so `.ts` files can import them). `checkJs` goes further and *type-checks* them, as if they were TypeScript.
+
+```json
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "strict": false
+  },
+  "include": ["src"]
+}
+```
+
+With only `allowJs`, JavaScript files are accepted but not checked. Add `checkJs` and TypeScript infers types from your JavaScript and reports the mistakes it can see, without a single annotation:
+
+```js
+// src/tasks.js
+export function openIds(tasks, limit) {
+  return tasks.filter((t) => !t.done).slice(0, limit).map((t) => t.id);
+}
+
+const first = openIds([], 3)[0];
+first.toFixed(2); // first is any, so nothing is reported (even if it is really a string)
+```
+
+That line shows the limit of inference: with no information about `tasks`, the parameter is `any` and almost nothing is flagged. That's why the next step, JSDoc, matters. You don't have to check everything at once either: put `// @ts-check` at the top of a single `.js` file to opt that one file in, or `// @ts-nocheck` to opt one file out while `checkJs` is on.
+
+```js
+// @ts-check
+// Only this file is checked, even if checkJs is off globally.
+const count = "3";
+count.push(1); // ❌ Property 'push' does not exist on type 'string'.
+```
+
+## 29.2 JSDoc types
+
+TypeScript understands **JSDoc comments** in JavaScript files as type annotations. The code stays plain JavaScript that runs anywhere with no build step, yet your editor and `tsc` check it.
+
+```js
+// src/tasks.js
+/**
+ * @param {{ id: string, done: boolean }[]} tasks
+ * @param {number} limit
+ * @returns {string[]}
+ */
+export function openIds(tasks, limit) {
+  return tasks.filter((t) => !t.done).slice(0, limit).map((t) => t.id);
+}
+
+openIds([{ id: "a", done: false }], "5");
+// ❌ Argument of type 'string' is not assignable to parameter of type 'number'.
+```
+
+Reusable types use `@typedef`, and variables use `@type`:
+
+```js
+/** @typedef {"todo" | "doing" | "done"} Status */
+/**
+ * @typedef {object} Task
+ * @property {string} id
+ * @property {string} title
+ * @property {Status} status
+ */
+
+/** @type {Status} */
+let current = "todo";
+current = "blocked"; // ❌ Type '"blocked"' is not assignable to type 'Status'.
+
+/** @type {import("./types").Task} */
+const t = { id: 1 }; // ❌ Type 'number' is not assignable to type 'string'.
+```
+
+The last form imports a type from a real `.ts` file, so JavaScript can use TypeScript's more expressive types. JSDoc is a **stepping stone**: it lets you add types incrementally to files you can't convert yet. Once a file is stable, converting its JSDoc to real annotations (and renaming it to `.ts`) is nearly mechanical.
+
+> 💡 **Tip.** Some teams stay on JSDoc permanently for libraries that must run with no build step. It's a legitimate end state, though the syntax is clunkier for complex types.
+
+## 29.3 Mixed JS/TS projects
+
+During migration, both languages live in one project and import each other. The rules are simple: `.ts` files may import `.js` files (types inferred from JSDoc, or `any` when there are none), and `.js` files may import `.ts` files (the types come through only if `checkJs` or JSDoc is in play).
+
+```ts
+// src/main.ts
+import { openIds } from "./tasks.js"; // a JavaScript file; types come from its JSDoc
+
+const ids: number[] = openIds([], 3);
+// ❌ Type 'string[]' is not assignable to type 'number[]'.
+```
+
+Note the `.js` extension in the import even though it is a `.js` file: this is how modern ESM resolution works ([Chapter 25](/chapter/25)). The **boundary** between a typed file and an untyped one is where trouble hides, so make it explicit. If a `.js` file has no JSDoc, its exports are `any`, and `any` flows silently into your typed code. A small declaration file next to it (`tasks.d.ts`) can describe the boundary until you convert the file:
+
+```ts
+// src/legacy-pricing.d.ts: a hand-written description for src/legacy-pricing.js
+export function priceFor(task: { priority: number }): number;
+export const TAX_RATE: number;
+```
+
+When `legacy-pricing.d.ts` sits next to `legacy-pricing.js`, TypeScript uses the declaration, and you've drawn a typed fence around untyped code ([Chapter 28](/chapter/28)).
+
+## 29.4 A gradual migration strategy
+
+A migration needs an *order*. The two classic orders are **leaf-first** and **core-first**:
+
+| Strategy | Start with | Why | Risk |
+|---|---|---|---|
+| Leaf-first | Utilities and helpers that import nothing | Few dependencies, easy wins, types flow *upward* to callers | The risky core stays untyped for a long time |
+| Core-first | Shared models (`Task`, `User`) and the data layer | Every file that touches them benefits immediately | Large blast radius, needs care |
+
+Most teams do a blend: type the **shared domain models** first (a handful of interfaces everyone uses), then work leaf-first through the utilities, then climb toward the feature code. A concrete plan:
+
+```text
+Phase 0  Add tsconfig (allowJs, checkJs off, noEmit). Add `typecheck` to CI. Nothing breaks.
+Phase 1  Add types.ts with Task, Project, User. Reference them from JSDoc in a few files.
+Phase 2  checkJs on, with // @ts-nocheck at the top of every file that has errors.
+Phase 3  Remove @ts-nocheck file by file, fixing errors. Rename finished files to .ts.
+Phase 4  New code must be .ts. Raise strictness one flag at a time (29.6).
+```
+
+Two practical habits keep the ratchet turning. Do **rename passes** (`git mv tasks.js tasks.ts`, in a PR containing nothing else, so history follows the file), and **track progress** where everyone can see it:
+
+```sh
+# a crude but effective migration tracker
+echo "TS files: $(find src -name '*.ts' -o -name '*.tsx' | wc -l)"
+echo "JS files: $(find src -name '*.js' -o -name '*.jsx' | wc -l)"
+echo "@ts-nocheck: $(grep -rl '@ts-nocheck' src | wc -l)"
+```
+
+> ⚠️ **Common mistake.** A big-bang rewrite on a branch. It diverges from `main` while features land, so you spend weeks resolving conflicts. Small shippable steps, merged daily, are the entire point of a ratchet.
+
+## 29.5 Taming legacy code
+
+Legacy JavaScript uses dynamic patterns that look hostile to a type system. Usually you can type them **without redesigning them**. Three common ones follow.
+
+**String-keyed lookups.** Indexing an object with a plain `string` fails, because the compiler can't know which keys exist:
+
+```ts
+const handlers = { created: () => 1, deleted: () => 2 };
+
+function run(name: string) {
+  return handlers[name]();
+  // ❌ Element implicitly has an 'any' type because expression of type 'string' can't be used to index type '{ created: () => number; deleted: () => number; }'.
+}
+
+function isHandler(name: string): name is keyof typeof handlers {
+  return name in handlers;
+}
+
+function runSafe(name: string) {
+  if (isHandler(name)) return handlers[name](); // ✅ name is "created" | "deleted"
+}
+```
+
+**Mixins.** Classes built by functions that extend a base class can be typed with a constructor type and a generic:
+
+```ts
+type Constructor<T = {}> = new (...args: any[]) => T;
+
+function Timestamped<TBase extends Constructor>(Base: TBase) {
+  return class extends Base {
+    createdAt = Date.now();
+  };
+}
+
+class Task { constructor(public title: string) {} }
+
+const TimestampedTask = Timestamped(Task);
+const t = new TimestampedTask("docs");
+t.title.toUpperCase();         // ✅ from Task
+const c: string = t.createdAt; // ❌ Type 'number' is not assignable to type 'string'.
+```
+
+**Config blobs.** Objects that accumulate properties over time can start as a loose type and tighten later:
+
+```ts
+// Step 1: honest and loose: unknown values must be checked before use
+type LegacyConfig = Record<string, unknown>;
+
+// Step 2: describe what you know, keep an escape hatch for the rest
+interface AppConfig {
+  apiUrl: string;
+  retries?: number;
+  [extra: string]: unknown;
+}
+```
+
+Prefer `unknown` over `any` for these blobs: `unknown` forces a check before use, so the compiler *finds* the places that need real types, while `any` hides them.
+
+## 29.6 Strictness migration
+
+`"strict": true` is not one switch but a bundle of flags. Turning on the bundle in a large codebase produces thousands of errors at once. Instead, enable the flags **one at a time**, in order of payoff per error:
+
+```json
+{
+  "compilerOptions": {
+    "noImplicitAny": true
+    // next: "strictNullChecks": true
+    // then: "strictFunctionTypes", "strictBindCallApply", "strictPropertyInitialization"
+    // then: "noImplicitThis", "useUnknownInCatchVariables"
+    // finally: "strict": true, then "noUncheckedIndexedAccess"
+  }
+}
+```
+
+To size a step before committing to it, flip the flag locally and count the errors:
+
+```sh
+npx tsc --noEmit --noImplicitAny | grep -c "error TS"      # how many would we fix?
+npx tsc --noEmit --strictNullChecks | grep -c "error TS"
+```
+
+What each flag teaches you:
+
+```ts
+function add(a, b) { return a + b; }
+// ❌ noImplicitAny: Parameter 'a' implicitly has an 'any' type.
+
+let user: { name: string } | undefined;
+user.name;
+// ❌ strictNullChecks: 'user' is possibly 'undefined'.
+
+try { /* … */ } catch (e) {
+  e.message;
+  // ❌ useUnknownInCatchVariables: 'e' is of type 'unknown'.
+}
+```
+
+When a single file blocks the step, use a **per-file escape hatch** instead of delaying the whole project. `// @ts-nocheck` at the top of a JS or TS file skips it; `// @ts-expect-error` above one line marks a known error that will announce itself (`Unused '@ts-expect-error' directive.`) when it's fixed. Prefer `@ts-expect-error` to `@ts-ignore`, because the latter stays silent forever. Both are debt, so track their count like any other metric.
+
+## 29.7 Reducing any
+
+Once the project compiles under strict flags, `any` becomes the remaining hole. You can't fix what you can't see, so **measure** it:
+
+```sh
+# explicit anys (crude)
+grep -rn ": any\|as any\|<any>" src | wc -l
+
+# type coverage: percentage of identifiers with a non-any type
+npx type-coverage --at-least 95 --detail
+```
+
+Then make the compiler and linter stop new ones from arriving. The ESLint rules from [Chapter 27](/chapter/27) do most of the work:
+
+```js
+// eslint.config.js (excerpt): ratchet these from "warn" to "error" as the count hits zero
+rules: {
+  "@typescript-eslint/no-explicit-any": "error",
+  "@typescript-eslint/no-unsafe-assignment": "error",
+  "@typescript-eslint/no-unsafe-member-access": "error",
+  "@typescript-eslint/no-unsafe-return": "error",
+}
+```
+
+Burn the existing ones down with a **burn-down chart**: record the count in CI on every merge and plot it over time. Mechanical cases (adding `unknown` to catch variables, annotating obvious parameters) can be handled by **codemods**, scripts that rewrite code using a parser (`jscodeshift`, or the `ts-migrate` tool). Replace `any` with a type you can justify: `unknown` plus narrowing, a generic, or a proper interface.
+
+```ts
+// before
+function parseTask(raw: any): any { return { id: raw.id, title: raw.title }; }
+
+// after: unknown forces a check; the return type is real
+function parseTask(raw: unknown): Task {
+  if (typeof raw !== "object" || raw === null) throw new Error("not an object");
+  const r = raw as Record<string, unknown>;
+  if (typeof r.id !== "string" || typeof r.title !== "string") throw new Error("bad task");
+  return { id: r.id, title: r.title, done: false };
+}
+```
+
+That `parseTask` is the shape of a real boundary check; [Chapter 32](/chapter/32) replaces the hand-written version with schema validation.
+
+## Common mistakes
+
+> ⚠️ **A big-bang rewrite.** One giant branch, frozen features, and a merge nightmare. Migrate in small steps that each ship.
+
+> ⚠️ **Turning on `strict` all at once.** Thousands of errors, no progress, and a team that loses faith. Enable flags one at a time and count first.
+
+> ⚠️ **Converting `any` problems into `as` assertions.** Silencing an error with `as Task` moves the lie, it doesn't remove it. Validate or narrow instead.
+
+> ⚠️ **`@ts-ignore` everywhere.** It never reports when it becomes unnecessary. Prefer `@ts-expect-error` with a reason, and count them.
+
+> ⚠️ **Not measuring.** Without a tracked number (files converted, `any` count, `@ts-nocheck` count), the migration stalls at 70% and nobody notices.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** an existing JavaScript codebase has more life ahead of it than behind it, and bugs from wrong shapes keep costing time.
+
+> 🚫 **When not to.** A script that will be deleted next month, or a stable module nobody touches, may not repay the effort. Leave it in JavaScript with `// @ts-check` or a small `.d.ts` fence, and spend the time where change actually happens.
+
+## How it connects
+
+> 🔗 **Connection.** The settings come from [Chapter 26](/chapter/26), declaration fences from [Chapter 28](/chapter/28), and lint rules from [Chapter 27](/chapter/27). The migration project [P06](/projects/p06) puts the whole plan into practice, and [Chapter 76](/chapter/76) covers keeping the gains with CI.
+
+> 🌍 **Real world.** Large companies routinely migrate multi-hundred-thousand-line JavaScript codebases this way: `allowJs` on day one, shared models typed first, strictness ratcheted over many months, and a dashboard showing the `any` count falling.
+
+## Exercises
+
+### Level 1 — Recall
+
+Annotate this JavaScript function with JSDoc so that `checkJs` catches the bug in the call below.
+
+```js
+function discount(price, percent) {
+  return price - price * (percent / 100);
+}
+discount("20", 10);
+```
+
+### Level 2 — Application
+
+Take the migration project ([P06](/projects/p06)), enable `checkJs`, and fix the first ten errors. For each fix, say whether you used a JSDoc type, a code change, or an escape hatch, and why.
+
+### Level 3 — Challenge
+
+A legacy module builds classes with a mixin function `withEvents(Base)` that adds `on` and `emit`. Type it without changing its design, so that instances of `withEvents(Task)` have both `Task`'s members and `on`/`emit`.
+
+*Hint: a `Constructor` type and a generic base-class parameter.*
+
+### Level 4 — Real-world
+
+**Ticket TF-340: Migration plan.** Write a one-page plan to move a 15,000-line JavaScript app to strict TypeScript over one quarter, for a team of five who must keep shipping.
+
+- Phases with exit criteria (what is "done" for each phase).
+- Metrics tracked weekly (files converted, `any` count, `@ts-nocheck` count) and who reviews them.
+- A list of risks and how each is mitigated (merge conflicts, review load, flaky types).
+- A rule for new code during the migration.
+
+## Key takeaways
+
+- `allowJs` lets TypeScript include JavaScript; `checkJs` (or `// @ts-check` per file) type-checks it.
+- JSDoc (`@param`, `@returns`, `@type`, `@typedef`) gives JavaScript real types with no build step, and is a good stepping stone.
+- In mixed projects, the JS/TS boundary is where `any` leaks; fence it with JSDoc or a `.d.ts`.
+- Migrate gradually: shared models first, then leaf-first, with rename passes in their own PRs, tracked by numbers.
+- Type dynamic legacy patterns (string lookups, mixins, config blobs) without redesigning them, preferring `unknown` to `any`.
+- Turn strict flags on one at a time, counting errors first, and use `@ts-expect-error` rather than `@ts-ignore`.
+- Measure `any`, block new ones with lint rules, and burn the old ones down.
+
+## What comes next
+
+Part V ends here: you can configure, run, check, and migrate TypeScript projects. Part VI takes TypeScript to the server, starting with [Chapter 30: TypeScript on Node.js](/chapter/30), where the environment you've been configuring meets real files, processes, and requests.
+

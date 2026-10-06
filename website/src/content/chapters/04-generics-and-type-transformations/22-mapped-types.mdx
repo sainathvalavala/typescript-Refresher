@@ -1,0 +1,259 @@
+> 📖 **The problem.** In [Chapter 21](/chapter/21) you used `Partial<Task>` and it just worked. Now a teammate asks: "How does `Partial` actually work? And can we make a type where every property becomes a getter function, so `Task` becomes `{ getTitle(): string; getDone(): boolean }`?" There is no built-in utility for that. To answer, you have to open the box.
+
+A **mapped type** is the machine inside most utility types. Once you can read `{ [K in keyof T]?: T[K] }`, you can rebuild `Partial`, `Readonly`, `Pick`, and `Record` from memory, and write your own transformations when the standard library doesn't have one. This chapter keeps the syntax small and the examples concrete.
+
+> 🧠 **Mental model.** **A mapped type is a `for…in` loop over keys, at the type level.** For each key `K` in a list of keys, produce one property in the new object type. You choose the key list, the new name, the new value type, and the modifiers.
+
+## 22.1 The mapping syntax
+
+The shape of every mapped type is:
+
+```ts
+type Mapped<T> = { [K in keyof T]: T[K] };
+//                  ^^^^^^^^^^^^^   loop: for each key K of T
+//                                  ^^^^ …the property's type is whatever T had at K
+```
+
+Read it as the pseudo-JavaScript `for (const K of keys(T)) result[K] = T[K]`. This particular one is the **identity mapping**: it produces a copy of `T`, which sounds useless but is the foundation for every other mapped type. Change the right-hand side and you change the output.
+
+```ts
+interface Task {
+  id: string;
+  title: string;
+  done: boolean;
+}
+
+type Same<T> = { [K in keyof T]: T[K] };
+type SameTask = Same<Task>; // { id: string; title: string; done: boolean }
+
+type AllStrings<T> = { [K in keyof T]: string };
+type TaskLabels = AllStrings<Task>; // { id: string; title: string; done: string }
+
+type Flags<T> = { [K in keyof T]: boolean };
+type TaskFlags = Flags<Task>; // { id: boolean; title: boolean; done: boolean }
+```
+
+`K` is a *type variable* that takes each key in turn (`"id"`, then `"title"`, then `"done"`), and `T[K]` is the indexed access you met in [Chapter 20](/chapter/20). The left side decides **which keys exist**; the right side decides **what each one holds**.
+
+## 22.2 Rebuilding Partial, Required, Readonly, Pick and Record
+
+Now the box is open. These are the real definitions from the standard library (renamed with a `My` prefix so you can paste them next to the originals):
+
+```ts
+type MyPartial<T>  = { [K in keyof T]?: T[K] };        // add ?
+type MyRequired<T> = { [K in keyof T]-?: T[K] };       // remove ?
+type MyReadonly<T> = { readonly [K in keyof T]: T[K] }; // add readonly
+```
+
+`Partial`, `Required`, and `Readonly` are the identity mapping plus a modifier. `Pick` and `Record` change **which keys** the loop visits:
+
+```ts
+type MyPick<T, Keys extends keyof T> = { [K in Keys]: T[K] };
+type MyRecord<Keys extends keyof any, V> = { [K in Keys]: V };
+
+type Preview = MyPick<Task, "id" | "title">;       // { id: string; title: string }
+type Board = MyRecord<"todo" | "doing", Task[]>;   // { todo: Task[]; doing: Task[] }
+
+type Bad = MyPick<Task, "titel">;
+// ❌ Type '"titel"' does not satisfy the constraint 'keyof Task'.
+```
+
+`Pick` loops over the keys *you* provide instead of `keyof T`, and the constraint `Keys extends keyof T` is what catches the typo `"titel"`. `Record` has no source type at all: it loops over a key list and gives every key the same value type. `keyof any` is just `string | number | symbol`, the set of everything that can be a key.
+
+> 💡 **Tip.** Hover over `Partial` in your editor and go to its definition. Every one of these is a single line in `lib.es5.d.ts`.
+
+Now you can also write the strict `Omit` that [Chapter 21](/chapter/21) wished for:
+
+```ts
+type StrictOmit<T, Keys extends keyof T> = Pick<T, Exclude<keyof T, Keys>>;
+
+type NoId = StrictOmit<Task, "id">; // { title: string; done: boolean }
+type Oops = StrictOmit<Task, "idd">; // ❌ Type '"idd"' does not satisfy the constraint 'keyof Task'.
+```
+
+## 22.3 Modifiers
+
+A property has two modifiers you can change in a mapped type: `?` (optional) and `readonly`. A plain `?` or `readonly` **adds** it; prefixing with `-` **removes** it (and `+` explicitly adds, which is the default).
+
+```ts
+interface Config {
+  readonly apiUrl: string;
+  timeout?: number;
+}
+
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+type Complete<T> = { [K in keyof T]-?: T[K] };
+
+type EditableConfig = Mutable<Config>;
+// { apiUrl: string; timeout?: number }
+
+type FullConfig = Complete<Config>;
+// { readonly apiUrl: string; timeout: number }
+```
+
+There is no built-in `Mutable`, but `-readonly` makes one trivial. Notice that removing `?` also strips `| undefined` that the optional marker added, which is why `FullConfig["timeout"]` is `number`, not `number | undefined`.
+
+Modifiers combine, so you can add and remove in one pass:
+
+```ts
+type Frozen<T> = { readonly [K in keyof T]-?: T[K] };  // read-only and fully required
+
+const settings: Frozen<Config> = { apiUrl: "/api", timeout: 3000 };
+settings.timeout = 1; // ❌ Cannot assign to 'timeout' because it is a read-only property.
+```
+
+## 22.4 Key remapping with as
+
+So far the new object has the same key names as the loop's keys. An `as` clause after `in` lets you **rename** each key as it is produced, using a template literal type (a string pattern evaluated by the compiler; [Chapter 24](/chapter/24) covers them fully).
+
+```ts
+type Getters<T> = {
+  [K in keyof T as `get${Capitalize<string & K>}`]: () => T[K];
+};
+
+type TaskGetters = Getters<Task>;
+// { getId: () => string; getTitle: () => string; getDone: () => boolean }
+```
+
+`Capitalize<…>` upper-cases the first letter. The `string & K` part narrows `K` to its string keys, because a key could technically also be a `number` or `symbol`, and `Capitalize` only accepts strings.
+
+The second trick: if the `as` expression evaluates to `never`, that key is **dropped**. That gives you filtering:
+
+```ts
+type WithoutDone<T> = { [K in keyof T as K extends "done" ? never : K]: T[K] };
+type NoDone = WithoutDone<Task>; // { id: string; title: string }
+
+type OnlyStrings<T> = { [K in keyof T as T[K] extends string ? K : never]: T[K] };
+type StringFields = OnlyStrings<Task>; // { id: string; title: string }
+
+interface Service { name: string; start(): void; stop(): void }
+type Methods<T> = { [K in keyof T as T[K] extends Function ? K : never]: T[K] };
+type ServiceMethods = Methods<Service>; // { start(): void; stop(): void }
+```
+
+The pattern `K extends … ? never : K` reads "keep this key unless it matches." It is the key-level cousin of `Exclude`, and the conditional-type syntax it uses is the subject of [Chapter 23](/chapter/23).
+
+## 22.5 Homomorphic mapped types
+
+A mapped type of the form `{ [K in keyof T]: … }` has a special property: TypeScript recognizes that you're looping over the keys **of `T`** and *copies the `?` and `readonly` modifiers* from each original property. These are called **homomorphic** mapped types. (The same applies to `{ [K in Keys]: … }` when `Keys` is constrained to `keyof T`, which is why `Pick` preserves modifiers.)
+
+```ts
+interface Profile {
+  readonly id: string;
+  nickname?: string;
+}
+
+type Copy<T> = { [K in keyof T]: T[K] };
+type P1 = Copy<Profile>;
+// { readonly id: string; nickname?: string }  ← modifiers preserved
+```
+
+If instead the key list doesn't come directly from `keyof T`, the link to the source is lost and so are the modifiers:
+
+```ts
+type Lossy<T> = { [K in Exclude<keyof T, never>]: T[K] };
+type P2 = Lossy<Profile>;
+// { id: string; nickname: string | undefined }  ← readonly and ? are gone; the property is now required
+
+type Strings = { [K in string]: number };
+// { [x: string]: number }  ← not an object with known keys, but an index signature
+```
+
+> ⚠️ **Common mistake.** Silently losing optionality. If your custom helper turns optional properties into required ones with `| undefined`, you probably wrote a non-homomorphic mapping. Prefer `[K in keyof T]` when you want the source's modifiers preserved, and add or remove modifiers explicitly.
+
+## 22.6 Mapping over unions of keys
+
+You don't need an existing object type to start from. Any union of string literals can be the key list, which turns a mapped type into a **generator** for handler maps, flag objects, and lookup tables.
+
+```ts
+type Status = "todo" | "doing" | "done";
+
+type StatusFlags = { [S in Status]: boolean };
+// { todo: boolean; doing: boolean; done: boolean }
+
+type StatusHandlers = { [S in Status]: (task: Task) => void };
+
+const handlers: StatusHandlers = {
+  todo: (t) => console.log("queued", t.title),
+  doing: (t) => console.log("started", t.title),
+  done: (t) => console.log("finished", t.title),
+};
+
+const missing: StatusHandlers = { todo: () => {}, doing: () => {} };
+// ❌ Property 'done' is missing in type '{ todo: () => void; doing: () => void; }' but required in type 'StatusHandlers'.
+```
+
+It is the same shape `Record<Status, …>` gives you, but a mapped type lets the **value depend on the key** `S`, which `Record` cannot do:
+
+```ts
+interface Payloads {
+  created: { task: Task };
+  deleted: { id: string };
+}
+
+type EventHandlers = { [E in keyof Payloads]: (payload: Payloads[E]) => void };
+// { created: (payload: { task: Task }) => void; deleted: (payload: { id: string }) => void }
+```
+
+Each handler's parameter type is picked by its own key. This "key decides value" pattern is the heart of typed event systems ([P05](/projects/p05)) and reducers ([Chapter 55](/chapter/55)).
+
+## Common mistakes
+
+> ⚠️ **Mapping over `string` instead of `keyof T`.** `{ [K in string]: T[K] }` is an index signature, not a copy of `T`, and it won't even compile with `T[K]`. Loop over `keyof T`.
+
+> ⚠️ **Losing optionality unknowingly.** A non-homomorphic key list drops `?` and `readonly` (section 22.5). Check the hover result when a helper behaves strangely.
+
+> ⚠️ **Unreadable one-liners.** A mapped type with an `as` clause, a conditional, and an `infer` all on one line is correct and unreadable. Give pieces names, put each clause on its own line, and add a comment showing an example input and output.
+
+> ⚠️ **Hover shows the formula, not the result.** Editors may display `Getters<Task>` rather than the expanded object. Assign it to a variable and hover that, or wrap the result with `Prettify<T> = { [K in keyof T]: T[K] } & {}`.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** every property of a type needs the same treatment (wrap, rename, make optional, make nullable), or when you need one entry per member of a union (handlers, flags, labels).
+
+> 🚫 **When not to.** If a built-in (`Partial`, `Pick`, `Record`) says it already, use that. If only one or two properties differ, write the interface by hand. Mapped types are for *systematic* transformations, not one-offs.
+
+## How it connects
+
+> 🔗 **Connection.** Mapped types combine `keyof` and indexed access from [Chapter 17](/chapter/17) and [Chapter 20](/chapter/20). Next, [Chapter 23](/chapter/23) adds conditional types, which let the *value* of each property depend on a test. You'll see this again in React for deriving form state and error shapes ([Chapter 63](/chapter/63)).
+
+> 🌍 **Real world.** Form libraries use mapped types to produce one error slot per field, state libraries to produce a setter per state key, and ORM libraries to produce typed filters for every column.
+
+## Exercises
+
+### Level 1 — Recall
+
+From memory, write `Readonly<T>` and `Partial<T>` as mapped types without looking at this chapter. Then write `Required<T>`, and explain what `-?` does.
+
+### Level 2 — Application
+
+Write `Nullable<T>`, where every property of `T` becomes `T[K] | null`, and `Mutable<T>`, which removes `readonly` from every property. Test both against a `Task` with a `readonly id` and an optional `dueDate`, and check that the modifiers you didn't touch are preserved.
+
+### Level 3 — Challenge
+
+Write `Getters<T>` so that `Getters<{ name: string; age: number }>` is `{ getName(): string; getAge(): number }`. Then extend it to a `Setters<T>` that produces `setName(value: string): void`.
+
+*Hint: use `as` with a template literal and `Capitalize`.*
+
+### Level 4 — Real-world
+
+**Ticket TF-231: Form error types.** The upcoming task form needs a `FormErrors<T>` type: each field of `T` maps to `string | undefined`.
+
+- `FormErrors<CreateTaskInput>` has exactly the same keys as `CreateTaskInput`, all required (no silently missing field).
+- Nested objects are **not** required to be handled; document that limitation in a comment.
+- Add a second type `Touched<T>` (each field to `boolean`) and a function `hasErrors(errors: FormErrors<T>): boolean`.
+- Add at least three `expectTypeOf` tests, including one for a type with optional fields.
+
+## Key takeaways
+
+- A mapped type `{ [K in keyof T]: … }` is a loop over keys: the left side picks the keys, the right side picks each value type.
+- `Partial`, `Required`, `Readonly`, `Pick`, and `Record` are each one line of mapped-type syntax.
+- `?`, `readonly`, `-?`, and `-readonly` add or remove modifiers.
+- `as` renames keys, and mapping a key to `never` removes it.
+- `[K in keyof T]` is **homomorphic** and preserves the source's modifiers; other key lists don't.
+- A union of literals can be the key list, which generates handler maps and flags.
+
+## What comes next
+
+Mapped types transform properties, but they can't *decide* things: "if this property is a function, do X, otherwise Y". And you still don't know how `ReturnType` pulls a type out of a function, or how `Exclude` filters a union. The tool for that is the type-level ternary in [Chapter 23: Conditional Types and `infer`](/chapter/23).
+

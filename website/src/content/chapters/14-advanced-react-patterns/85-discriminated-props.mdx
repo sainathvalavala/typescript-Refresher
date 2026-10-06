@@ -1,0 +1,348 @@
+> 📖 **The problem.** TaskFlow's `Button` started simple. Then someone needed it to navigate, so it gained `href`. Then forms needed `type="submit"`. Then a teammate passed `href`, `onClick`, *and* `type="submit"` to the same button in the project settings page. Does it navigate, run the handler, or submit the form? Nobody knows without reading the implementation, and the implementation has a comment that says `// if both href and onClick, href wins (I think)`. Every prop is optional, so the type happily accepts all of it.
+
+The props type said "any of these, in any combination", but the component only works for a few specific combinations. This chapter teaches you to write props types that describe **exactly the valid configurations**, so that impossible combinations stop compiling. By the end, you'll be able to spot props that depend on each other, model them as discriminated unions or mutually exclusive props, write a reusable `XOR` helper, type controlled and uncontrolled components correctly, and know which destructuring patterns keep narrowing working. You'll also know when the right answer is two components instead of one clever type.
+
+> 🧠 **Mental model.** When props depend on each other, the props type is a **union of valid configurations**, one member per way the component can legitimately be used. Inside each configuration, `never` marks the props that are **forbidden** there.
+
+## 85.1 Props that depend on each other
+
+A props type built from independent optional fields claims that every combination is meaningful. When that's false, the component's body is where you find out:
+
+```tsx
+type ButtonProps = {
+  children: ReactNode;
+  href?: string;          // only for links
+  external?: boolean;     // only meaningful with href
+  onClick?: () => void;   // only for action buttons
+  type?: "button" | "submit";
+  disabled?: boolean;     // links can't really be disabled
+};
+
+function Button({ href, external, onClick, type = "button", disabled, children }: ButtonProps) {
+  if (href && onClick) console.warn("Button: href and onClick together; href wins");
+  if (href) return <a href={href} target={external ? "_blank" : undefined}>{children}</a>;
+  return <button type={type} onClick={onClick} disabled={disabled}>{children}</button>;
+}
+
+<Button href="/tasks" type="submit" onClick={save} disabled>Save</Button>; // ✅ compiles. What does it do?
+```
+
+Learn to recognize the smell. The signs are almost always the same:
+
+- **Comments** on props that say "only used when…" or "ignored if…".
+- **Runtime warnings** or `if` chains in the body that reject combinations.
+- **Optional props that come in pairs**: `external` makes no sense without `href`.
+- **Silent precedence rules**: "`href` wins". The caller can't see them, and they change when someone refactors.
+
+Each of those is information that belongs in the type. A runtime warning reaches the developer only if they happen to open the console on the right screen; a compile error reaches them the moment they type the wrong prop.
+
+## 85.2 Discriminated props
+
+The most explicit fix is a **discriminant**: one literal-typed prop, such as `kind`, that names the configuration. This is the same discriminated union you used for state in [Chapter 13](/chapter/13) and [Chapter 55](/chapter/55), applied to props. Each member lists exactly the props that configuration accepts:
+
+```tsx
+type ButtonProps =
+  | { kind: "link"; href: string; external?: boolean; children: ReactNode }
+  | { kind: "action"; onClick: () => void; disabled?: boolean; children: ReactNode }
+  | { kind: "submit"; form?: string; disabled?: boolean; children: ReactNode };
+```
+
+Inside the component, checking `kind` narrows `props` to one member, and an exhaustive `switch` means adding a fourth kind forces you to render it:
+
+```tsx
+function Button(props: ButtonProps) {
+  switch (props.kind) {
+    case "link":
+      return <a href={props.href} target={props.external ? "_blank" : undefined}>{props.children}</a>;
+    case "action":
+      return <button type="button" onClick={props.onClick} disabled={props.disabled}>{props.children}</button>;
+    case "submit":
+      return <button type="submit" form={props.form} disabled={props.disabled}>{props.children}</button>;
+  }
+}
+```
+
+At the call site, the discriminant tells TypeScript which member to check against, so both missing and extra props are caught, with messages that name the right configuration:
+
+```tsx
+<Button kind="link" href="/tasks">Tasks</Button>;          // ✅
+<Button kind="action" onClick={archive}>Archive</Button>;  // ✅
+
+<Button kind="link" onClick={archive}>Tasks</Button>;
+// ❌ Property 'onClick' does not exist on type 'IntrinsicAttributes & { kind: "link"; href: string; external?: boolean | undefined; children: ReactNode; }'.
+
+<Button kind="action" onClick={archive} href="/x">Archive</Button>;
+// ❌ Property 'href' does not exist on type 'IntrinsicAttributes & { kind: "action"; onClick: () => void; disabled?: boolean | undefined; children: ReactNode; }'.
+```
+
+> 💡 **Tip.** Name the discriminant after what the caller is choosing (`kind`, `variant`, `mode`), and keep its values short literals. The discriminant shows up in every call site, so it's part of your public API.
+
+## 85.3 Mutually exclusive props
+
+Sometimes an explicit `kind` prop feels like ceremony. The caller's intent is already clear from which prop they passed: `href` means a link, `onClick` means an action. You can model that as a union *without* a discriminant, but there's a trap:
+
+```tsx
+type ClickableProps = { href: string } | { onClick: () => void };
+
+<Clickable href="/tasks" onClick={archive}>Tasks</Clickable>; // ✅ compiles?!
+```
+
+Why does this compile? For a union **without** a discriminant, TypeScript's excess-property check asks whether each prop exists in *some* member of the union. `onClick` exists in the second member, so it isn't "excess", and the object is assignable to the first member, which only *requires* `href`. A union of object types means "at least one of these shapes", not "exactly one".
+
+To make the props **mutually exclusive**, each member must explicitly forbid the other member's props. That's what `?: never` does: the prop may be absent, but no value can be assigned to it.
+
+```tsx
+type ClickableProps =
+  | { href: string; onClick?: never }
+  | { onClick: () => void; href?: never };
+
+<Clickable href="/tasks">Tasks</Clickable>;            // ✅
+<Clickable onClick={archive}>Archive</Clickable>;      // ✅
+<Clickable href="/tasks" onClick={archive}>Tasks</Clickable>;
+// ❌ Types of property 'onClick' are incompatible. Type '() => void' is not assignable to type 'undefined'.
+<Clickable>Nothing</Clickable>;
+// ❌ Property 'onClick' is missing in type '{ children: string; }' but required in type '{ onClick: () => void; href?: undefined; }'.
+```
+
+Because the forbidden prop has type `undefined` in the other member, checking for it is a valid way to narrow, with no `kind` prop needed:
+
+```tsx
+function Clickable(props: ClickableProps & { children: ReactNode }) {
+  if (props.href !== undefined) {
+    return <a href={props.href}>{props.children}</a>;      // props.href: string
+  }
+  return <button type="button" onClick={props.onClick}>{props.children}</button>; // props.onClick: () => void
+}
+```
+
+> 🧠 **Mental model.** `prop?: never` reads as "this configuration has no such prop". It's the type-level version of a sign that says *not here*.
+
+## 85.4 XOR helper types
+
+Writing `?: never` by hand for every prop of the other configuration gets tedious fast, and it's easy to forget one when a configuration grows. A small helper can generate the forbidden props for you. First, `Without<T, U>` makes every key that's in `T` but not in `U` optional and `never`:
+
+```tsx
+type Without<T, U> = { [K in Exclude<keyof T, keyof U>]?: never };
+
+type NoLinkProps = Without<{ href: string; external?: boolean }, { onClick: () => void }>;
+// { href?: never; external?: never }
+```
+
+Then `XOR<T, U>` is "all of `T` and none of `U`'s extra keys, or all of `U` and none of `T`'s":
+
+```tsx
+type XOR<T, U> = (T & Without<U, T>) | (U & Without<T, U>);
+
+type LinkProps = { href: string; external?: boolean };
+type ActionProps = { onClick: () => void };
+
+type ClickableProps = XOR<LinkProps, ActionProps> & { children: ReactNode };
+
+<Clickable href="/tasks" external>Docs</Clickable>;      // ✅
+<Clickable external onClick={archive}>Archive</Clickable>;
+// ❌ Types of property 'onClick' are incompatible. Type '() => void' is not assignable to type 'undefined'.
+```
+
+The helper pays off once you have the same "this or that, never both" shape in several places:
+
+```tsx
+type AvatarProps = XOR<{ src: string; alt: string }, { initials: string }>;
+type TaskLinkProps = XOR<{ taskId: string }, { task: Task }>;
+type DateRangeProps = XOR<{ start: Date; end: Date }, { preset: "today" | "thisWeek" }>;
+```
+
+Two honest limits. First, `XOR` handles exactly two configurations; three-way exclusivity needs nesting or a more general helper, and the types get hard to read. Second, hovering over an `XOR` type shows intersections and mapped types instead of the friendly object you'd write by hand. For one component, hand-written `?: never` is often clearer. For a design system with a dozen such components, the helper keeps them consistent.
+
+> 🌍 **Real world.** Packages such as `ts-xor` and `type-fest` (`MergeExclusive`) ship this exact helper, because it comes up so often in component libraries.
+
+## 85.5 Controlled vs uncontrolled props
+
+You met controlled and uncontrolled components in [Chapter 84](/chapter/84). Their props are a textbook case of dependent props: `value` is useless without `onValueChange` (the parent would never learn about changes, so clicks would do nothing), and `defaultValue` is meaningless alongside `value` (the component would ignore it). Here are the two valid configurations for TaskFlow's `PriorityPicker`:
+
+```tsx
+type Priority = 1 | 2 | 3;
+
+type PriorityPickerProps =
+  | { value: Priority; onValueChange: (p: Priority) => void; defaultValue?: never }   // controlled
+  | { value?: never; defaultValue?: Priority; onValueChange?: (p: Priority) => void }; // uncontrolled
+```
+
+In the controlled configuration, `onValueChange` is **required**. In the uncontrolled one, it's an optional notification. The implementation picks its source of truth based on whether `value` was passed:
+
+```tsx
+function PriorityPicker(props: PriorityPickerProps) {
+  const [internal, setInternal] = useState<Priority>(props.defaultValue ?? 2);
+  const isControlled = props.value !== undefined;
+  const value = isControlled ? props.value : internal;
+
+  function select(p: Priority) {
+    if (!isControlled) setInternal(p);
+    props.onValueChange?.(p);
+  }
+
+  return (
+    <div role="radiogroup" aria-label="Priority">
+      {([1, 2, 3] as const).map((p) => (
+        <button key={p} role="radio" aria-checked={p === value} onClick={() => select(p)}>
+          P{p}
+        </button>
+      ))}
+    </div>
+  );
+}
+```
+
+The call sites now reject the two classic bugs:
+
+```tsx
+<PriorityPicker defaultValue={1} />;                                   // ✅ uncontrolled
+<PriorityPicker value={priority} onValueChange={setPriority} />;       // ✅ controlled
+
+<PriorityPicker value={priority} />;
+// ❌ Property 'onValueChange' is missing in type '{ value: Priority; }' but required in type '{ value: Priority; onValueChange: (p: Priority) => void; defaultValue?: undefined; }'.
+
+<PriorityPicker value={priority} onValueChange={setPriority} defaultValue={1} />;
+// ❌ Type 'number' is not assignable to type 'Priority | undefined'.
+```
+
+Notice the last message. The real problem is that `defaultValue` is forbidden when `value` is passed, but TypeScript reports a confusing mismatch from its attempt to match the other member. When no union member fits, the error describes the member TypeScript tried last, not the one you meant. This is the main cost of union props, and the reason to keep the configurations few and their names obvious.
+
+> 🔗 **Connection.** The native `input` element has the same rule at runtime: React warns when you pass `value` without `onChange`. Your types catch it at compile time instead.
+
+## 85.6 Narrowing destructured props
+
+Most React code destructures props in the parameter list. Since TypeScript 4.6, narrowing works across destructured variables from a discriminated union: checking one destructured variable narrows its siblings, as long as none of them can be reassigned.
+
+```tsx
+type ButtonProps =
+  | { kind: "link"; href: string; onClick?: never }
+  | { kind: "action"; onClick: () => void; href?: never };
+
+function Button({ kind, href, onClick }: ButtonProps) {
+  if (kind === "link") {
+    return <a href={href}>Open</a>;          // ✅ href: string
+  }
+  return <button onClick={onClick}>Run</button>; // ✅ onClick: () => void
+}
+```
+
+Checking the forbidden prop works too (`if (href !== undefined)` narrows `onClick`), and so does destructuring only the discriminant and then reading `props`. A few common patterns, however, quietly lose the connection between the variables:
+
+```tsx
+function A(props: ButtonProps) {
+  const { kind, ...rest } = props;
+  if (kind === "link") rest.href; // ❌ rest.href: string | undefined. Rest objects are not narrowed.
+}
+
+function B(props: ButtonProps) {
+  let { kind, href } = props;     // `let` instead of `const`
+  if (kind === "link") href;      // ❌ href: string | undefined
+}
+
+function C({ kind, href }: ButtonProps) {
+  if (kind === "link") href;      // ❌ href: string | undefined…
+  kind = "action";                // …because a destructured parameter is reassigned somewhere
+}
+```
+
+The rule behind all three: TypeScript can only correlate variables that it knows still hold the values they were destructured from. A `let`, a reassignment, or a rest object breaks that guarantee. When you need a rest object to spread onto an element (a very common pattern for passing native props through), narrow **`props` first**, then destructure inside each branch:
+
+```tsx
+function Button(props: ButtonProps & { className?: string }) {
+  if (props.kind === "link") {
+    const { kind, ...linkProps } = props;   // linkProps is narrowed: href is string
+    return <a {...linkProps} />;
+  }
+  const { kind, ...buttonProps } = props;
+  return <button type="button" {...buttonProps} />;
+}
+```
+
+## 85.7 ✅ Useful / 🚫 Unnecessary
+
+A union of configurations is a powerful tool, and an easy one to overuse. Every member you add makes the props type harder to read, the hover tooltip longer, and the error messages vaguer (you saw that in 85.5). At some point, a component with five configurations is really five components sharing a stylesheet.
+
+> ✅ **When is this useful?** The configurations are **variations of one thing**: they share most of their props, their markup, and their behavior. Controlled vs uncontrolled. A link-or-action `Clickable` that renders the same visual element. An `Alert` whose `onDismiss` is required only when it's dismissible. A component whose callers really do switch between configurations with one prop.
+
+> 🚫 **When is this unnecessary complexity?** The configurations share almost **nothing** but styles. The component body is a big `switch` where each branch renders entirely different markup. Callers never switch between configurations at runtime. In those cases, separate components (`LinkButton`, `ActionButton`, `SubmitButton`) are simpler to type, to read, and to document, and the error messages name the component the caller actually used.
+
+Here's what "two components" looks like. Shared styling moves into a function, and each component has a small, non-union props type:
+
+```tsx
+const buttonClass = (tone: "primary" | "neutral" = "neutral") => `btn btn--${tone}`;
+
+function LinkButton({ href, tone, children }: { href: string; tone?: "primary" | "neutral"; children: ReactNode }) {
+  return <a href={href} className={buttonClass(tone)}>{children}</a>;
+}
+
+function ActionButton({ onClick, tone, children }: { onClick: () => void; tone?: "primary" | "neutral"; children: ReactNode }) {
+  return <button type="button" onClick={onClick} className={buttonClass(tone)}>{children}</button>;
+}
+
+<LinkButton href="/tasks">Tasks</LinkButton>;   // the name says what it is
+<ActionButton onClick={archive}>Archive</ActionButton>;
+```
+
+A useful test: if you'd describe the component to a teammate as "it's an X, *or* it's a Y, *or* it's a Z", you probably have three components.
+
+## Common mistakes
+
+> ⚠️ **A union of shapes without `?: never`.** `{ href: string } | { onClick: () => void }` still accepts both props at once. Without a discriminant, each member must forbid the other member's props.
+
+> ⚠️ **Optional discriminants.** `kind?: "link" | "action"` means "no kind" is also valid, and narrowing on `kind` no longer covers every case. Make the discriminant required, or give the default configuration its own member.
+
+> ⚠️ **Destructuring into a rest object before narrowing.** `const { kind, ...rest } = props` gives you an un-narrowed `rest`. Narrow `props` first, then destructure inside each branch.
+
+> ⚠️ **Putting the controlled callback in the wrong place.** If `onChange` is optional in the controlled configuration, `value` without `onChange` compiles and the component freezes. Make it required there.
+
+> ⚠️ **One mega-union for a mega-component.** Five configurations in one props type usually means five components. Union props are for variations, not for unrelated things that look alike.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** props genuinely depend on each other within *one* component: required-together pairs (`dismissible` and `onDismiss`), exclusive alternatives (`href` or `onClick`), and controlled vs uncontrolled state. Prefer an explicit discriminant when there are three or more configurations, and `?: never` or `XOR` when the intent is clear from which prop is present.
+
+> 🚫 **When not to.** Props that are truly independent should stay independent optionals. Configurations that render unrelated markup should be separate components. And a type so clever that its error messages confuse callers has stopped doing its job.
+
+## How it connects
+
+> 🔗 **Connection.** Discriminated props are discriminated unions ([Chapter 13](/chapter/13)) applied to component APIs, with narrowing from [Chapter 14](/chapter/14). `XOR` uses mapped types and `Exclude` ([Chapter 21](/chapter/21), [Chapter 22](/chapter/22)). Props design in general started in [Chapter 50](/chapter/50), and controlled/uncontrolled state appeared in [Chapter 84](/chapter/84). [Chapter 86](/chapter/86) takes the "link or button" problem further: one component whose *rendered element* is chosen by the caller.
+
+> 🌍 **Real world.** Radix UI and React Aria type nearly every stateful component as controlled-or-uncontrolled (`value`/`defaultValue`/`onValueChange`, `open`/`defaultOpen`/`onOpenChange`). Many design systems keep link buttons and action buttons as separate components for exactly the reasons in 85.7.
+
+## Exercises
+
+### Level 1 — Recall
+
+Type an `Alert` component for TaskFlow notifications. It always takes `tone` (`"info" | "success" | "error"`) and `children`. When `dismissible` is `true`, `onDismiss` is **required**; when `dismissible` is `false` or omitted, passing `onDismiss` is an error. Write four call sites: two valid, and two marked `// @ts-expect-error` that your type rejects.
+
+### Level 2 — Application
+
+Type a `TextInput` that extends the native input props (`ComponentPropsWithoutRef<"input">`) and is **either** controlled (`value` plus a required `onValueChange: (value: string) => void`) **or** uncontrolled (`defaultValue`, optional `onValueChange`), never both. Remove the native `value`, `defaultValue`, and `onChange` props from the base so they can't sneak back in. Implement the component, and make sure it narrows correctly with the props destructured in the parameter list.
+
+### Level 3 — Challenge
+
+Write `XOR<A, B>` from memory, then use it for three different TaskFlow components (pick from an avatar, a task link, a date-range picker, or your own). Then generalize: write `OneOf<[A, B, C]>`, which accepts exactly one of N configurations, and use it for a component with three configurations. Compare the hover output and one error message of `OneOf` against a hand-written union with `?: never`.
+
+*Hint: for each member, forbid every key that appears in any other member but not in this one.*
+
+### Level 4 — Real-world
+
+**Ticket TF-420: Break up `ActionControl`.** TaskFlow has an `ActionControl` component with five configurations (link, button, submit, menu trigger, and file upload) in one 300-line union props type with a `mode` discriminant. Most call sites use one mode each, and nobody switches mode at runtime. Split it into separate components.
+
+- Each new component has a small, non-union props type (a controlled/uncontrolled union is fine where it's real).
+- Shared styling lives in one place, so the visual output is unchanged.
+- Every call site is migrated, and the PR description shows three call sites before and after.
+- The PR description includes one error message from the old union and the equivalent error from the new component.
+
+## Key takeaways
+
+- When some prop combinations are invalid, the props type should be a **union of valid configurations**.
+- A **discriminant** prop (`kind`) gives the clearest narrowing and the clearest error messages.
+- Without a discriminant, a union of shapes means "at least one"; add `?: never` (or `XOR`) to mean "exactly one".
+- Controlled props are a dependent pair: `value` requires its change callback and forbids `defaultValue`.
+- Destructuring keeps narrowing when the variables are `const` and never reassigned. Rest objects and `let` lose it, so narrow `props` before destructuring a rest.
+- Union props make error messages worse. When configurations share little, write separate components.
+
+## What comes next
+
+The two-components answer to "link or button" works until a design system needs the same styled `Button` rendered as an `a`, a `button`, a router `Link`, or a `label`, with each element's own props. Writing four copies again isn't the answer. [Chapter 86: Polymorphic Components & the asChild Pattern](/chapter/86) lets the caller choose the rendered element, and makes the props type follow that choice.

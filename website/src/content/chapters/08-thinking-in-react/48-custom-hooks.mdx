@@ -1,0 +1,380 @@
+> 📖 **The problem.** TaskFlow remembers the selected filter, the draft of a new task, the sidebar's collapsed state, and the user's sort order across page reloads. Four components each contain a copy of the same 15 lines: read `localStorage` in a state initializer, write it back in an effect. They started out identical. Now one forgets to handle corrupted JSON and crashes the app for a user whose storage got mangled. One writes on every keystroke. One uses a different key format. One forgot the `try`. Four copies, four slightly different bugs.
+
+Functions solve this for ordinary code: extract the repeated part, give it a name, fix bugs once. But this repeated code isn't ordinary. It calls `useState` and `useEffect`, and hooks can only be called from components or other hooks. **Custom hooks** are the answer: your own functions that use React's hooks, which let you extract and reuse stateful logic. By the end you'll be able to extract a hook from duplicated code, follow the naming rule and know why it exists, explain precisely what a hook shares and doesn't, and design a hook's interface.
+
+> 🧠 **Mental model.** *A custom hook is a function that uses hooks, so it gets its own state slots in each component that calls it. Hooks share **logic**, not **state**.* Calling `useToggle()` in two components gives you two independent toggles, just as calling `useState()` twice gives you two independent states.
+
+## 48.1 Extracting a custom hook
+
+Start with the duplication, and extract in three mechanical steps. Here's one of the four copies:
+
+```tsx
+function FilterTabs() {
+  const [filter, setFilter] = useState<Filter>(() => {
+    try {
+      const raw = localStorage.getItem("taskflow:filter");
+      return raw === null ? "all" : (JSON.parse(raw) as Filter);
+    } catch {
+      return "all";
+    }
+  });
+
+  useEffect(() => {
+    localStorage.setItem("taskflow:filter", JSON.stringify(filter));
+  }, [filter]);
+
+  /* … render tabs … */
+}
+```
+
+**Step 1:** identify the part that isn't about filters: everything about reading and writing storage. **Step 2:** cut it into a function whose name starts with `use`, replacing the specifics (key, initial value) with parameters. **Step 3:** return whatever the component needs.
+
+```tsx
+// hooks/useLocalStorage.ts
+import { useEffect, useState } from "react";
+
+export function useLocalStorage<T>(key: string, initial: T) {
+  const [value, setValue] = useState<T>(() => {
+    try {
+      const raw = localStorage.getItem(key);
+      return raw === null ? initial : (JSON.parse(raw) as T);
+    } catch {
+      return initial;
+    }
+  });
+
+  useEffect(() => {
+    localStorage.setItem(key, JSON.stringify(value));
+  }, [key, value]);
+
+  return [value, setValue] as const;
+}
+```
+
+The component shrinks to a single line, and it reads like `useState`, because it behaves like it:
+
+```tsx
+function FilterTabs() {
+  const [filter, setFilter] = useLocalStorage<Filter>("taskflow:filter", "all");
+  /* … render tabs … */
+}
+```
+
+Four copies become one. A bug fixed there is fixed everywhere. The `useState` and `useEffect` calls still happen *inside* the component's render, as part of its hook sequence ([Chapter 43](/chapter/43)). Extraction is only moving code between functions, not changing when or how it runs.
+
+> ⚠️ **Common mistake.** `useLocalStorage("tasks", [])` infers `T` as `never[]`, and then `setValue([task])` fails. Pass the type argument: `useLocalStorage<Task[]>("tasks", [])` ([Chapter 34](/chapter/34)).
+
+## 48.2 Naming and rules
+
+A custom hook must **start with `use`**, followed by a capital letter: `useLocalStorage`, `useToggle`, `useOnlineStatus`. The name isn't decoration. It's the signal that tells the tooling, and your teammates, that this function calls hooks.
+
+```tsx
+function useToggle(initial = false) { /* calls useState */ }    // ✅ a hook: may call hooks
+function formatTitle(t: Task) { /* no hooks */ }                // ✅ a plain function: must NOT call hooks
+function getFilter() { return useLocalStorage("f", "all"); }    // ❌ calls a hook but isn't named use…
+                                                                //    lint: React Hook "useLocalStorage" is called in function "getFilter"
+                                                                //    that is neither a React function component nor a custom React Hook function.
+```
+
+The rule behind it is the **rules of hooks** from [Chapter 43](/chapter/43): hooks must be called at the top level, in the same order on every render, and only from components or other hooks. The linter (`eslint-plugin-react-hooks`) checks those rules by name: a function starting with `use` is allowed to call hooks and is checked for conditional calls; a function without that prefix isn't.
+
+```tsx
+function useDebounced<T>(value: T, shouldDebounce: boolean) {
+  if (shouldDebounce) {
+    const [debounced] = useState(value);   // ❌ Hook "useState" is called conditionally.
+    return debounced;                       //    React Hooks must be called in the exact same order in every component render.
+  }
+  return value;
+}
+```
+
+Inside a custom hook you may call any hook, including other custom hooks, and use any logic you like, as long as the hooks are called unconditionally. The `use` prefix is also what lets the React Compiler ([Chapter 47](/chapter/47)) recognize them. Treat it as part of the hook's API, because it is.
+
+## 48.3 Logic, not state
+
+This is the idea most worth getting right. Two components calling the same custom hook do **not** share any state. Each call creates its own state slots, owned by the component that made the call:
+
+```tsx
+function useToggle(initial = false) {
+  const [on, setOn] = useState(initial);
+  const toggle = useCallback(() => setOn((v) => !v), []);
+  return [on, toggle] as const;
+}
+
+function SidebarToggle() {
+  const [open, toggleOpen] = useToggle();   // this component's own boolean
+  return <button onClick={toggleOpen}>{open ? "Hide" : "Show"} sidebar</button>;
+}
+
+function FiltersToggle() {
+  const [open, toggleOpen] = useToggle();   // a different boolean, completely independent
+  return <button onClick={toggleOpen}>{open ? "Hide" : "Show"} filters</button>;
+}
+```
+
+Click one and the other is unaffected. The hook is a **recipe** ("a boolean plus a function that flips it"), and each component bakes its own cake from it. That's exactly how calling `useState()` twice in one component gives two independent values.
+
+What if you *do* want shared state? That's a different tool, and the choice is about **where the state lives**, not about hooks ([Chapter 42](/chapter/42)):
+
+```tsx
+// Shared state: lift it to a common parent and pass it down, or put it in context (Chapter 46)
+function TaskApp() {
+  const [filter, setFilter] = useLocalStorage<Filter>("taskflow:filter", "all"); // ONE instance, owned here
+  return (
+    <>
+      <FilterTabs filter={filter} onChange={setFilter} />   {/* both children use the same value */}
+      <Counter filter={filter} />
+    </>
+  );
+}
+```
+
+A hook might *internally* use context or a store to share data (`useTheme` from [Chapter 46](/chapter/46) reads shared state through `useContext`), but the sharing comes from that mechanism, not from the hook function.
+
+> 🧠 **Mental model.** A custom hook is like a cookie cutter: the shape is shared, but each cookie is separate dough. State sharing needs a single lump of dough, which means one owner higher up.
+
+## 48.4 Designing a hook's interface
+
+A hook is an API, and the same design questions apply as for any function: what goes in, what comes out, and how surprising is it?
+
+**Inputs.** Take the minimum configuration, with sensible defaults. For several options, use an options object so call sites stay readable:
+
+```tsx
+useDebouncedValue(query, 300);                       // fine for one setting
+useAsync(fetchTasks, { retries: 3, immediate: false }); // an object when options multiply
+```
+
+**Outputs: tuple or object?** Both are common, with a clear rule of thumb. A **tuple** (array) suits a small, ordered pair where callers rename freely, like `useState`. An **object** suits three or more values, or when names should be fixed:
+
+```tsx
+// Tuple: callers choose the names
+const [filter, setFilter] = useLocalStorage<Filter>("f", "all");
+const [sidebarOpen, toggleSidebar] = useToggle();
+
+// Object: callers pick what they need, in any order, and names are self-documenting
+const { data, error, isLoading, refetch } = useTasks(projectId);
+```
+
+Because TypeScript widens array literals, the tuple return needs `as const` (or an explicit tuple return type), or callers would get `(boolean | (() => void))[]`:
+
+```tsx
+function useToggle(initial = false) {
+  const [on, setOn] = useState(initial);
+  const toggle = useCallback(() => setOn((v) => !v), []);
+  return [on, toggle] as const;     // readonly [boolean, () => void]
+  // return [on, toggle];           // ❌ would infer (boolean | (() => void))[]: destructuring gets a union
+}
+```
+
+**Stability.** If the hook returns functions, keep them stable with `useCallback` when callers might pass them to memoized children or effect dependencies ([Chapter 47](/chapter/47)). **Keep it focused.** A hook that returns eleven values and takes seven options is a component in disguise. Deep generic typing of hooks (conditional return types, overloads) is the topic of [Chapter 56](/chapter/56); for now, simple tuples and objects are plenty.
+
+## 48.5 Common custom hooks
+
+A handful of small hooks show up in nearly every codebase. Each is a short recipe, and together they cover the patterns you'll copy. **`useToggle`** you've seen. **`useDebouncedValue`** delays a fast-changing value, which is perfect for search-as-you-type, so you query only after the user pauses:
+
+```tsx
+export function useDebouncedValue<T>(value: T, delayMs = 300): T {
+  const [debounced, setDebounced] = useState(value);
+
+  useEffect(() => {
+    const id = setTimeout(() => setDebounced(value), delayMs);
+    return () => clearTimeout(id);          // cancel the pending update if value changes again
+  }, [value, delayMs]);
+
+  return debounced;
+}
+
+function TaskSearch() {
+  const [query, setQuery] = useState("");
+  const debouncedQuery = useDebouncedValue(query, 300);   // updates 300ms after typing stops
+  const results = useTaskSearch(debouncedQuery);          // the expensive part uses the settled value
+  /* … */
+}
+```
+
+The generic `T` appears in the parameter and the return type ([Chapter 16](/chapter/16)'s "earns its place twice"), so `useDebouncedValue("abc")` returns a `string`, and `useDebouncedValue(filter)` returns a `Filter`.
+
+**`useLocalStorage`** from 48.1 has a weakness the Level 3 exercise asks you to fix: it trusts the stored JSON with `as T`. That's the boundary lie from [Chapter 32](/chapter/32): storage can hold old versions, edits, or garbage. A more honest version takes a **validator** and falls back when the stored value isn't valid:
+
+```tsx
+export function useLocalStorage<T>(key: string, initial: T, isValid: (v: unknown) => v is T) {
+  const [value, setValue] = useState<T>(() => {
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw === null) return initial;
+      const parsed: unknown = JSON.parse(raw);   // unknown, never `as T`
+      return isValid(parsed) ? parsed : initial;
+    } catch {
+      return initial;                              // corrupted JSON must not crash the app
+    }
+  });
+  /* … write back in an effect, as before … */
+  return [value, setValue] as const;
+}
+```
+
+**`useMediaQuery`** and **`useOnlineStatus`** read from the browser, which is a source of change *outside* React. React has a hook for subscribing to such sources correctly, **`useSyncExternalStore`**: you give it a `subscribe` function, a way to read the current value, and a server fallback.
+
+```tsx
+export function useOnlineStatus(): boolean {
+  return useSyncExternalStore(
+    (notify) => {
+      window.addEventListener("online", notify);
+      window.addEventListener("offline", notify);
+      return () => {
+        window.removeEventListener("online", notify);
+        window.removeEventListener("offline", notify);
+      };
+    },
+    () => navigator.onLine,   // the current value, read on each render
+    () => true,               // value to assume during server rendering
+  );
+}
+
+export function useMediaQuery(query: string): boolean {
+  return useSyncExternalStore(
+    (notify) => {
+      const mql = window.matchMedia(query);
+      mql.addEventListener("change", notify);
+      return () => mql.removeEventListener("change", notify);
+    },
+    () => window.matchMedia(query).matches,
+    () => false,
+  );
+}
+
+function Banner() {
+  const online = useOnlineStatus();
+  const isMobile = useMediaQuery("(max-width: 640px)");
+  return online ? null : <p>You're offline. Changes will sync later.</p>;
+}
+```
+
+Components using these hooks read like plain values, with the subscription detail hidden. When the network drops, the banner appears, and nothing in `Banner` mentions an event listener.
+
+## 48.6 When not to make a hook
+
+A custom hook is an abstraction, and abstractions cost something. Don't extract until you have a *reason*:
+
+**Premature extraction.** One use, no duplication, and no complexity worth hiding? Leave it inline. Wait for the second or third copy (the rule of three from [Chapter 16](/chapter/16)), when you can see what the real variation is.
+
+**Hooks that hide simple code.** A hook that wraps a single `useState` adds an indirection without adding meaning:
+
+```tsx
+// ❌ Adds a name and a file, saves nothing
+function useQuery() {
+  return useState("");
+}
+const [query, setQuery] = useQuery();
+
+// ✅ Just write it
+const [query, setQuery] = useState("");
+```
+
+**A hook that is really a component.** If the logic returns JSX, or most of its job is rendering, it should be a component. Hooks are for logic; components are for UI.
+
+**A hook where a plain function will do.** If there is no state, no effect, and no context, it doesn't need hooks at all, so write an ordinary function:
+
+```tsx
+// ❌ useFormattedDate calls no hooks, so it shouldn't pretend to be one
+function useFormattedDate(date: Date) {
+  return date.toLocaleDateString();
+}
+
+// ✅ A plain function is simpler, testable anywhere, and callable in loops and callbacks
+function formatDate(date: Date) {
+  return date.toLocaleDateString();
+}
+```
+
+A useful test: *would I be able to explain what this hook does in one sentence, without mentioning how?* "Persists a value in localStorage" is a good hook. "Does some stuff for the TaskCard" isn't.
+
+> 🚫 **When not to.** Don't extract a hook just to make a long component shorter. Splitting by *what it does* (a coherent behavior) beats splitting by *line count*. A 100-line component with one clear job is better than five two-line hooks you have to chase through.
+
+## 48.7 Testing hooks (preview)
+
+One quiet benefit of extraction: logic in a hook can be tested **without rendering any UI**. A hook is just a function that React runs, so a test can run it in a minimal host component and assert on what it returns.
+
+```tsx
+import { renderHook, act } from "@testing-library/react";
+import { expect, test } from "vitest";
+
+test("useToggle flips and starts false by default", () => {
+  const { result } = renderHook(() => useToggle());
+
+  expect(result.current[0]).toBe(false);
+
+  act(() => result.current[1]());          // call toggle inside act(), so React applies the update
+  expect(result.current[0]).toBe(true);
+});
+```
+
+Compare that with testing the same behavior through a component: you'd need markup, a button, a click simulation, and a text assertion. The hook test checks the *logic* directly, which is faster and more precise. A hook with a timer (like `useDebouncedValue`) can be tested with fake timers; a hook that reads storage with a stubbed `localStorage`.
+
+This is also a design check. If a hook is *hard* to test, it often does too much, or reaches for globals it should have received as arguments. [Chapter 67](/chapter/67) covers testing logic, reducers, and hooks properly.
+
+## Common mistakes
+
+> ⚠️ **Extracting too early.** One use and no duplication means no hook yet. Wait for the second copy.
+
+> ⚠️ **A hook that calls no hooks.** If nothing inside uses state, effects, or context, it's a plain function. Naming it `use…` just adds lint restrictions.
+
+> ⚠️ **Expecting hooks to share state.** Two components calling `useToggle()` each get their own. To share, lift the state or use context.
+
+> ⚠️ **Trusting stored data with `as T`.** `useLocalStorage` should validate what it reads, because storage is a boundary ([Chapter 32](/chapter/32)).
+
+> ⚠️ **Returning an array without `as const`.** TypeScript infers a union array, and destructuring loses the specific types.
+
+> ⚠️ **Calling hooks conditionally inside a hook.** The rules of hooks apply inside custom hooks too.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** the same stateful or effect-based logic appears in two or more components, when a component mixes UI with a self-contained behavior (subscriptions, timers, storage), or when you want to test logic without rendering.
+
+> 🚫 **When not to.** For one-off logic, for code without state or effects (use a plain function), and for anything whose main job is to render. A hook is not a way to shorten a component.
+
+## How it connects
+
+> 🔗 **Connection.** Hooks and their rules are from [Chapter 43](/chapter/43), effect cleanup from [Chapter 44](/chapter/44), and stable function identity from [Chapter 47](/chapter/47). The generic `useDebouncedValue<T>` uses [Chapter 16](/chapter/16), and the storage validation is [Chapter 32](/chapter/32) at work again. Typing hook return values and overloads is the subject of [Chapter 56](/chapter/56), testing them is [Chapter 67](/chapter/67), and real applications grow a `hooks/` folder, as in [Chapter 58](/chapter/58).
+
+## Exercises
+
+### Level 1 — Recall
+
+Identify logic that could become a hook in each snippet, and name it: **(A)** a component that adds a `resize` listener in an effect and stores `window.innerWidth` in state, **(B)** a component that tracks `hovered` with `onMouseEnter` and `onMouseLeave`, **(C)** a component that formats a date string with `toLocaleDateString` before rendering.
+
+*One of the three should NOT become a hook; say which and why.*
+
+### Level 2 — Application
+
+Write two hooks. `useToggle(initial = false)` returns `[value, toggle]`, typed with `as const`. `useDebouncedValue<T>(value: T, delayMs = 300): T` returns a value that follows `value` after the delay. Use both in a TaskFlow search bar with a collapsible filter panel, and confirm that two `useToggle` calls in the same component are independent.
+
+### Level 3 — Challenge
+
+Write `useLocalStorage<T>(key, initial, isValid)` that handles **invalid stored JSON safely**: it must survive an unparseable string, a stored value that fails `isValid`, and a `localStorage` that throws (private mode, quota exceeded). Add a test with `renderHook` for each of the three cases.
+
+*Hint: the value in storage is `unknown` until `isValid` says otherwise.*
+
+### Level 4 — Real-world
+
+**Ticket TF-470: Extract TaskFlow's filtering and shortcut logic.** `TaskBoard` has grown to 300 lines, with filtering, searching, and keyboard shortcuts mixed in with rendering.
+
+- Extract `useTaskFilters(tasks)`, which owns the filter, query, and derived visible list, and returns an object.
+- Extract `useKeyboardShortcut(key, handler)`, which adds and removes a `keydown` listener correctly (no stale handlers, no leaks).
+- `TaskBoard` shrinks to mostly JSX, with no behavior changes.
+- Each hook has at least one test that runs without rendering the whole board.
+
+## Key takeaways
+
+- A custom hook is a function that calls other hooks, used to **extract and reuse stateful logic**. Four copies of a bug become one fix.
+- Name it `use…`. The prefix lets the linter and the Compiler know it follows the rules of hooks.
+- Hooks share **logic**, not **state**. Each call gets its own state slots, and shared state needs lifting or context.
+- Design the interface like any API: minimal inputs, tuple for a small pair (with `as const`), object for three or more values.
+- Common hooks: `useToggle`, `useDebouncedValue`, `useLocalStorage` (validate what you read), `useMediaQuery` and `useOnlineStatus` (via `useSyncExternalStore`).
+- Don't extract early, and don't make a hook out of code without state or effects.
+- Hooks can be tested without UI, which makes them a useful design check.
+
+## What comes next
+
+That completes [Part VIII](/part/viii). You can now think in state, share data through the tree, tame re-renders, and package logic into reusable hooks, all with simple types. But the types have been deliberately light. What *exactly* is the type of an event handler, a ref, a reducer, a context with a `null` default, or a hook that returns a tuple? [Part IX](/part/ix) opens with [Chapter 49: How TypeScript Sees React](/chapter/49), and then types each of these precisely.
+

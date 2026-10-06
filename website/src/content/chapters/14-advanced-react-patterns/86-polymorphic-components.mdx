@@ -1,0 +1,301 @@
+> 📖 **The problem.** TaskFlow's UI package has `Button`, `LinkButton`, `RouterLinkButton`, and `SubmitButton`. They look identical: same padding, same tones, same focus ring. Each one is a separate file with its own copy of the class list. When the design team changed the focus ring last quarter, three of the four got updated. Then someone needed a button-styled `label` for a file input, and a fifth copy appeared.
+
+The visual design is one thing; the rendered **element** is another. A button-styled link must still be an `a` (so it navigates, opens in a new tab, and is announced as a link), and a button-styled label must still be a `label`. This chapter shows two ways to separate "how it looks" from "what element it is". The first is the **polymorphic** `as` prop, where the caller names the element and the props type follows. The second is the **`asChild` (slot)** pattern, where the caller *passes* the element and the component merges its props onto it. By the end, you'll be able to type both, put refs on them correctly, and explain why `asChild` usually leads to much simpler types.
+
+> 🧠 **Mental model.** A polymorphic component lets the **caller choose the rendered element**, and its props type follows that choice: `as="a"` allows `href`, `as="button"` allows `type`. The `asChild` pattern avoids most of that type complexity through **composition**: the caller renders the element, and the component only adds behavior and styles to it.
+
+## 86.1 The problem
+
+Here are two of the four copies. The only real difference between them is the element at the bottom:
+
+```tsx
+type Tone = "neutral" | "primary" | "danger";
+
+function Button({ tone = "neutral", className, ...props }: ComponentProps<"button"> & { tone?: Tone }) {
+  return <button className={cx("btn", `btn--${tone}`, className)} {...props} />;
+}
+
+function LinkButton({ tone = "neutral", className, ...props }: ComponentProps<"a"> & { tone?: Tone }) {
+  return <a className={cx("btn", `btn--${tone}`, className)} {...props} />;
+}
+
+// RouterLinkButton: the same again, rendering <Link>.
+// SubmitButton: the same again, with type="submit".
+```
+
+Each copy exists for a good reason: you can't make a router `Link` out of a `button` with a click handler without breaking middle-click, "open in new tab", and the link role for screen readers. Using the right element matters. What we want is to write the styling **once** and still let each call site render the right element with that element's own props, fully typed.
+
+> 🔗 **Connection.** [Chapter 85](/chapter/85) solved a smaller version with separate components and a shared `buttonClass` function. That remains a perfectly good answer for two or three elements. This chapter is for design-system primitives that need to render as *anything*.
+
+## 86.2 The `as` prop
+
+The polymorphic idea is simple: accept a prop, conventionally called `as`, that holds the element to render. React's `ElementType` describes everything that can appear as a JSX tag: an intrinsic element name such as `"a"` or `"section"`, or a component. Inside the component, you assign it to a capitalized variable and render it:
+
+```tsx
+type NaiveBoxProps = { as?: ElementType; className?: string; children?: ReactNode };
+
+function NaiveBox({ as: Component = "div", ...rest }: NaiveBoxProps) {
+  return <Component {...rest} />;
+}
+
+<NaiveBox as="section">Project overview</NaiveBox>; // ✅ renders a <section>
+<NaiveBox as="a" href="/tasks">Tasks</NaiveBox>;
+// ❌ Property 'href' does not exist on type 'IntrinsicAttributes & NaiveBoxProps'.
+```
+
+The rendering works, but the props type doesn't follow the choice: it has no idea that `as="a"` should allow `href`. Before reaching for the full solution, notice that many components only need a **small, fixed set** of elements. A restricted union of element names is much simpler and is often all you need:
+
+```tsx
+type StackProps = {
+  as?: "div" | "ul" | "ol" | "section";
+  gap?: 1 | 2 | 4;
+  children: ReactNode;
+};
+
+function Stack({ as: Component = "div", gap = 2, children }: StackProps) {
+  return <Component className={`stack stack--gap-${gap}`}>{children}</Component>;
+}
+
+<Stack as="ul" gap={4}>{taskItems}</Stack>; // ✅
+<Stack as="table">…</Stack>;                 // ❌ Type '"table"' is not assignable to type '"div" | "ul" | "ol" | "section" | undefined'.
+```
+
+When the allowed elements share the props you accept (here, just `className` and `children`), a restricted union is the right tool. Full polymorphism is for when each element must bring **its own** props.
+
+## 86.3 Typing polymorphic props
+
+To make the props follow the element, the component must be **generic in the element type**. Call the type parameter `C`. The props then have three parts: your own props (`tone`), the `as` prop itself (of type `C`), and every prop of the chosen element, which `ComponentPropsWithoutRef<C>` computes. Your own props must win any name collision, so you `Omit` their keys from the element's props:
+
+```tsx
+type PolymorphicProps<C extends ElementType, Own = {}> = Own &
+  { as?: C } &
+  Omit<ComponentPropsWithoutRef<C>, keyof Own | "as">;
+```
+
+The component declares `C` with a default, so leaving out `as` means "a `div`, with `div` props":
+
+```tsx
+type BoxOwnProps = { tone?: Tone };
+
+function Box<C extends ElementType = "div">({
+  as,
+  tone = "neutral",
+  className,
+  ...rest
+}: PolymorphicProps<C, BoxOwnProps>) {
+  const Component = as ?? "div";
+  return <Component className={cx("box", `box--${tone}`, className)} {...rest} />;
+}
+```
+
+At each call site, TypeScript infers `C` from the `as` prop, exactly like it infers `T` from an argument, and then checks every other prop against that element:
+
+```tsx
+<Box>Default div</Box>;                                   // ✅ C = "div"
+<Box as="a" href="/tasks">Tasks</Box>;                    // ✅ C = "a", href allowed
+<Box as="button" onClick={(e) => e.currentTarget.form}>Save</Box>; // ✅ e.currentTarget: HTMLButtonElement
+<Box as={Link} to="/tasks">Tasks</Box>;                   // ✅ C = typeof Link, so its props apply
+
+<Box as="button" href="/tasks">Tasks</Box>;               // ❌ Property 'href' does not exist on type …
+<Box as={Link} href="/tasks">Tasks</Box>;                 // ❌ Property 'href' does not exist on type …
+<Box as="a" tone="loud" href="/x">x</Box>;                 // ❌ Type '"loud"' is not assignable to type 'Tone | undefined'.
+```
+
+The second-to-last line shows the payoff: a router `Link` takes `to`, not `href`, and the type knows that because it read `Link`'s own props.
+
+> 💡 **Tip.** Inside the body, TypeScript checks `<Component {...rest} />` loosely, because `C` is still unknown there. If your TypeScript version reports an error on that line, widen just the local variable with `const Component: ElementType = as ?? "div"`. The public props type stays fully strict, which is where the safety matters.
+
+## 86.4 Refs in polymorphic components
+
+A design-system primitive must accept a `ref`: focus management, popovers, and tooltips all need the DOM node. With polymorphism, the ref's type depends on the element. A `Box as="a"` holds an `HTMLAnchorElement`, and a `Box as="button"` holds an `HTMLButtonElement`. React's `ComponentRef<C>` computes exactly that: for an intrinsic element it's the DOM element type, and for a component it's whatever that component's `ref` prop points to.
+
+Since `ref` is a regular prop in React 19, you add it to the props type next to the others:
+
+```tsx
+type PolymorphicPropsWithRef<C extends ElementType, Own = {}> =
+  PolymorphicProps<C, Own> & { ref?: Ref<ComponentRef<C>> };
+
+function Box<C extends ElementType = "div">({ as, tone = "neutral", ...rest }: PolymorphicPropsWithRef<C, BoxOwnProps>) {
+  const Component = as ?? "div";
+  return <Component data-tone={tone} {...rest} />; // ref is part of rest and reaches the element
+}
+
+type AnchorRef = ComponentRef<"a">;        // HTMLAnchorElement
+type LinkRef = ComponentRef<typeof Link>;  // HTMLAnchorElement, read from Link's own ref prop
+```
+
+The ref now follows the element just like every other prop:
+
+```tsx
+const anchorRef = useRef<HTMLAnchorElement>(null);
+const divRef = useRef<HTMLDivElement>(null);
+
+<Box as="a" href="/tasks" ref={anchorRef}>Tasks</Box>;  // ✅
+<Box ref={divRef}>Panel</Box>;                          // ✅ default element is a div
+<Box as="button" ref={anchorRef}>Save</Box>;
+// ❌ Type 'RefObject<HTMLAnchorElement | null>' is not assignable to type 'Ref<HTMLButtonElement> | undefined'.
+```
+
+> 🕰 **Legacy note.** Before React 19, a polymorphic component needed `forwardRef`, which erased the `C` type parameter (see [Chapter 84](/chapter/84)). Libraries worked around it with large hand-written call-signature types and a cast. If you maintain such code, migrating to ref-as-prop deletes most of those types.
+
+## 86.5 The asChild / Slot pattern
+
+The `as` prop asks the caller to *name* an element and pass its props to *your* component. The **`asChild` pattern** flips this around: the caller renders the element themselves, as the only child, and your component merges its props onto that child. The child's props are checked where they're written, by the child's own type. Your component's type never has to compute them.
+
+```tsx
+<Button asChild tone="primary">
+  <Link to="/tasks/new">New task</Link>
+</Button>
+// Renders: <a href="/tasks/new" class="btn btn--primary">New task</a>
+```
+
+The piece that does the merging is usually called `Slot`. It takes exactly one child with `Children.only` (which throws if there are zero or several), checks that it's an element, and uses `cloneElement` to produce a copy with the merged props:
+
+```tsx
+type ElementProps = HTMLAttributes<HTMLElement> & { ref?: Ref<HTMLElement> };
+type SlotProps = ElementProps & { children?: ReactNode };
+
+function Slot({ children, ref, ...slotProps }: SlotProps) {
+  const child = Children.only(children);
+  if (!isValidElement<ElementProps>(child)) return null;
+  const childProps = child.props;
+
+  return cloneElement(child, {
+    ...slotProps,
+    ...childProps,                       // the child's own props win…
+    className: [slotProps.className, childProps.className].filter(Boolean).join(" "), // …except classes merge
+    style: { ...slotProps.style, ...childProps.style },                                 // …and styles merge
+    ref: ref ?? childProps.ref,
+  });
+}
+```
+
+With `Slot`, the `Button` itself has an ordinary, non-generic props type. It renders either a `button` or a `Slot`:
+
+```tsx
+type ButtonProps = ComponentPropsWithoutRef<"button"> & {
+  tone?: Tone;
+  asChild?: boolean;
+  ref?: Ref<HTMLButtonElement>;
+};
+
+function Button({ tone = "neutral", asChild = false, className, ...props }: ButtonProps) {
+  const classes = cx("btn", `btn--${tone}`, className);
+  if (asChild) return <Slot className={classes} {...props} />;
+  return <button type="button" className={classes} {...props} />;
+}
+
+<Button asChild><a href="/docs">Docs</a></Button>;              // ✅ checked as an <a>
+<Button asChild><Link href="/tasks/new">New task</Link></Button>;
+// ❌ Property 'href' does not exist on type 'IntrinsicAttributes & { to: string; … }'. Did you mean 'ref'?
+```
+
+Compare the error with the one from 86.3: it points at the `Link` line and mentions only `Link`'s props. That's the main reason `asChild` leads to simpler types. **There are no generics, no `Omit`, and no computed props**; each element checks its own props in the usual way.
+
+This simple `Slot` has honest gaps. The child's `onClick` *replaces* the `Button`'s instead of running both, and a ref passed to `Button` replaces any ref on the child instead of being merged with it. A production `Slot` composes every event handler and merges refs. The other trade-off is that `Button`'s props type still says "button props" even when it renders an `a`, so `<Button asChild type="submit">` compiles and puts a meaningless attribute on a link.
+
+> 🌍 **Real world.** Radix UI popularized `asChild` and ships `Slot` as its own package; shadcn/ui's `Button` is built on it. Their `Slot` composes handlers (the child's first, then the slot's) and merges refs, which is your Level 3 exercise.
+
+## 86.6 Costs
+
+Polymorphism isn't free, and the costs fall on everyone who uses the component, not only on its author. The first cost is **error-message quality**. Here is the full, real message for the `<Box as="button" href="/tasks">` mistake from 86.3:
+
+```tsx
+<Box as="button" href="/tasks">Tasks</Box>;
+// ❌ Type '{ as: "button"; href: string; children: string; }' is not assignable to type
+//    'IntrinsicAttributes & BoxOwnProps & { as?: "button" | undefined; } &
+//    Omit<Omit<DetailedHTMLProps<ButtonHTMLAttributes<HTMLButtonElement>, HTMLButtonElement>, "ref">, "as" | "tone">'.
+//    Property 'href' does not exist on type 'IntrinsicAttributes & BoxOwnProps & …'.
+```
+
+The useful part ("`href` does not exist") is buried under your library's internal type plumbing. Every app developer who misuses `Box` reads this.
+
+The second cost is **type-checking speed**. Each `<Box as=…>` instantiates the full props type of the chosen element (hundreds of properties for an HTML element), then `Omit` maps over all of them. One polymorphic primitive is fine. A design system where every component is polymorphic, nested inside other polymorphic components, can noticeably slow the editor and the build. You can measure instead of guessing:
+
+```sh
+npx tsc --noEmit --extendedDiagnostics   # compare "Instantiations" and "Check time" before and after
+npx tsc --noEmit --generateTrace trace   # then inspect with: npx @typescript/analyze-trace trace
+```
+
+The third cost is **cognitive**: readers must understand `ElementType`, `ComponentPropsWithoutRef`, `ComponentRef`, and `Omit` to change the component. [Chapter 95](/chapter/95) covers type-checking performance in depth.
+
+## 86.7 ✅ Useful / 🚫 Unnecessary
+
+> ✅ **When is this useful?** Low-level **design-system primitives** whose whole job is styling: `Box`, `Text`, `Stack`, `Button`, `Heading`. Components that must render as many different elements, including your router's `Link`, while keeping each element's own props typed. Prefer `asChild` for interactive components (buttons, menu triggers, tooltips), because it keeps types simple and lets the caller own the element; use `as` for layout and typography primitives where the element is just a tag name.
+
+> 🚫 **When is this unnecessary complexity?** **App-level components** such as `TaskCard`, `ProjectHeader`, or `InviteForm`. They have one job and one element. A component that only ever renders two or three elements: use a restricted union (86.2) or separate components. A polymorphic component used in two places is pure overhead: two plain components are shorter, faster to check, and give better errors.
+
+A quick comparison of the three options for the same requirement:
+
+```tsx
+// 1. Separate components: simplest types, some duplicated markup
+<LinkButton href="/docs">Docs</LinkButton>
+
+// 2. as prop: one component, generic props type, long error messages
+<Button as="a" href="/docs">Docs</Button>
+
+// 3. asChild: one component, plain props type, the child checks its own props
+<Button asChild><a href="/docs">Docs</a></Button>
+```
+
+## Common mistakes
+
+> ⚠️ **`as?: ElementType` with no generic.** The component renders the right element, but the props type ignores the choice, so `href` on `as="a"` fails and anything you pass through is unchecked. Make the component generic in `C`, or restrict `as` to a small union.
+
+> ⚠️ **Forgetting to `Omit` your own prop names.** Without `Omit<…, keyof Own>`, a prop such as `color` or `size` is intersected with the native attribute of the same name, and the result is often `never` or a confusing union.
+
+> ⚠️ **Typing the ref as `Ref<HTMLElement>` on a polymorphic component.** It accepts mismatched refs. Use `Ref<ComponentRef<C>>` so the ref follows the element.
+
+> ⚠️ **Passing several children to an `asChild` component.** `Children.only` throws at runtime. `asChild` means exactly one element child, and a text node isn't an element.
+
+> ⚠️ **Making app components polymorphic "for flexibility".** A `TaskCard as="li"` is usually better solved by the parent wrapping it in an `li`.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** you're building shared primitives that render as many elements, and each element's props must stay typed. Choose `asChild` for interactive components and `as` for layout and text primitives.
+
+> 🚫 **When not to.** One or two elements: separate components or a restricted `as` union. App components with a single purpose: no polymorphism at all. If the error messages are confusing your teammates, the abstraction is costing more than it saves.
+
+## How it connects
+
+> 🔗 **Connection.** Polymorphic types build on generic components ([Chapter 57](/chapter/57), [Chapter 84](/chapter/84)), `Omit` and intersections ([Chapter 21](/chapter/21)), and ref-as-prop ([Chapter 53](/chapter/53)). `cloneElement` and `ReactElement` were introduced in [Chapter 49](/chapter/49). The `asChild` idea of "the caller owns the markup" is a form of inversion of control, which [Chapter 88](/chapter/88) explores. [Chapter 89](/chapter/89) places polymorphism at the top of the complexity ladder, and [Chapter 95](/chapter/95) covers the type-checking cost.
+
+> 🌍 **Real world.** Chakra UI and MUI expose an `as` or `component` prop on their primitives. Radix UI, shadcn/ui, and Ark UI standardized on `asChild`. Many teams use both: `as` for `Text` and `Box`, `asChild` for everything interactive.
+
+## Exercises
+
+### Level 1 — Recall
+
+Type a `Text` component whose `as` prop is restricted to `"h1" | "p" | "span"` (defaulting to `"p"`), with a `size` prop of `"sm" | "md" | "lg"`. Write three valid call sites, then one `// @ts-expect-error` call site with `as="div"`. In a sentence, explain why this component doesn't need a type parameter.
+
+### Level 2 — Application
+
+Implement a fully polymorphic `Box<C>` with your own `tone` and `padding` props, a correctly typed `ref`, and a default element of `"div"`. Use it as a `section`, an `a` with `href`, a `button` with an `onClick` that reads `e.currentTarget`, and your router's `Link`. Add `// @ts-expect-error` lines proving that `href` fails on `button`, `to` fails on `a`, and an anchor ref fails on a `button`.
+
+### Level 3 — Challenge
+
+Implement `Button asChild` with a production-quality `Slot`. It must join class names, merge styles, **compose** event handlers (when both the slot and the child have `onClick`, the child's runs first, then the slot's), and **merge refs** so a ref passed to `Button` and a ref already on the child both receive the node. Write tests for each of the four merges.
+
+*Hint: write a `composeRefs(...refs)` helper that returns a single callback ref which assigns to every ref it was given.*
+
+### Level 4 — Real-world
+
+**Ticket TF-512: De-polymorph `Surface`.** TaskFlow's `Surface` component is fully polymorphic (`as`, generic props, `ComponentRef`), but a code search shows exactly two usages: `as="section"` on the dashboard and `as="aside"` in the task sidebar. Replace it with two plain components.
+
+- `DashboardSection` and `TaskSidebar` have small, non-generic props types and render identical markup and classes to before.
+- The polymorphic types and the `Surface` file are deleted.
+- The PR description includes one error message from before and after, for the same mistake.
+- Optional: report the change in `--extendedDiagnostics` instantiation counts.
+
+## Key takeaways
+
+- A **polymorphic** component separates how it looks from which element it renders; its props type follows the caller's choice.
+- Start with a **restricted `as` union** when only a few elements are allowed and they share your props.
+- Full polymorphism: generic `C extends ElementType`, your props, plus `Omit<ComponentPropsWithoutRef<C>, keyof Own | "as">`.
+- Type the ref as `Ref<ComponentRef<C>>`; in React 19 it's just another prop.
+- **`asChild`** merges props onto a single child with `Children.only` and `cloneElement`. The child checks its own props, so there are no generics and errors stay readable.
+- Polymorphism costs error-message quality, type-checking time, and readability. Reserve it for design-system primitives.
+
+## What comes next
+
+Polymorphism and `asChild` give callers control over *which element* renders. The next problem is control over *structure*: a `Tabs` component configured by a growing array of `{ label, content, disabled, icon, badge }` objects, where every new requirement adds another field. [Chapter 87: Compound Components](/chapter/87) replaces the configuration object with a family of components that share state behind the scenes.

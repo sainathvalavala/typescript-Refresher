@@ -1,0 +1,449 @@
+> 📖 **The problem.** TaskFlow's sign-up form started innocently: six `useState` calls (`name`, `email`, `password`, `confirm`, `role`, `agreed`), one `handleChange(e: any)` that does `setX(e.target.value)` in a chain of `if`s, and validation. The validation is in three places: on blur, on submit, and again in a "disabled" check on the button. They disagree. The button enables while submit still rejects, and someone renames `confirm` to `confirmPassword` in the markup but not in the handler, so the field silently stops working. TypeScript said nothing, because `any` and string comparisons give it nothing to check.
+
+A form looks like a pile of inputs, but it is really a small, well-defined piece of state. This chapter models that state with types, so a misspelled field name is a compile error, validation lives in one function, the errors are accessible to everyone, and the whole thing collapses into a reusable `useForm<T>` hook that you write yourself. It matters even if you later use a library ([Chapter 64](/chapter/64)), because you will understand exactly what the library is doing for you.
+
+> 🧠 **Mental model.** **A form is a small state machine over a typed values object.** It tracks four things: the **values**, which fields have been **touched**, the **errors**, and the **submission status**. Field names are `keyof Values`, so a typo cannot compile.
+
+## 63.1 Typed form state
+
+Start with the shape the form *edits*. Not the shape the server stores: the shape the inputs hold. Inputs hold strings (even a number field gives you a string), so a values type is usually string-heavy, and conversion happens at submit time ([Chapter 64](/chapter/64) covers it with schemas).
+
+```ts
+type SignUpValues = {
+  name: string;
+  email: string;
+  password: string;
+  confirmPassword: string;
+  role: "member" | "admin";
+  acceptTerms: boolean;
+};
+
+const initialValues: SignUpValues = {
+  name: "",
+  email: "",
+  password: "",
+  confirmPassword: "",
+  role: "member",
+  acceptTerms: false,
+};
+```
+
+One `useState` holds the entire object. Annotating the initial value with the type means you cannot forget a field, and every later update is checked against it:
+
+```tsx
+function SignUpForm() {
+  const [values, setValues] = useState<SignUpValues>(initialValues);
+
+  values.email;     // string
+  values.emial;     // ❌ Property 'emial' does not exist on type 'SignUpValues'. Did you mean 'email'?
+  setValues({ ...values, role: "owner" });
+  // ❌ Type '"owner"' is not assignable to type '"admin" | "member"'.
+  return null;
+}
+```
+
+Six scattered `useState`s become one value you can validate, reset (`setValues(initialValues)`), and pass around whole.
+
+> 💡 **Tip.** Derive the values type from a default object when you prefer: `const initialValues = { name: "", ... } satisfies SignUpValues`. But declare the type explicitly when a field is a union, or `role` would widen to `string`.
+
+## 63.2 Form events
+
+Three events drive a form: **change** (the user edited a field), **blur** (they left it), and **submit** (they pressed Enter or the button). You met their types in [Chapter 51](/chapter/51); here they are in a form's clothes:
+
+```tsx
+function Example() {
+  const onChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    e.target.value;   // string
+    e.target.checked; // boolean (meaningful for checkboxes)
+  };
+
+  const onBlur = (e: React.FocusEvent<HTMLInputElement>) => {
+    e.target.name;    // string
+  };
+
+  const onSubmit = (e: React.SubmitEvent<HTMLFormElement>) => {
+    e.preventDefault(); // without this, the browser reloads the page
+  };
+
+  return (
+    <form onSubmit={onSubmit}>
+      <input name="email" onChange={onChange} onBlur={onBlur} />
+    </form>
+  );
+}
+```
+
+The generic argument says *which element* the event came from, and it decides what `e.target` and `e.currentTarget` are. A `<select>` needs `ChangeEvent<HTMLSelectElement>`; a `<textarea>` needs `HTMLTextAreaElement`. If you write one handler for several kinds, use a union:
+
+```ts
+type FieldElement = HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
+
+function handleAnyChange(e: React.ChangeEvent<FieldElement>) {
+  e.target.name;  // string: every form control has one
+  e.target.value; // string: every form control has one
+  e.target.checked;
+  // ❌ Property 'checked' does not exist on type 'EventTarget & FieldElement'.
+  //    Property 'checked' does not exist on type 'EventTarget & HTMLSelectElement'.
+}
+```
+
+The error is useful: it tells you that checkboxes need special handling, which is the next section.
+
+## 63.3 A typed change handler
+
+The classic form handler uses the input's `name` attribute as the key into the values object. One handler serves every field, which is how you get from six `useState`s to one object. The problem is that `e.target.name` is a plain `string`, and TypeScript will not let you index a typed object with an arbitrary string.
+
+```tsx
+function handleChange(e: React.ChangeEvent<HTMLInputElement>) {
+  const { name, value } = e.target;
+  setValues((prev) => ({ ...prev, [name]: value }));
+  // compiles, but typos in the name attribute slip through, and the result isn't checked
+}
+```
+
+Make the contract explicit by narrowing the name to `keyof SignUpValues`. You are asserting something the compiler cannot see (the DOM), so do it in one place, once:
+
+```tsx
+type FieldName = keyof SignUpValues; // "name" | "email" | ... | "acceptTerms"
+
+function handleChange(e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) {
+  const target = e.target;
+  const name = target.name as FieldName; // the one assertion, at the DOM boundary
+  const value = target instanceof HTMLInputElement && target.type === "checkbox"
+    ? target.checked
+    : target.value;
+
+  setValues((prev) => ({ ...prev, [name]: value }));
+}
+```
+
+This handler knows that checkboxes report `checked` rather than `value`. What it does *not* yet know is that `acceptTerms` is a boolean and `email` is a string. The generic `useForm<T>` in 63.8 fixes that by making the setter itself typed: `setField("email", true)` becomes an error.
+
+```tsx
+function setField<K extends keyof SignUpValues>(name: K, value: SignUpValues[K]) {
+  setValues((prev) => ({ ...prev, [name]: value }));
+}
+
+setField("email", "ada@example.com"); // ✅
+setField("email", true);              // ❌ Argument of type 'boolean' is not assignable to parameter of type 'string'.
+setField("emial", "x");               // ❌ Argument of type '"emial"' is not assignable to parameter of type 'keyof SignUpValues'.
+```
+
+That is the `getProperty` pattern from [Chapter 17](/chapter/17), now guarding a form: the name picks the key, and the value's type is looked up from it.
+
+## 63.4 Submission
+
+Submitting is *asynchronous* and has a life cycle of its own, which is the "submission status" part of the state machine. Model it as a union, not as a boolean, so impossible combinations cannot exist:
+
+```ts
+type SubmitStatus =
+  | { state: "idle" }
+  | { state: "submitting" }
+  | { state: "success" }
+  | { state: "error"; message: string };
+```
+
+The submit handler does four things in order: stop the browser's own submit, refuse if already submitting, run the work, and record the outcome.
+
+```tsx
+const [status, setStatus] = useState<SubmitStatus>({ state: "idle" });
+
+async function handleSubmit(e: React.SubmitEvent<HTMLFormElement>) {
+  e.preventDefault();
+  if (status.state === "submitting") return; // guard against double submission
+
+  setStatus({ state: "submitting" });
+  try {
+    await signUp(values); // Promise<void>
+    setStatus({ state: "success" });
+  } catch (error) {
+    setStatus({
+      state: "error",
+      message: error instanceof Error ? error.message : "Something went wrong.",
+    });
+  }
+}
+```
+
+In the JSX, disable the button and say what is happening:
+
+```tsx
+<button type="submit" disabled={status.state === "submitting"}>
+  {status.state === "submitting" ? "Creating account…" : "Create account"}
+</button>
+{status.state === "error" && <p role="alert">{status.message}</p>}
+```
+
+> ⚠️ **Common mistake.** Relying on `disabled` alone to stop double submission. State updates are batched, so a fast double click can run the handler twice before the re-render disables the button. The early-return guard on `status.state` (or a ref flag) is the real protection. The disabled button is for the user's eyes.
+
+> 🚫 **When not to.** Do not disable the submit button *because the form is invalid*. A disabled button gives no reason, and screen-reader users cannot even focus it. Let them press it, then tell them what is wrong (63.7).
+
+## 63.5 Client-side validation
+
+Put validation in **one function**: values in, errors out. That removes the three-places problem, because blur, submit, and the live display all call the same function. The return type is a mapped type from [Chapter 22](/chapter/22): one optional message per field.
+
+```ts
+type FormErrors<T> = Partial<Record<keyof T, string>>;
+
+function validateSignUp(values: SignUpValues): FormErrors<SignUpValues> {
+  const errors: FormErrors<SignUpValues> = {};
+
+  if (values.name.trim() === "") errors.name = "Enter your name.";
+
+  if (!/^\S+@\S+\.\S+$/.test(values.email)) errors.email = "Enter a valid email address.";
+
+  if (values.password.length < 8) errors.password = "Use at least 8 characters.";
+
+  if (values.confirmPassword !== values.password) {
+    errors.confirmPassword = "Passwords do not match.";
+  }
+
+  if (!values.acceptTerms) errors.acceptTerms = "You must accept the terms.";
+
+  errors.nme = "typo";
+  // ❌ Property 'nme' does not exist on type 'Partial<Record<keyof SignUpValues, string>>'. Did you mean 'name'?
+
+  return errors;
+}
+```
+
+The type does two jobs. It forbids errors for fields that do not exist, and because it is derived from `T`, adding a field to `SignUpValues` automatically allows an error for it. The form is valid exactly when the object has no keys:
+
+```ts
+const isValid = (errors: FormErrors<SignUpValues>) => Object.keys(errors).length === 0;
+```
+
+Validators are pure functions of `values`, so they are trivially testable without rendering anything. That is the main argument for keeping them out of the component ([Chapter 67](/chapter/67)).
+
+## 63.6 Touched, dirty, and error display
+
+If you show every error immediately, the user sees "Enter your name" before typing a single letter. Two more pieces of state decide *when* to show a message:
+
+- **Touched**: the user has visited this field (focused it and then left it).
+- **Dirty**: the current value differs from the initial value.
+
+```ts
+type Touched<T> = Partial<Record<keyof T, boolean>>;
+
+const isDirty = (values: SignUpValues) =>
+  (Object.keys(initialValues) as (keyof SignUpValues)[]).some(
+    (key) => values[key] !== initialValues[key],
+  );
+```
+
+An error is displayed for a field when it **exists** and the field is **touched**, *or* a submit has been attempted (which touches everything).
+
+```tsx
+const [touched, setTouched] = useState<Touched<SignUpValues>>({});
+const [submitAttempted, setSubmitAttempted] = useState(false);
+
+const errors = validateSignUp(values); // recomputed every render: cheap and always in sync
+
+function shouldShow(name: keyof SignUpValues): boolean {
+  return Boolean(errors[name]) && (touched[name] === true || submitAttempted);
+}
+
+function handleBlur(e: React.FocusEvent<HTMLInputElement>) {
+  const name = e.target.name as keyof SignUpValues;
+  setTouched((prev) => ({ ...prev, [name]: true }));
+}
+```
+
+Notice that `errors` is **derived**, not stored. It is a pure function of `values`, so keeping it in `useState` would create a second copy that can disagree with the first, the same trap as [Chapter 60](/chapter/60) warned about for derived state.
+
+A good default: show a field's error on blur, then update it live as the user fixes it. "Dirty" is useful for a "Discard changes?" prompt on navigation and for enabling a Save button on edit forms, where nothing has changed yet.
+
+## 63.7 Accessible forms
+
+A form that works only for people who can see the red text is not finished. Four small habits make errors usable with a keyboard and a screen reader, and none of them needs a library.
+
+1. **Every input has a real label**, connected by `htmlFor` and `id`.
+2. **`aria-invalid`** tells assistive technology that the field currently has an error.
+3. **`aria-describedby`** points at the error text, so it is read when the field is focused.
+4. **On a failed submit, move focus to the first invalid field**, so keyboard users land where the problem is.
+
+```tsx
+function TextField(props: {
+  name: keyof SignUpValues;
+  label: string;
+  value: string;
+  error?: string;
+  type?: "text" | "email" | "password";
+  onChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
+  onBlur: (e: React.FocusEvent<HTMLInputElement>) => void;
+}) {
+  const errorId = `${props.name}-error`;
+  return (
+    <div>
+      <label htmlFor={props.name}>{props.label}</label>
+      <input
+        id={props.name}
+        name={props.name}
+        type={props.type ?? "text"}
+        value={props.value}
+        onChange={props.onChange}
+        onBlur={props.onBlur}
+        aria-invalid={props.error ? true : undefined}
+        aria-describedby={props.error ? errorId : undefined}
+      />
+      {props.error && (
+        <p id={errorId} role="alert">
+          {props.error}
+        </p>
+      )}
+    </div>
+  );
+}
+```
+
+Focusing the first error needs the DOM element, so submit looks it up by name. The form is the `currentTarget` of the event, and `elements` is typed as a collection you can index:
+
+```tsx
+function handleSubmit(e: React.SubmitEvent<HTMLFormElement>) {
+  e.preventDefault();
+  setSubmitAttempted(true);
+
+  const firstInvalid = (Object.keys(errors) as (keyof SignUpValues)[])[0];
+  if (firstInvalid) {
+    const el = e.currentTarget.elements.namedItem(firstInvalid);
+    if (el instanceof HTMLElement) el.focus(); // narrow before use: namedItem returns Element | RadioNodeList | null
+    return;
+  }
+  void submit();
+}
+```
+
+> 💡 **Tip.** `role="alert"` announces the message the moment it appears, which is right for a submit-time error but chatty for per-keystroke errors. Show live errors on blur, as in 63.6, and the announcements stay useful.
+
+> ⚠️ **Common mistake.** Using `placeholder` as the label. It vanishes when typing starts, has poor contrast, and is not a reliable accessible name.
+
+## 63.8 Building `useForm<T>`
+
+Everything so far is the same for every form: values, touched, errors, status, `setField`, blur, submit. Only the values type, the initial values, the validator, and the submit action differ. That is precisely what a generic is for ([Chapter 16](/chapter/16)).
+
+```tsx
+import { useState } from "react";
+
+type FormErrors<T> = Partial<Record<keyof T, string>>;
+
+type UseFormOptions<T> = {
+  initialValues: T;
+  validate: (values: T) => FormErrors<T>;
+  onSubmit: (values: T) => Promise<void>;
+};
+
+export function useForm<T extends Record<string, string | boolean>>(opts: UseFormOptions<T>) {
+  const [values, setValues] = useState<T>(opts.initialValues);
+  const [touched, setTouched] = useState<Partial<Record<keyof T, boolean>>>({});
+  const [submitAttempted, setSubmitAttempted] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+
+  const errors = opts.validate(values); // derived, never stored
+
+  function setField<K extends keyof T>(name: K, value: T[K]) {
+    setValues((prev) => ({ ...prev, [name]: value }));
+  }
+
+  function errorFor(name: keyof T): string | undefined {
+    return touched[name] || submitAttempted ? errors[name] : undefined;
+  }
+
+  async function handleSubmit(e: React.SubmitEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (submitting) return;
+    setSubmitAttempted(true);
+    if (Object.keys(errors).length > 0) return;
+    setSubmitting(true);
+    try {
+      await opts.onSubmit(values);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return { values, errors, submitting, setField, errorFor, handleSubmit,
+    touch: (name: keyof T) => setTouched((prev) => ({ ...prev, [name]: true })) };
+}
+```
+
+The constraint `T extends Record<string, string | boolean>` says "a flat object of simple values", which is what plain inputs produce, and it is what lets `useForm` stay free of `any`. The hook returns everything the form needs, and the call site gets full inference from `initialValues`:
+
+```tsx
+function SignUpForm() {
+  type Values = { name: string; email: string; acceptTerms: boolean };
+  const form = useForm<Values>({
+    initialValues: { name: "", email: "", acceptTerms: false },
+    validate: (v) => (v.name === "" ? { name: "Enter your name." } : {}),
+    onSubmit: async (v) => { await signUp(v); },
+  });
+
+  form.setField("email", "ada@example.com"); // ✅ T is Values
+  form.setField("acceptTerms", "yes");
+  // ❌ Argument of type 'string' is not assignable to parameter of type 'boolean'.
+  form.errorFor("emial"); // ❌ Argument of type '"emial"' is not assignable to parameter of type '"name" | "email" | "acceptTerms"'.
+
+  return <form onSubmit={form.handleSubmit}>{/* fields */}</form>;
+}
+```
+
+Notice that field names flow from one values type through the whole API. (Pass the type explicitly: inferring `T` from a bare object literal would narrow `acceptTerms` to the literal `false`.) This is the same trick libraries use, minus nested fields, arrays, and a hundred edge cases, which is why [Chapter 64](/chapter/64) tells you when to stop building your own.
+
+## Common mistakes
+
+> ⚠️ **`handleChange(e: any)`.** It removes every check the form could give you. Type events with their element, and narrow `name` to `keyof Values` once.
+
+> ⚠️ **Storing errors in state.** Errors are a function of values; compute them. A stored copy goes stale the moment a value changes.
+
+> ⚠️ **Showing every error from the first render.** Gate display on `touched` or `submitAttempted`, or users see a wall of red before typing.
+
+> ⚠️ **Forgetting `e.preventDefault()`.** The page reloads and all form state vanishes.
+
+> ⚠️ **Disabling submit instead of explaining.** Disabled buttons give no feedback and cannot be focused. Validate on submit and show the reasons.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** a form is small and self-contained: login, a create-task dialog, a settings panel. Hand-rolled state is easy to read, and you learn precisely what is going on.
+
+> 🚫 **When not to.** Large forms with nested objects, dynamic arrays, cross-field rules, and performance concerns are where a library (React Hook Form, [Chapter 64](/chapter/64)) pays for itself. Do not keep growing `useForm` into a framework. Also, a single search box needs no form state machine: plain `useState` is fine.
+
+## How it connects
+
+> 🔗 **Connection.** Event types come from [Chapter 51](/chapter/51), `keyof` and indexed access from [Chapters 17](/chapter/17) and [20](/chapter/20), `FormErrors<T>` from mapped types in [Chapter 22](/chapter/22), and the submission union from [Chapter 52](/chapter/52). Next, [Chapter 64](/chapter/64) replaces the hand-written validator with a schema shared with the server.
+
+> 🌍 **Real world.** The "values, touched, errors, isSubmitting" four-tuple is the core of Formik, React Hook Form, and TanStack Form. They differ in *how* they avoid re-rendering on every keystroke, not in what they track.
+
+## Exercises
+
+### Level 1 — Recall
+
+Write the `LoginValues` type (email, password, remember-me) and the matching `FormErrors<LoginValues>`. Which fields are strings and which is a boolean, and why does `remember` need different event handling?
+
+### Level 2 — Application
+
+Build a **create-task form** with title, project, due date (as a string), and priority. Write one `validateTask` function returning `FormErrors<TaskValues>`. Show errors only after blur or a submit attempt, wire up labels, `aria-invalid`, and `aria-describedby`, and focus the first invalid field on a failed submit.
+
+### Level 3 — Challenge
+
+Extend `useForm<T>` with `register(name)` that returns typed input props: `{ name, value, onChange, onBlur, "aria-invalid" }`, so a field is written as `input {...form.register("email")}` and `register("emial")` fails to compile. *Hint: the return type depends on whether `T[K]` is a string or a boolean, so think about overloads or a conditional type.*
+
+### Level 4 — Real-world
+
+**Ticket TF-402: New-project wizard.** Creating a project takes three steps (details, members, review), and users lose their input when they go back.
+
+- Each step validates only its own fields before allowing "Next".
+- Going back and forward preserves everything entered.
+- The review step shows a read-only summary and a single Submit that cannot fire twice.
+- Every error is announced accessibly and focus moves to the first invalid field.
+
+## Key takeaways
+
+- A form is a state machine over a typed values object: values, touched, errors, submission status.
+- Field names are `keyof Values`; type the setter as `setField<K extends keyof T>(name: K, value: T[K])` so name and value agree.
+- Validation is one pure function from values to `FormErrors<T>`. Derive errors, never store them.
+- Show errors after touch or submit; disabled buttons are not an explanation.
+- Accessibility is part of correctness: labels, `aria-invalid`, `aria-describedby`, focus on first error.
+- `useForm<T>` is just those pieces in a generic hook, and knowing that tells you when a library is worth it.
+
+## What comes next
+
+Your validator checks the client's rules. The server has rules too, they will not always match, and the server's word is final. [Chapter 64: Validation, Schemas & Form Abstractions](/chapter/64) shares one schema between both sides, maps server errors back onto fields, and introduces React Hook Form and React 19 Actions.

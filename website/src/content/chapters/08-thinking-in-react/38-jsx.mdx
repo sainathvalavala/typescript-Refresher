@@ -1,0 +1,363 @@
+> 📖 **The problem.** A teammate new to React looks at `<Button kind="primary">Save</Button>` and asks, "So JSX is just HTML inside JavaScript?" It looks exactly like HTML. Then they write `class="btn"` and TypeScript complains, write `style="color: red"` and it complains again, and render a task count of zero and a stray `0` appears on the page. Each surprise makes sense the moment you see what that line really compiles to: `jsx(Button, { kind: "primary", children: "Save" })`. A function call.
+
+JSX is the syntax you'll write more than any other in this book, so it's worth understanding precisely rather than by imitation. This chapter shows what JSX compiles to, and then every rule follows from that: why one root element, why `className`, why some values render and others vanish, and why React is safe from a whole category of attacks that plagued P09-style code.
+
+By the end, you'll be able to read any JSX and say what JavaScript it becomes, convert HTML to JSX without guessing, and predict exactly what a given expression renders.
+
+> 🧠 **Mental model.** **JSX is syntax for creating element objects.** Every tag is a function call that returns a description. Inside braces you are back in plain JavaScript, so anything that is a JavaScript *expression* can go there.
+
+## 38.1 JSX is JavaScript
+
+Browsers don't understand JSX. Before your code runs, the TypeScript compiler (or Vite's transform) rewrites every tag into a call to a function named `jsx`, imported automatically from `react/jsx-runtime`. Here is the line from the opening problem, before and after:
+
+```tsx
+// What you write
+const save = <Button kind="primary">Save</Button>;
+```
+
+```js
+// What the compiler emits
+import { jsx as _jsx } from "react/jsx-runtime";
+const save = _jsx(Button, { kind: "primary", children: "Save" });
+```
+
+The tag name becomes the first argument, the attributes become a **props** object, and whatever sits between the tags becomes `props.children`. That call returns the plain element object you logged in [Chapter 37](/chapter/37). Nesting works the same way, one call per tag (`jsxs` is the variant used when there are several children):
+
+```tsx
+const list = (
+  <ul className="tasks">
+    <li>Write docs</li>
+    <li>Fix bug</li>
+  </ul>
+);
+// _jsxs("ul", {
+//   className: "tasks",
+//   children: [_jsx("li", { children: "Write docs" }), _jsx("li", { children: "Fix bug" })],
+// });
+```
+
+Notice the first arguments. A **lowercase** tag such as `li` becomes the *string* `"li"`, meaning a built-in HTML element. A **capitalized** tag such as `Button` becomes a *reference* to the variable `Button`, meaning your component. That's the whole reason component names must start with a capital letter.
+
+This also explains the "one root element" rule. A function returns one value, and a JSX expression is one function call. Two sibling tags side by side would be two values with nothing joining them:
+
+```tsx
+function TaskHeader() {
+  // ❌ JSX expressions must have one parent element.
+  return (
+    <h2>Today</h2>
+    <p>3 tasks left</p>
+  );
+}
+```
+
+Wrap them in one parent, either a real element or a fragment (38.4), and the problem goes away.
+
+> 🕰 **Legacy note.** Before React 17, JSX compiled to `React.createElement(...)`, so every file had to bring `React` into scope even if it never mentioned it. With the automatic runtime (`"jsx": "react-jsx"` in your tsconfig, which the Vite template sets), the compiler adds the `jsx` import for you. You'll still see the old header line in older codebases.
+
+## 38.2 Expressions in braces
+
+Curly braces are a hole in your JSX where one JavaScript **expression** goes. They're the same idea as `${...}` in a template literal: leave the markup, compute a value, drop it in. Braces work in two places: as children (between tags) and as attribute values.
+
+```tsx
+type TaskCardProps = { task: Task; dueInDays: number };
+
+function TaskCard({ task, dueInDays }: TaskCardProps) {
+  const status = task.done ? "Done" : "Open";
+  return (
+    <article title={task.title} className={task.done ? "card card--done" : "card"}>
+      <h3>{task.title.toUpperCase()}</h3>
+      <p>Status: {status}</p>
+      <p>Due {dueInDays === 0 ? "today" : `in ${dueInDays} days`}</p>
+      {/* A comment inside JSX lives in braces too */}
+    </article>
+  );
+}
+```
+
+Anything that produces a value works: variables, property access, function calls, arithmetic, ternaries, template literals, and (as you'll see in [Chapter 40](/chapter/40)) `map` over an array. What doesn't work is a **statement**. `if`, `for`, and `const` don't produce values, so they can't fill a hole:
+
+```tsx
+const label = <p>{if (task.done) { "Done" }}</p>;   // ❌ Expression expected.
+const label2 = <p>{task.done ? "Done" : "Open"}</p>; // ✅ a ternary is an expression
+```
+
+When the logic gets bigger than a ternary, move it **above the `return`**, into ordinary statements, and put just the result in the braces. JSX reads best when the braces contain names, not paragraphs.
+
+> ⚠️ **Common mistake.** Quotes and braces are different things. `title="task.title"` passes the literal string "task.title". `title={task.title}` passes the value. And `title="{task.title}"` passes the string with the braces in it. Use quotes only for fixed strings.
+
+## 38.3 Attributes become props
+
+Because attributes become keys of a JavaScript props object, they follow JavaScript's rules, and specifically the names of DOM *properties* rather than HTML *attributes*. Most are identical (`id`, `type`, `src`, `placeholder`). The differences are few and systematic, so learn them once:
+
+- `class` is a reserved word in JavaScript, so it's **`className`** (the DOM property has always been called that).
+- `for` is also reserved, so `<label for>` becomes **`htmlFor`**.
+- Multi-word attributes are **camelCase**: `maxLength`, `tabIndex`, `autoFocus`, and every event handler (`onClick`, `onChange`, `onSubmit`).
+- `style` takes an **object** with camelCase CSS properties, not a string. Numbers mean pixels for size properties.
+- `aria-*` and `data-*` attributes keep their hyphens.
+- Every tag must be closed, so void elements are self-closing: `<input />`, `<img />`, `<br />`.
+
+Here's a piece of P09's HTML and its JSX translation:
+
+```html
+<label for="title" class="field-label">Title</label>
+<input id="title" class="field" type="text" maxlength="80" autofocus>
+<button class="btn" onclick="save()" style="background-color: teal; margin-top: 8px" aria-label="Save task">Save</button>
+```
+
+```tsx
+function NewTaskForm() {
+  return (
+    <form className="new-task">
+      <label htmlFor="title" className="field-label">Title</label>
+      <input id="title" className="field" type="text" maxLength={80} autoFocus />
+      <button className="btn" onClick={save} style={{ backgroundColor: "teal", marginTop: 8 }} aria-label="Save task">
+        Save
+      </button>
+    </form>
+  );
+}
+```
+
+Two details deserve a second look. `style={{ ... }}` isn't special syntax: the outer braces are the expression hole, the inner ones are an object literal. And `onClick={save}` passes the *function*, where HTML's `onclick="save()"` was a string of code to run later. You'll see why that difference matters in [Chapter 41](/chapter/41).
+
+You don't have to memorize any of this, because TypeScript knows the props of every HTML element and catches mistakes as you type:
+
+```tsx
+const a = <div class="row" />;       // ❌ Property 'class' does not exist on type '…'. Did you mean 'className'?
+const b = <p style="color: red" />;  // ❌ Type 'string' is not assignable to type 'CSSProperties'.
+const c = <button onclick={save} />; // ❌ Property 'onclick' does not exist on type '…'. Did you mean 'onClick'?
+```
+
+## 38.4 Fragments
+
+The one-root rule from 38.1 creates a temptation: wrap everything in a `div`. Sometimes that's harmless. Often it isn't. An extra `div` breaks a CSS grid or flex layout that expects specific children, and it produces invalid HTML inside elements with strict content rules: a `ul` may only contain `li` elements, and a `tr` may only contain cells.
+
+A **fragment** groups elements without adding anything to the DOM. The short syntax is an empty tag:
+
+```tsx
+type TaskHeaderProps = { left: number };
+
+function TaskHeader({ left }: TaskHeaderProps) {
+  return (
+    <>
+      <h2>Today</h2>
+      <p>{left} tasks left</p>
+    </>
+  );
+}
+// In the DOM, <h2> and <p> sit directly inside whatever renders TaskHeader. No wrapper.
+```
+
+The short syntax can't take attributes. The one attribute you'll ever need on a fragment is `key`, when a list item is made of several sibling elements. For that, use the long form, `Fragment`, imported from `react`:
+
+```tsx
+import { Fragment } from "react";
+
+type TaskListProps = { tasks: Task[] };
+
+function TaskDetails({ tasks }: TaskListProps) {
+  return (
+    <dl>
+      {tasks.map((t) => (
+        <Fragment key={t.id}>
+          <dt>{t.title}</dt>
+          <dd>{t.done ? "Done" : "Open"}</dd>
+        </Fragment>
+      ))}
+    </dl>
+  );
+}
+```
+
+A `dl` expects alternating `dt` and `dd` children, so a wrapper `div` per task would be wrong. A keyed fragment gives React an identity for each pair (keys are [Chapter 40](/chapter/40)'s subject) while the DOM stays clean.
+
+## 38.5 What renders and what doesn't
+
+Anything you put in braces as a child must be something React knows how to show. The rules are short, but two of them surprise everyone:
+
+| Value in braces | What appears |
+|---|---|
+| A string or a number | The text, including `0` and `NaN` |
+| `null`, `undefined`, `true`, `false` | Nothing at all |
+| An element | That element |
+| An array | Each item, in order |
+| A plain object or a `Date` | An error |
+
+The "nothing" row is what makes conditional rendering possible: `false` and `null` are the official ways to say "render nothing here". The surprises are the edges of that rule:
+
+```tsx
+type RenderRulesProps = { task: Task; count: number };
+
+function RenderRules({ task, count }: RenderRulesProps) {
+  return (
+    <ul>
+      <li>{task.title}</li>             {/* "Write docs" */}
+      <li>{count}</li>                  {/* "0" when count is 0: numbers always render */}
+      <li>{null}</li>                   {/* nothing */}
+      <li>Done: {task.done}</li>        {/* "Done: " and nothing else: booleans never render */}
+      <li>Done: {String(task.done)}</li> {/* "Done: false" */}
+      <li>{count && "You have tasks"}</li> {/* "0": the && returned count itself */}
+    </ul>
+  );
+}
+```
+
+The last line is the famous stray zero. `count && "..."` evaluates to `count` when `count` is falsy, and `0` is a number, so it renders. Booleans do the opposite of what beginners expect: `{task.done}` shows nothing, so you must turn a boolean into text yourself. [Chapter 40](/chapter/40) gives the pattern for avoiding the zero.
+
+Objects are the one value React refuses. TypeScript stops it at compile time, and if it slips through (for example, from an `any`), React throws at runtime:
+
+```tsx
+const bad = <p>{task}</p>;        // ❌ Type 'Task' is not assignable to type 'ReactNode'.
+// 💥 at runtime: Objects are not valid as a React child (found: object with keys {id, title, done}).
+const good = <p>{task.title}</p>; // ✅ pick the field you meant
+```
+
+`ReactNode` is the name for "anything that can render": the union of the allowed rows in the table. You'll type with it properly in [Chapter 49](/chapter/49).
+
+## 38.6 JSX and safety
+
+In P09 you probably built rows with template strings and `innerHTML`. That's how a classic security hole happens. If a task title contains HTML, the browser parses it as HTML, including any scripts an attacker sneaks in. This is called **cross-site scripting** (XSS):
+
+```ts
+// P09-style rendering
+row.innerHTML = `<span class="title">${task.title}</span>`;
+// A task titled  <img src="x" onerror="stealSession()">  runs the attacker's code
+```
+
+In JSX, text in braces is **always escaped**: React inserts it as a text node, never as markup. The same malicious title shows up on screen as harmless, literal characters:
+
+```tsx
+const title = '<img src="x" onerror="stealSession()">';
+const row = <span className="title">{title}</span>;
+// The user sees the text  <img src="x" onerror="stealSession()">  and nothing runs.
+```
+
+Occasionally you genuinely need to insert HTML, for example to show Markdown that a server has already converted and **sanitized**. React makes that possible but deliberately awkward: a prop called `dangerouslySetInnerHTML` that takes an object with an `__html` key. The name is a warning label you can grep for in code review.
+
+```tsx
+type CommentBodyProps = { sanitizedHtml: string };
+
+function CommentBody({ sanitizedHtml }: CommentBodyProps) {
+  // Only with HTML that a sanitizer such as DOMPurify has cleaned. React does no checking here.
+  return <div className="comment" dangerouslySetInnerHTML={{ __html: sanitizedHtml }} />;
+}
+```
+
+> ⚠️ **Common mistake.** Escaping protects **text**, not every attribute. A user-supplied link in `href` can still point somewhere dangerous, so validate URLs from users before rendering them. [Chapter 74](/chapter/74) covers frontend security properly.
+
+## 38.7 TSX specifics
+
+TypeScript only parses JSX in files ending in **`.tsx`**. Keep components in `.tsx` files and plain logic (domain types, utility functions) in `.ts` files. Writing JSX in a `.ts` file produces a cascade of confusing syntax errors, because the compiler reads `<` as the start of a type assertion or a comparison. The `"jsx": "react-jsx"` setting in `tsconfig.app.json` tells TypeScript which runtime to compile for:
+
+```json
+{
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "strict": true
+  }
+}
+```
+
+Being inside a `.tsx` file changes the meaning of angle brackets in two places you already know from Part IV. First, the old **angle-bracket type assertion** looks like an opening tag, so it's not allowed; use `as` instead. Second, a **generic arrow function**'s type parameter list also looks like a tag:
+
+```tsx
+const a = <Task>data;                              // ❌ JSX element 'Task' has no corresponding closing tag.
+const b = data as Task;                            // ✅ the only assertion syntax in .tsx files
+
+const firstA = <T>(items: T[]) => items[0];        // ❌ JSX element 'T' has no corresponding closing tag.
+const firstB = <T,>(items: T[]) => items[0];       // ✅ the trailing comma means "type parameters, not a tag"
+function firstC<T>(items: T[]) { return items[0]; } // ✅ function declarations are never ambiguous
+```
+
+The trailing comma in `<T,>` looks odd, but it's the standard idiom. Writing `<T extends unknown>` works too. Or sidestep the issue with a function declaration, which is what most React code does for components anyway. You'll write generic components on purpose in [Chapter 57](/chapter/57).
+
+> 🔗 **Connection.** Assertions came from [Chapter 9](/chapter/9) and generic functions from [Chapter 16](/chapter/16). Nothing about them changes in `.tsx`; only the spelling does.
+
+## Common mistakes
+
+> ⚠️ **Writing HTML attribute names.** `class`, `for`, `onclick`, and `style="..."` are HTML. In JSX they're `className`, `htmlFor`, `onClick`, and a style object. Trust the TypeScript error; it usually names the fix.
+
+> ⚠️ **Lowercase component names.** `<taskRow />` is treated as an HTML tag called `taskrow`, not your component, because lowercase tags become strings.
+
+```tsx
+function taskRow() { return <li>…</li>; }
+const row = <taskRow />; // ❌ Property 'taskRow' does not exist on type 'JSX.IntrinsicElements'.
+```
+
+> ⚠️ **Rendering an object or a boolean.** `{task}` is an error; `{task.done}` silently renders nothing. Render a field, or convert the value to text yourself.
+
+> ⚠️ **Statements in braces.** `{if (...) ...}` and `{for (...) ...}` don't compile. Use a ternary or `map`, or compute the value above the `return`.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** you're describing UI structure: JSX makes the shape of the output visible at a glance, and braces let you drop in computed values right where they appear.
+
+> 🚫 **When not to.** Don't bury real logic inside the markup. A nested ternary three levels deep, or a `filter(...).sort(...).map(...)` chain spanning ten lines inside braces, belongs in named variables above the `return`. And don't reach for `dangerouslySetInnerHTML` to "just render this string"; if the string isn't sanitized HTML, render it as text.
+
+## How it connects
+
+> 🔗 **Connection.** [Chapter 37](/chapter/37) showed that components return element objects; this chapter showed the syntax that creates them. Next, [Chapter 39](/chapter/39) uses JSX attributes to pass props to your own components, and [Chapter 40](/chapter/40) builds on 38.5 for conditional rendering and lists. In Part IX, [Chapter 49](/chapter/49) explains how TypeScript checks JSX: `JSX.IntrinsicElements`, `ReactNode`, and `ReactElement`.
+
+> 🌍 **Real world.** JSX isn't React-only. Solid, Preact, and several other libraries use it with their own `jsx` function, which is why the compiler setting is about a *runtime*, not about React specifically.
+
+## Exercises
+
+### Level 1 — Recall
+
+Translate each JSX snippet into `jsx(...)` / `jsxs(...)` calls, then translate the last two calls back into JSX:
+
+```tsx
+<h1>TaskFlow</h1>
+<input type="checkbox" checked={task.done} />
+<TaskRow task={task} onToggle={toggle} />
+<ul className="tasks"><li>One</li><li>Two</li></ul>
+<>{left} left</>
+```
+
+```js
+_jsx("button", { className: "btn", disabled: true, children: "Save" });
+_jsx(Badge, { tone: "warning", children: _jsx("strong", { children: "Late" }) });
+```
+
+### Level 2 — Application
+
+Convert this HTML template from P09 into a `TaskEditor` component in a `.tsx` file. Fix every attribute so that it compiles with no TypeScript errors, and replace the hard-coded values with props:
+
+```html
+<div class="editor" data-task-id="t1">
+  <label for="edit-title">Title</label>
+  <input id="edit-title" value="Write docs" maxlength="120" autofocus>
+  <label><input type="checkbox" checked> Done</label>
+  <p style="font-size: 12px; color: gray">Created 3 days ago</p>
+  <button class="btn btn--primary" tabindex="0">Save</button><br>
+</div>
+```
+
+### Level 3 — Challenge
+
+Explain, in terms of what `&&` evaluates to, why `{items.length && <List items={items} />}` renders a stray `0` when the list is empty, while `{items.length > 0 && <List items={items} />}` does not. Then explain why `{isLoading && <Spinner />}` never has this problem, and find one more falsy value besides `0` that can leak onto the screen the same way.
+
+*Hint: look at the table in 38.5 and ask which falsy values are in the "nothing" row.*
+
+### Level 4 — Real-world
+
+**Ticket TF-214: TaskFlow Pro product page.** Marketing has a static mockup for the "TaskFlow Pro" page and wants it in the React app.
+
+- Build it from at least four components (for example `Hero`, `FeatureList`, `PricingCard`, `Faq`), with all repeated content (features, plans, questions) rendered from arrays.
+- Use fragments wherever a wrapper `div` would add nothing, and a keyed `Fragment` for the FAQ's `dt`/`dd` pairs.
+- No HTML attribute names, no `dangerouslySetInnerHTML`, and zero TypeScript errors under `strict`.
+- Prices are numbers in the data and formatted for display with `Intl.NumberFormat`.
+
+## Key takeaways
+
+- JSX compiles to `jsx(type, props)` calls that return **element objects**. It is JavaScript, not HTML.
+- Lowercase tags are built-in elements (strings); capitalized tags are your components (references).
+- Braces hold one **expression**. Statements go above the `return`.
+- Attributes are props, so they use DOM property names: `className`, `htmlFor`, camelCase handlers, and `style` objects.
+- `null`, `undefined`, `true`, and `false` render nothing; **`0` renders**; objects are an error.
+- Text in braces is **escaped automatically**; `dangerouslySetInnerHTML` is the deliberately loud exception.
+- In `.tsx` files, use `as` for assertions and `<T,>` for generic arrow functions.
+
+## What comes next
+
+You can now write any element you like, but so far every component has been a single function sitting in one file. Real apps are trees of dozens of small components that pass data to each other. How do you decide where one component ends and the next begins, and how do they talk? That's [Chapter 39: Components, Props & Composition](/chapter/39).

@@ -1,0 +1,382 @@
+> 📖 **The problem.** TaskFlow needs the signed-in user in forty components, and threading `user` through six layers of props is miserable, so you reach for context. TypeScript demands a default value, and you don't have one. So you write `createContext<AuthValue>({} as AuthValue)`. It compiles, the app works, and everyone moves on. Three months later a new page renders outside the provider, `user.name` is read from an empty object, and the page crashes in production with `Cannot read properties of undefined`. The `as` cast told the compiler a lie, and the compiler believed it.
+
+Context solves a real problem (sharing values with a whole subtree), and it has exactly one typing trap: the case where **no provider exists**. This chapter shows how to tell the truth about that case and make it impossible to ignore, then builds up to reducers in context, splitting contexts for performance, and React 19's simplified syntax (`<Context value={…}>` and `use`). By the end, you'll have a reusable pattern for typed, safe context.
+
+> 🧠 **Mental model.** **A context's type should tell the truth about the case where no provider exists.** Make "no provider" impossible to ignore by funneling all access through a custom hook that throws a clear error.
+
+## 54.1 createContext typing
+
+`createContext<T>(defaultValue)` creates a context whose value type is `T`. The argument is the **default value**: what a component receives when it reads the context but has no matching provider above it. TypeScript infers `T` from the default if you don't write it:
+
+```tsx
+import { createContext } from "react";
+
+const ThemeContext = createContext("light");
+// ThemeContext: Context<string>: the value is just "string", not "light" | "dark"
+
+type Theme = "light" | "dark";
+const ThemeContext2 = createContext<Theme>("light");
+// ThemeContext2: Context<Theme>: the type argument widens the type beyond the default
+```
+
+Just as with `useState` ([Chapter 52](/chapter/52)), give the type argument when the default is narrower than the real range of values. And here the default is the whole story: unlike `useState`, a context has *two* sources of values, the default (no provider) and the provider's `value` prop, and both must be of type `T`.
+
+```tsx
+const ThemeContext3 = createContext<Theme>("light");
+
+<ThemeContext3 value="dark">…</ThemeContext3>;   // ✅
+<ThemeContext3 value="blue">…</ThemeContext3>;   // ❌ Type '"blue"' is not assignable to type 'Theme'.
+```
+
+A default is perfectly fine when a sensible one exists (a theme falls back to light, a locale to English). The trouble starts when none does.
+
+## 54.2 The default value problem
+
+Some contexts have no meaningful default, because the value *only exists* when a provider supplies it: the signed-in user, a database connection, a router. TypeScript still wants a `T`, and developers have three bad ways to give it one:
+
+```tsx
+type AuthValue = {
+  user: User | null;
+  signIn: (user: User) => void;
+  signOut: () => void;
+};
+
+// 1. The cast: compiles, but is a lie
+const Auth1 = createContext<AuthValue>({} as AuthValue);
+
+// 2. A fake default: compiles, and silently does nothing outside the provider
+const Auth2 = createContext<AuthValue>({
+  user: null,
+  signIn: () => {},
+  signOut: () => {},
+});
+
+// 3. Making every field optional: honest, but now every consumer checks every field
+const Auth3 = createContext<Partial<AuthValue>>({});
+```
+
+Why each is dangerous: (1) `useContext(Auth1).signOut()` calls `undefined` and crashes far from the real bug. (2) is subtler. A forgotten provider produces a button that does nothing and no error anywhere, which can be a *worse* bug, because there's no stack trace to chase. (3) makes the type safe but unusable.
+
+All three share a root cause: the type claims a value *always* exists, while the truth is "sometimes there's no provider". The honest type is a union with that case:
+
+```tsx
+const Auth = createContext<AuthValue | null>(null);
+//                        ^^^^^^^^^^^^^^^ the type now says what the code really knows
+```
+
+Now a consumer that forgets to handle the missing provider gets a compile error instead of a production crash:
+
+```tsx
+function Avatar() {
+  const auth = useContext(Auth);
+  return <img alt={auth.user.name} />;
+  //                ^^^^ ❌ 'auth' is possibly 'null'.
+}
+```
+
+That's honest, but writing `if (auth === null) …` in every component is tedious. The next section removes the tedium.
+
+## 54.3 The safe context pattern
+
+The standard solution has two parts: the context holds `Value | null`, and a **custom hook** is the only way anyone reads it. The hook checks for `null` once, throws a clear error, and returns the non-null value. Every consumer gets a clean `AuthValue` with no checks.
+
+```tsx
+import { createContext, useContext } from "react";
+
+const AuthContext = createContext<AuthValue | null>(null);
+
+export function useAuth(): AuthValue {
+  const value = useContext(AuthContext);
+  if (value === null) {
+    throw new Error("useAuth must be used inside <AuthProvider>");
+  }
+  return value; // narrowed: AuthValue
+}
+
+function Avatar() {
+  const { user } = useAuth(); // ✅ no null check needed; AuthValue guaranteed
+  return user ? <img alt={user.name} /> : null;
+}
+```
+
+The error message names both the hook and the missing provider, so the developer who forgets the provider sees `useAuth must be used inside <AuthProvider>` in the first test run, not a mystery crash in production. The `null` check is also the proof the compiler needs: narrowing turns `AuthValue | null` into `AuthValue` at the `return`.
+
+Notice that `AuthContext` itself is *not exported*. Only the hook and the provider are public. That's what makes the pattern airtight: nobody can bypass the check by calling `useContext(AuthContext)` directly.
+
+> ⚠️ **Common mistake.** If the context's `T` itself can legitimately be `null` (say, "the current user, or null when signed out"), then `null` can't double as "no provider". Wrap it: `createContext<{ user: User | null } | null>(null)`, or use a unique sentinel such as `undefined` for "no provider".
+
+## 54.4 Typed provider components
+
+The provider is a component like any other: its props type has `children: ReactNode` ([Chapter 50](/chapter/50)), plus anything needed to configure it (an initial user, a storage backend, a fixed value for tests). Inside, it owns the state and builds the value object that every consumer will receive.
+
+```tsx
+import { useMemo, useState, type ReactNode } from "react";
+
+type AuthProviderProps = {
+  children: ReactNode;
+  initialUser?: User | null; // handy for tests and Storybook
+};
+
+export function AuthProvider({ children, initialUser = null }: AuthProviderProps) {
+  const [user, setUser] = useState<User | null>(initialUser);
+
+  const value = useMemo<AuthValue>(
+    () => ({
+      user,
+      signIn: (next) => setUser(next),   // next: User, from AuthValue's signature
+      signOut: () => setUser(null),
+    }),
+    [user],
+  );
+
+  return <AuthContext value={value}>{children}</AuthContext>;
+}
+```
+
+Two details matter. First, annotating `useMemo<AuthValue>` makes TypeScript check the object against the context's type *and* contextually type the callbacks (`next` needs no annotation). If you later add a field to `AuthValue` and forget it here, the compile error lands right at this line.
+
+Second, **memoize the value object**. Without `useMemo`, a new `{ user, signIn, signOut }` object is created on every render of the provider, and React compares context values by identity, so *every consumer re-renders* every time the provider does, even if nothing changed.
+
+```tsx
+const value: AuthValue = { user, signIn: setUser, signOut: () => setUser(null) };
+// ⚠️ new object each render: all consumers re-render whenever AuthProvider re-renders
+```
+
+## 54.5 Consumers through hooks
+
+Having the hook as the *only* consumer API gives you a seam to improve later without touching call sites. Components never import the context; they import a hook with a precise return type. That also allows the hook to expose a **narrower** or **derived** view than the raw context value:
+
+```tsx
+export function useAuth(): AuthValue {
+  const value = useContext(AuthContext);
+  if (value === null) throw new Error("useAuth must be used inside <AuthProvider>");
+  return value;
+}
+
+// A second, derived hook: the signed-in user, or a thrown error, never null.
+export function useCurrentUser(): User {
+  const { user } = useAuth();
+  if (user === null) throw new Error("useCurrentUser requires a signed-in user");
+  return user;
+}
+
+function ProfileMenu() {
+  const user = useCurrentUser(); // user: User, with no null checks
+  return <span>{user.name}</span>;
+}
+```
+
+`useCurrentUser` moves a precondition ("this component only renders for signed-in users") out of every component and into one throw. Use it for screens behind an auth guard, where a `null` user would be a bug. Components that may render for anonymous visitors use `useAuth().user` and handle `null`.
+
+The export list tells the story. Here's what a module looks like from the outside:
+
+```ts
+// auth.tsx exports
+export { AuthProvider, useAuth, useCurrentUser };
+export type { AuthValue };
+// AuthContext is intentionally NOT exported
+```
+
+> 💡 **Tip.** Name the file after the feature (`auth.tsx`), keep the context, provider, and hooks together, and only export the provider and hooks. Fast Refresh in some setups complains about files that mix components with non-component exports, so check your tooling's convention.
+
+## 54.6 Context + reducer
+
+When the shared state has real transition rules, pair context with `useReducer` ([Chapter 55](/chapter/55)). The provider owns the reducer; consumers get typed `state` and a typed `dispatch`. The pattern gets a compact, fully-typed form:
+
+```tsx
+import { createContext, useContext, useReducer, type Dispatch, type ReactNode } from "react";
+
+type Toast = { id: string; kind: "info" | "error"; message: string };
+
+type ToastAction =
+  | { type: "toastAdded"; toast: Toast }
+  | { type: "toastDismissed"; id: string };
+
+function toastReducer(state: Toast[], action: ToastAction): Toast[] {
+  switch (action.type) {
+    case "toastAdded":
+      return [...state, action.toast];
+    case "toastDismissed":
+      return state.filter((t) => t.id !== action.id);
+  }
+}
+
+const ToastStateContext = createContext<Toast[] | null>(null);
+const ToastDispatchContext = createContext<Dispatch<ToastAction> | null>(null);
+
+export function ToastProvider({ children }: { children: ReactNode }) {
+  const [toasts, dispatch] = useReducer(toastReducer, []);
+  return (
+    <ToastStateContext value={toasts}>
+      <ToastDispatchContext value={dispatch}>{children}</ToastDispatchContext>
+    </ToastStateContext>
+  );
+}
+```
+
+The hooks apply the same safe pattern to each context:
+
+```tsx
+export function useToasts(): Toast[] {
+  const toasts = useContext(ToastStateContext);
+  if (toasts === null) throw new Error("useToasts must be used inside <ToastProvider>");
+  return toasts;
+}
+
+export function useToastDispatch(): Dispatch<ToastAction> {
+  const dispatch = useContext(ToastDispatchContext);
+  if (dispatch === null) throw new Error("useToastDispatch must be used inside <ToastProvider>");
+  return dispatch;
+}
+```
+
+`Dispatch<ToastAction>` means consumers can only dispatch actions that exist in the union: `dispatch({ type: "toastCleared" })` is a compile error. Here `toasts` is an array (which is never `null`), so `null` safely means "no provider". That's the case where `T | null` works without any wrapping.
+
+## 54.7 Splitting contexts
+
+When a context value changes, **every** component that reads it re-renders, no matter which part of the value it cares about. A context that bundles state and actions together makes a button that only *calls* `signOut` re-render whenever `user` changes. Splitting the context fixes that: put frequently changing data in one context and stable data (functions, dispatchers) in another.
+
+```tsx
+type AuthState = { user: User | null };
+type AuthActions = { signIn: (user: User) => void; signOut: () => void };
+
+const AuthStateContext = createContext<AuthState | null>(null);
+const AuthActionsContext = createContext<AuthActions | null>(null);
+
+export function AuthProvider({ children }: { children: ReactNode }) {
+  const [user, setUser] = useState<User | null>(null);
+
+  const state = useMemo<AuthState>(() => ({ user }), [user]);
+  const actions = useMemo<AuthActions>(
+    () => ({ signIn: setUser, signOut: () => setUser(null) }),
+    [], // setUser is stable, so the actions object is created once
+  );
+
+  return (
+    <AuthStateContext value={state}>
+      <AuthActionsContext value={actions}>{children}</AuthActionsContext>
+    </AuthStateContext>
+  );
+}
+```
+
+Now `useAuthActions()` returns an object whose identity never changes, so a `SignOutButton` that uses only it never re-renders because the user changed. You already saw the same split with `dispatch` in 54.6: React guarantees `dispatch` is stable.
+
+```tsx
+function SignOutButton() {
+  const { signOut } = useAuthActions(); // re-renders only if the provider itself remounts
+  return <button onClick={signOut}>Sign out</button>;
+}
+```
+
+> 🚫 **When not to.** Don't split by reflex. Two contexts mean two providers, two hooks, and more to explain. Measure first: if the context value changes rarely (a theme, a locale) or has few consumers, one context is fine. Split when profiling shows needless re-renders from a frequently changing value.
+
+## 54.8 Modern context syntax
+
+React 19 simplified how you write and read context, and the types follow.
+
+**Providing.** The context object *is* the provider component. You write `<ThemeContext value={…}>` instead of `<ThemeContext.Provider value={…}>`. The old form still works, but is slated for deprecation:
+
+```tsx
+const ThemeContext = createContext<Theme>("light");
+
+function App() {
+  return (
+    <ThemeContext value="dark">   {/* ✅ React 19 */}
+      <Page />
+    </ThemeContext>
+  );
+}
+// Legacy: <ThemeContext.Provider value="dark">…</ThemeContext.Provider>
+```
+
+**Reading.** The new `use` function reads a context (or a promise). Unlike `useContext`, `use` may be called **conditionally**, after an early `return`, or inside a loop, because it isn't a hook in the strict sense. Its type is the same: `use(AuthContext)` returns `AuthValue | null`.
+
+```tsx
+import { use } from "react";
+
+export function useAuth(): AuthValue {
+  const value = use(AuthContext);
+  if (value === null) throw new Error("useAuth must be used inside <AuthProvider>");
+  return value;
+}
+
+function Banner({ show }: { show: boolean }) {
+  if (!show) return null;
+  const theme = use(ThemeContext); // ✅ allowed after an early return; useContext would be a rules-of-hooks error
+  return <div className={theme}>Welcome</div>;
+}
+```
+
+Wrapping `use` in your custom hook gives you the same safe pattern with a single import change. For the book's examples, `useContext(Context)` and `use(Context)` are interchangeable; pick `use` for new code.
+
+> 🆕 **Modern note.** Since the provider is now just `<Context value>`, a generic helper can build the whole safe-context pattern once. You'll write exactly that in the Level 3 exercise below: `createSafeContext<T>(name)` returning a `[Provider, useValue]` pair.
+
+## Common mistakes
+
+> ⚠️ **`createContext<T>({} as T)`.** A cast that lies. A missing provider produces `undefined` field reads instead of a clear error. Use `T | null` and a throwing hook.
+
+> ⚠️ **A fake "no-op" default.** It hides a missing provider: clicks do nothing, nothing logs. Prefer failing loudly.
+
+> ⚠️ **Exporting the raw context.** If components can `useContext(AuthContext)` directly, the safe hook is optional, and so the safety is too. Export hooks only.
+
+> ⚠️ **Unmemoized provider values.** `value={{ user, signIn }}` creates a new object on every provider render, re-rendering all consumers. Memoize it, or split state and actions.
+
+> ⚠️ **One giant context for the whole app.** State, theme, user, and settings all change at different rates. Keep contexts small and focused.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** many components at different depths need the same value (theme, auth, locale, feature flags, a toast API), and passing props through the intermediate layers would be pure noise.
+
+> 🚫 **When not to.** Don't use context to avoid passing props a few levels. Explicit props are easier to follow and to type. Don't use it for rapidly changing values read by many components (mouse position, text input as you type): every consumer re-renders. And server data caching belongs in a data library, not hand-rolled context.
+
+## How it connects
+
+> 🔗 **Connection.** The `T | null` honesty is the same instinct as nullable state ([Chapter 52](/chapter/52)) and DOM refs ([Chapter 53](/chapter/53)). The reducer pairing is built in [Chapter 55](/chapter/55), and custom hooks like `useAuth` are typed using the rules of [Chapter 56](/chapter/56).
+
+> 🌍 **Real world.** React Router's `useNavigate`, TanStack Query's `useQueryClient`, and Next.js's `useRouter` all use this pattern: a context that is `null` without a provider, and a hook that throws a helpful error (`useQueryClient` famously says "No QueryClient set, use QueryClientProvider").
+
+## Exercises
+
+### Level 1 — Recall
+
+Identify the unsafe pattern in each definition and say what would go wrong at runtime:
+
+```tsx
+const A = createContext<CartValue>({} as CartValue);
+const B = createContext<SettingsValue>({ theme: "light", setTheme: () => {} });
+const C = createContext<Partial<UserValue>>({});
+const D = createContext<{ locale: string }>(undefined!);
+```
+
+### Level 2 — Application
+
+Build a typed `ThemeContext` with the safe pattern: a `Theme = "light" | "dark"` state, a `toggleTheme` function, a `ThemeProvider`, and a `useTheme` hook that throws outside the provider. The value must be memoized, and the raw context must not be exported.
+
+### Level 3 — Challenge
+
+Write a generic helper `createSafeContext<T>(name)` that returns a `[Provider, useValue]` pair. `useValue` must return `T` (never `null`) and throw an error mentioning `name` when used outside the provider. Use it to recreate `ThemeContext` and `AuthContext` in one line each.
+
+*Hint: the provider can be the context object itself in React 19, so you may return `[Context, useValue] as const`. Think about why the `as const` matters for the tuple's type.*
+
+### Level 4 — Real-world
+
+**Ticket TF-340: Toast notifications.** Build TaskFlow's `NotificationsContext` for toasts.
+
+- The API is `notify({ kind, message })` where `kind` is `"info" | "success" | "error"`; calling it with another kind is a compile error.
+- State and actions are split into two contexts, so components that only call `notify` never re-render when toasts appear.
+- Toasts auto-dismiss after five seconds, and the reducer stays pure (the timer lives in the provider).
+- Using either hook outside the provider throws an error naming the provider. Add tests for the reducer and for the throw.
+
+## Key takeaways
+
+- A context's type must tell the truth about "no provider". Use `createContext<Value | null>(null)`.
+- Never use `{} as Value` or a fake no-op default. They turn a missing provider into a silent bug.
+- Funnel all reads through a custom hook that throws a clear error, and don't export the raw context.
+- Memoize provider values (`useMemo<Value>`), because every consumer re-renders when the identity changes.
+- Pair context with `useReducer` using typed `state` and `Dispatch<Action>`, and split state from dispatch for fewer re-renders.
+- In React 19, write `<Context value={…}>` to provide and `use(Context)` to read, including conditionally.
+
+## What comes next
+
+Our toast reducer was small, but real boards have dozens of events that all change related state. A reducer with a discriminated-union action type and an exhaustive `switch` makes sure none is forgotten. [Chapter 55: Reducers & State Machines with Discriminated Unions](/chapter/55) builds that discipline, and shows the same context pattern on a full task board.

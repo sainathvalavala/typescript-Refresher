@@ -1,0 +1,470 @@
+> 📖 **The problem.** TaskFlow's first backend script is twenty lines long. It reads `config.json`, starts a server on `process.env.PORT`, and works perfectly on your laptop. On the first production deploy it dies in under a second: the platform never set `PORT`, so `parseInt` produced `NaN` and Node refused to listen. You fix that, redeploy, and it dies again, because someone typed `"databseUrl"` in `config.json` and the database client received `undefined`. TypeScript was installed the whole time. It caught neither bug.
+
+This chapter moves TypeScript from the editor-and-browser world of the earlier parts onto **Node.js**, the runtime TaskFlow's API will live in for the rest of the book. You'll set up a project the modern way, learn what Node's type definitions give you, and, just as important, learn where they stop. Environment variables, files, and network responses all come from *outside* your program, and TypeScript can only describe them, never guarantee them.
+
+By the end you'll be able to build a typed Node project, read config and files without lying to the compiler, handle async work with timeouts and cancellation, and write a small, well-behaved command-line tool.
+
+> 🧠 **Mental model.** Node gives you a **typed standard library** (described by `@types/node`) and an **untyped outside world** (files, environment variables, the network). Inside the standard library, trust the types. At the edge, where data arrives from outside, the types are only a guess until you check.
+
+## 30.1 Setting up Node + TypeScript
+
+Node runs JavaScript. TypeScript has to disappear before Node sees your code, and there are two ways to make that happen: **compile** it ahead of time with `tsc` (which writes `.js` files to a `dist` folder), or **strip** the types at load time with a runner such as `tsx`. A modern project uses both: a stripper for fast development, and `tsc` for type checking and production builds.
+
+You need three packages: `typescript` (the compiler and checker), `@types/node` (type descriptions of Node's built-in modules, covered in [Chapter 28](/chapter/28)), and `tsx` (a fast runner).
+
+```sh
+mkdir taskflow-api && cd taskflow-api
+npm init -y
+npm pkg set type=module          # use ES modules, as the rest of the book does
+npm install --save-dev typescript @types/node tsx
+```
+
+The `tsconfig.json` is where Node-specific choices live. Each line here earns its place:
+
+```json
+{
+  "compilerOptions": {
+    "target": "es2023",
+    "lib": ["es2023"],
+    "module": "nodenext",
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true,
+    "skipLibCheck": true,
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src"]
+}
+```
+
+`module: "nodenext"` tells TypeScript to follow Node's *real* module rules: it reads `"type"` from `package.json` and insists on file extensions in relative imports. `lib: ["es2023"]` deliberately leaves out `"dom"`, because Node has no `document`. `types: ["node"]` loads Node's definitions. `erasableSyntaxOnly` forbids the few TypeScript features that generate code (enums, namespaces with values, constructor parameter properties), so any type-stripping runner can handle your files.
+
+Then wire up the scripts:
+
+```json
+{
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "start": "node dist/server.js"
+  }
+}
+```
+
+> ⚠️ **Common mistake.** `tsx` and Node's own type stripping **do not check types**. They delete the annotations and run whatever is left. Only `tsc` checks. Run `npm run typecheck` in your editor workflow and in CI, or a type error will happily reach production.
+
+With `module: "nodenext"`, relative imports name the file that will exist **after** the build, which is the `.js` file:
+
+```ts
+// src/server.ts
+import { config } from "./config.js"; // ✅ resolves to src/config.ts now, dist/config.js later
+import { config } from "./config";    // ❌ Relative import paths need explicit file extensions in ECMAScript imports when '--moduleResolution' is 'node16' or 'nodenext'. Did you mean './config.js'?
+```
+
+> 🆕 **Modern note.** TypeScript 6 and later no longer load every `@types` package automatically; without `"types": ["node"]` you'll see `Cannot find name 'process'`. And Node 22.18+ can run a `.ts` file directly (`node src/server.ts`) by stripping its types, with no flag (earlier 22.x releases need `--experimental-strip-types`). It ignores `tsconfig.json`, checks nothing, and expects relative imports to end in `.ts`, so this book uses `tsx` during development and `tsc` for builds.
+
+## 30.2 Node's type definitions
+
+`@types/node` is a large set of declaration files that describe everything Node provides: the `process` object, the `Buffer` class, and every built-in module. Once it's loaded, Node's APIs are as discoverable as your own code. Hover over anything and the editor tells you exactly what it is.
+
+```ts
+import { readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+
+const args = process.argv;              // args: string[]  (["/usr/bin/node", "/app/cli.js", ...])
+const id = randomUUID();                // id: a template literal type, "xxxxxxxx-xxxx-..." shaped
+const bytes = Buffer.from("héllo");     // a Buffer: raw bytes, not characters
+bytes.length;                           // 6, because "é" takes two bytes in UTF-8
+const text = await readFile("notes.txt", "utf8"); // text: string
+```
+
+The `node:` prefix on imports means "the built-in module, never an npm package with the same name". It's optional for older modules like `fs`, but required for newer ones such as `node:test` and `node:sqlite`, and it makes the import's origin obvious to a reader. Use it everywhere.
+
+Node and the browser share many globals (`fetch`, `URL`, `AbortController`, `setTimeout`, `structuredClone`, `console`), but each also has globals the other lacks:
+
+| Available in | Examples |
+|---|---|
+| Both | `fetch`, `URL`, `AbortController`, `setTimeout`, `crypto`, `console` |
+| Node only | `process`, `Buffer`, `import.meta.dirname` |
+| Browser only | `window`, `document`, `localStorage`, `alert` |
+
+This is why the `lib` setting from 30.1 matters. If you leave `lib` unset, TypeScript includes the DOM library by default, and browser-only code type-checks in a Node project and then crashes:
+
+```ts
+// With "lib": ["es2023"] (no "dom"):
+document.title = "TaskFlow"; // ❌ Cannot find name 'document'. Do you need to change your target library? Try changing the 'lib' compiler option to include 'dom'.
+
+// Without a lib setting, the same line compiles, then at runtime:
+// 💥 ReferenceError: document is not defined
+
+const handle = setTimeout(() => {}, 1000); // handle: NodeJS.Timeout, not a number as in the browser
+```
+
+> 💡 **Tip.** Code shared between Node and the browser should write `ReturnType<typeof setTimeout>` instead of `number` or `NodeJS.Timeout`. It's correct in both environments.
+
+## 30.3 Environment variables
+
+Environment variables are configuration that lives *outside* your code: set by your shell, a `.env` file, Docker, or your hosting platform. Node exposes them on `process.env`, and its type is honest about what that means. `process.env` is typed as an object whose every property is `string | undefined`, because any variable might not be set, and the operating system only stores text.
+
+```ts
+const raw = process.env.PORT;         // raw: string | undefined
+const port: number = process.env.PORT; // ❌ Type 'string | undefined' is not assignable to type 'number'.
+parseInt(process.env.PORT);           // ❌ Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
+```
+
+TypeScript forces you to deal with the `undefined`. What it can't do is protect you from the *string*. Every value is text, which creates two classic runtime traps that compile without complaint:
+
+```ts
+// Started with: DEBUG=false PORT=80a node dist/server.js
+if (process.env.DEBUG) enableVerboseLogs(); // 💥 runs anyway: "false" is a non-empty, truthy string
+const port = Number(process.env.PORT);      // port: number ... and its value is NaN
+```
+
+A reasonable first step is a small **config module** with helper functions that check each variable once, at startup, and convert it to the type the rest of the program wants:
+
+```ts
+// src/env.ts (a naive version; Chapter 32 replaces it with a schema)
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) throw new Error(`Missing required environment variable: ${name}`);
+  return value;
+}
+
+function intEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value)) throw new Error(`${name} must be an integer, got "${raw}"`);
+  return value;
+}
+
+export const env = {
+  port: intEnv("PORT", 3000),                // number, and guaranteed not NaN
+  databaseUrl: requireEnv("DATABASE_URL"),   // string, and guaranteed present
+  debug: process.env.DEBUG === "true",       // boolean, compared as text on purpose
+};
+```
+
+This works, and it's far better than reading `process.env` all over the codebase. But notice the cost: every new variable needs another hand-written helper, and the checks and the types are maintained separately. [Chapter 32](/chapter/32) replaces all of it with one schema.
+
+> ⚠️ **Common mistake.** It's tempting to "fix" the `undefined` by redeclaring the environment type. It compiles, and it lies: the variable is still missing on any machine where nobody set it.
+
+```ts
+declare global {
+  namespace NodeJS {
+    interface ProcessEnv { DATABASE_URL: string } // a promise nobody can keep
+  }
+}
+const url = process.env.DATABASE_URL; // url: string, even when it's undefined at runtime
+```
+
+> 💡 **Tip.** Node 20.6+ loads `.env` files itself: `node --env-file=.env dist/server.js` (and `tsx` accepts the same flag). Keep `.env` out of git and commit a `.env.example` listing the variable names.
+
+## 30.4 The file system
+
+Node's file APIs live in `node:fs/promises`, the promise-based version you can `await`. The type of `readFile` depends on how you call it: pass an encoding and you get a `string`; omit it and you get a `Buffer` of raw bytes. Overloads ([Chapter 11](/chapter/11)) make the return type follow your arguments.
+
+```ts
+import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { join } from "node:path";
+
+const text = await readFile("data/tasks.json", "utf8"); // text: string
+const logo = await readFile("assets/logo.png");          // a Buffer of bytes
+
+// Relative paths resolve from process.cwd() (where you ran the command), not from this file.
+const dataDir = join(import.meta.dirname, "..", "data"); // anchored to this file's folder
+await mkdir(dataDir, { recursive: true });
+await writeFile(join(dataDir, "backup.json"), JSON.stringify([], null, 2), "utf8");
+```
+
+Now the trap. `JSON.parse` is declared to return `any`, and `any` is assignable to every type. So annotating the result looks like safety and is actually an unchecked promise:
+
+```ts
+type AppConfig = { port: number; databaseUrl: string };
+
+const config: AppConfig = JSON.parse(await readFile("config.json", "utf8")); // ✅ compiles. Nothing was checked.
+
+// config.json actually contains: { "port": "8080", "databseUrl": "postgres://db/taskflow" }
+config.databaseUrl.startsWith("postgres"); // 💥 TypeError: Cannot read properties of undefined (reading 'startsWith')
+config.port + 1;                           // "80801": string concatenation, no error at all
+```
+
+The annotation `AppConfig` described what you *hoped* was in the file. The file disagreed, and the error appeared far from its cause. The honest version says what TypeScript actually knows about file contents, which is nothing, by returning `unknown` ([Chapter 9](/chapter/9)):
+
+```ts
+// src/fs-utils.ts
+import { readFile } from "node:fs/promises";
+
+export async function readJson(path: string): Promise<unknown> {
+  const text = await readFile(path, "utf8");
+  return JSON.parse(text); // any goes in, unknown comes out: the lie stops here
+}
+
+export async function readJsonOr(path: string, fallback: unknown): Promise<unknown> {
+  try {
+    return await readJson(path);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return fallback; // file missing
+    throw error; // anything else (bad JSON, permissions) is a real problem
+  }
+}
+
+const raw = await readJson("config.json"); // raw: unknown
+raw.port;                                  // ❌ 'raw' is of type 'unknown'.
+```
+
+`unknown` forces you to check before use. Writing those checks by hand gets tedious fast; that's the whole subject of [Chapter 32](/chapter/32).
+
+## 30.5 Async patterns
+
+Almost everything in Node that touches the outside world is asynchronous. Three patterns cover most of what you'll write.
+
+**Run independent work in parallel.** Awaiting two reads one after the other takes the sum of their times. `Promise.all` starts both at once and waits for both, and TypeScript types the result as a tuple, so each position keeps its own type:
+
+```ts
+import { readFile, readdir } from "node:fs/promises";
+
+const [configText, dataFiles] = await Promise.all([
+  readFile("config.json", "utf8"),
+  readdir("data"),
+]); // configText: string, dataFiles: string[]
+```
+
+**Give up after a deadline, or on request.** An `AbortSignal` is a small object that says "stop". Many Node and web APIs accept one through a `signal` option. `AbortSignal.timeout(ms)` creates a signal that fires by itself; an `AbortController` gives you a signal you fire manually, for example on Ctrl+C. `AbortSignal.any` combines several.
+
+```ts
+const controller = new AbortController();
+process.once("SIGINT", () => controller.abort()); // Ctrl+C cancels in-flight work
+
+async function fetchHolidays(year: number, signal?: AbortSignal): Promise<unknown> {
+  const response = await fetch(`https://api.example.com/holidays/${year}`, {
+    signal: AbortSignal.any([AbortSignal.timeout(5_000), ...(signal ? [signal] : [])]),
+  });
+  if (!response.ok) throw new Error(`Holiday API responded ${response.status}`);
+  return response.json(); // in Node's types this is already Promise<unknown>
+}
+
+try {
+  await fetchHolidays(2026, controller.signal);
+} catch (error) {
+  if (error instanceof DOMException && error.name === "TimeoutError") console.error("Holiday API timed out");
+  else if (error instanceof DOMException && error.name === "AbortError") console.error("Cancelled");
+  else throw error;
+}
+```
+
+The design lesson is in the signature: a function that does slow work should **accept** a `signal?: AbortSignal` and pass it down, so its callers decide when to stop.
+
+**Process big files a piece at a time.** `readFile` loads the whole file into memory. For a 2 GB CSV export, use a **stream**, which delivers the file in chunks. `node:readline` turns a stream into lines you can loop over with `for await`:
+
+```ts
+import { createReadStream } from "node:fs";
+import { createInterface } from "node:readline";
+
+const lines = createInterface({ input: createReadStream("export.csv"), crlfDelay: Infinity });
+let count = 0;
+for await (const line of lines) {   // line: string
+  if (line.trim() !== "") count++;
+}
+console.log(`${count - 1} data rows`); // minus the header
+```
+
+> ⏭ **Safe to skip.** Streams have a much larger API (`pipeline`, transforms, backpressure). You won't need it for TaskFlow; the readline pattern above handles most line-oriented files.
+
+## 30.6 Configuration modules
+
+Picture the alternative to centralizing config: `process.env.DATABASE_URL` read in fourteen files, each with its own fallback, each converting strings slightly differently. A missing variable isn't noticed at startup; it's noticed at 3 a.m., when a rarely used code path finally runs.
+
+A **configuration module** is the fix. One file reads every setting, once, at startup, converts and checks each value, and exports a single typed, read-only object. Everything else imports that object and never touches `process.env` again. If something's wrong, the program refuses to start, which is the best possible time to find out.
+
+```ts
+// src/config.ts
+import { join } from "node:path";
+
+const LOG_LEVELS = ["debug", "info", "warn", "error"] as const;
+type LogLevel = (typeof LOG_LEVELS)[number]; // "debug" | "info" | "warn" | "error"
+
+function isLogLevel(value: string): value is LogLevel {
+  return (LOG_LEVELS as readonly string[]).includes(value);
+}
+
+export interface AppConfig {
+  readonly port: number;
+  readonly databaseUrl: string;
+  readonly logLevel: LogLevel;
+  readonly dataDir: string;
+}
+
+function loadConfig(): AppConfig {
+  const port = Number(process.env.PORT ?? "3000");
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`Invalid PORT: ${process.env.PORT}`);
+
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) throw new Error("DATABASE_URL is required");
+
+  const logLevel = process.env.LOG_LEVEL ?? "info";
+  if (!isLogLevel(logLevel)) throw new Error(`LOG_LEVEL must be one of ${LOG_LEVELS.join(", ")}`);
+
+  return { port, databaseUrl, logLevel, dataDir: join(import.meta.dirname, "..", "data") };
+}
+
+export const config: AppConfig = Object.freeze(loadConfig());
+```
+
+Using it is boring, which is the point:
+
+```ts
+// src/server.ts
+import { config } from "./config.js";
+
+server.listen(config.port);   // config.port: number, checked at startup
+config.port = 8080;           // ❌ Cannot assign to 'port' because it is a read-only property.
+```
+
+> 💡 **Tip.** For code you want to test, pass `AppConfig` in as a parameter (`createApp(config)`) instead of importing the singleton deep inside. Tests can then build any config they like without touching environment variables.
+
+## 30.7 Scripts and CLIs
+
+Not every Node program is a server. TaskFlow will need small command-line tools: import a CSV, export a backup, print stats. A good CLI has three things: arguments parsed into typed values, clear usage errors, and correct **exit codes**, the number a program hands back to the shell so scripts and CI can tell success from failure.
+
+Node ships `parseArgs` in `node:util`, and its types are inferred from the options you describe. Declare `type: "boolean"` and you get a `boolean`; declare a `default` and the `undefined` disappears:
+
+```ts
+import { parseArgs } from "node:util";
+
+const { values, positionals } = parseArgs({
+  options: {
+    status: { type: "string", short: "s" },
+    json: { type: "boolean", default: false },
+  },
+  allowPositionals: true,
+});
+// values.status: string | undefined
+// values.json:   boolean
+// positionals:   string[]
+```
+
+By convention, exit code `0` means success, `1` means "something failed", and `2` means "you called me wrong". Prefer setting `process.exitCode` over calling `process.exit()`: the latter stops the process immediately, which can cut off output that's still being written. Here is a complete, small tool:
+
+```ts
+// src/cli/stats.ts. Run with: npm run stats -- data/tasks.json --status todo
+import { parseArgs } from "node:util";
+import { readJson } from "../fs-utils.js";
+
+const USAGE = "Usage: stats <file.json> [--status todo|doing|done] [--json]";
+
+function statusOf(item: unknown): string | undefined {
+  if (typeof item === "object" && item !== null && "status" in item && typeof item.status === "string") {
+    return item.status;
+  }
+  return undefined;
+}
+
+async function main(): Promise<number> {
+  let parsed;
+  try {
+    parsed = parseArgs({ options: { status: { type: "string" }, json: { type: "boolean", default: false } }, allowPositionals: true });
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : error, `\n${USAGE}`);
+    return 2; // unknown flag, missing value
+  }
+  const file = parsed.positionals[0]; // string | undefined (noUncheckedIndexedAccess)
+  if (!file) { console.error(USAGE); return 2; }
+
+  const data = await readJson(file); // unknown
+  if (!Array.isArray(data)) { console.error(`${file} does not contain an array`); return 1; }
+
+  const counts: Record<string, number> = {};
+  for (const item of data) {
+    const status = statusOf(item) ?? "invalid";
+    if (!parsed.values.status || parsed.values.status === status) counts[status] = (counts[status] ?? 0) + 1;
+  }
+  console.log(parsed.values.json ? JSON.stringify(counts) : counts);
+  return 0;
+}
+
+process.exitCode = await main();
+```
+
+Notice how much of the file is about the **edges**: arguments that might be wrong, a file that might not hold an array, items that might not have a `status`. That ratio is normal for real tools, and it's a preview of the next two chapters.
+
+## Common mistakes
+
+> ⚠️ **Believing `tsx` checked your types.** Runners strip types and run. Only `tsc --noEmit` (or your editor) checks. Make `typecheck` a CI step.
+
+> ⚠️ **Letting the DOM library into a Node project.** Without `"lib": ["es2023"]`, `document` and `localStorage` type-check and then throw `ReferenceError` at runtime.
+
+> ⚠️ **Annotating `JSON.parse` results.** `const tasks: Task[] = JSON.parse(text)` checks nothing. Return `unknown` from parsing helpers and narrow or validate afterward.
+
+> ⚠️ **Reading `process.env` everywhere, or redeclaring its type.** Read env once in a config module. Augmenting `ProcessEnv` to make variables non-optional is a lie the compiler can't detect.
+
+> ⚠️ **Paths relative to wherever you happened to run the command.** Anchor file paths with `import.meta.dirname` and `node:path`.
+
+> ⚠️ **`process.exit()` in the middle of async work.** It can truncate logs and skip cleanup. Set `process.exitCode` and let the program finish.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** you're writing anything that lives longer than an afternoon on the server side: APIs, background jobs, build scripts, and CLIs. The typed standard library alone pays for the setup, and a config module turns "crashes at 3 a.m." into "refuses to start".
+
+> 🚫 **When not to.** A one-off script doesn't need a `tsconfig.json`, a build step, or a `dist` folder: write `fix-data.ts` and run it with `node fix-data.ts` (Node 22.18+) or `npx tsx fix-data.ts`. Add the full setup from 30.1 when the code gets a second user or a deploy target, not before.
+
+## How it connects
+
+> 🔗 **Connection.** The `nodenext` module rules and `.js` import extensions come from [Chapter 25](/chapter/25); every option in the `tsconfig.json` is explained in [Chapter 26](/chapter/26); `tsx` and the run/check split are from [Chapter 27](/chapter/27); `@types/node` is a declaration package of the kind described in [Chapter 28](/chapter/28). The `unknown` returned by `readJson` is the same `unknown` from [Chapter 9](/chapter/9), and [Chapter 32](/chapter/32) turns both the naive env helpers and the JSON reader into schema-validated boundaries.
+
+> 🌍 **Real world.** Production Node services almost always have a single `config` module that validates the environment at boot, and they run `tsc --noEmit` in CI even when they deploy with a type-stripping runner. CLIs in the wild use `parseArgs` for small tools and libraries such as Commander for larger ones; the exit-code conventions are the same everywhere.
+
+## Exercises
+
+### Level 1 — Recall
+
+Write `readJsonFile(path: string): Promise<unknown>`. Then predict the type of each expression below, and check your answers by hovering:
+
+```ts
+process.env.HOME;
+process.argv[2];                          // with noUncheckedIndexedAccess on
+await readFile("a.txt", "utf8");
+await readFile("a.png");
+JSON.parse("{}");
+setTimeout(() => {}, 100);
+```
+
+For each one, say whether its *value* comes from inside your program or from the outside world.
+
+### Level 2 — Application
+
+Write a typed CLI, `summarize`, that reads a CSV file of tasks (`id,title,status,dueDate`) and prints the number of rows, the count per status, and how many tasks are overdue. Use `parseArgs` for a `--file` option and a `--json` flag, exit with code `2` on bad arguments and `1` when the file can't be read. Don't use `any`.
+
+### Level 3 — Challenge
+
+Write a batch processor that reads every `.json` file in a folder and reports which ones fail to parse. Each file gets its own 2-second timeout, and pressing Ctrl+C cancels the whole batch cleanly, printing how many files were completed.
+
+*Hint: create one `AbortController` for the batch, and combine its signal with a per-file `AbortSignal.timeout` using `AbortSignal.any`.*
+
+### Level 4 — Real-world
+
+**Ticket TF-210: Import/export CLI.** Support needs to move TaskFlow data between JSON backups and spreadsheets.
+
+- `taskflow export --format csv --out tasks.csv` converts `data/tasks.json` to CSV; `--format json` writes a pretty-printed copy.
+- `taskflow import tasks.csv` converts a CSV back into the JSON file, treating every row as `unknown` until each field has been checked, and lists rejected rows with their line numbers.
+- Exit codes: `0` on success, `1` if any row was rejected or a file failed, `2` on invalid arguments.
+- All configuration (data directory, default format) comes from one config module; no other file reads `process.env`.
+
+## Key takeaways
+
+- Run TypeScript on Node with a stripper (`tsx`, or Node 22.18+ itself) for speed, and `tsc` for checking and builds. **Strippers never check types.**
+- A Node `tsconfig.json` uses `module: "nodenext"`, `types: ["node"]`, and a `lib` **without** `"dom"`.
+- `@types/node` makes the standard library fully typed. Prefer `node:` imports.
+- `process.env` values are `string | undefined`. TypeScript handles the `undefined`; you must handle the "it's only text".
+- `JSON.parse` returns `any`. Annotating its result is an unchecked claim; return `unknown` instead.
+- Accept an `AbortSignal` in any function that does slow work, and use `Promise.all` for independent tasks.
+- Centralize configuration in one module that fails at startup, and give CLIs typed arguments and honest exit codes.
+
+## What comes next
+
+You can now read files and environment variables, and you've seen that both arrive as text TypeScript can't vouch for. An HTTP request is the same story at much larger scale: the body is a stream of bytes from a stranger. In [Chapter 31: Building a Typed HTTP API](/chapter/31), you'll build TaskFlow's API with clear, typed layers, and you'll deliberately leave one door unlocked so that Chapter 32 can walk straight through it.

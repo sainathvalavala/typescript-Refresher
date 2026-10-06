@@ -1,0 +1,359 @@
+> 📖 **The problem.** You install a charting library your company has used for years and write one line to use it. The compiler answers: `Could not find a declaration file for module 'legacy-charts'. '…/node_modules/legacy-charts/index.js' implicitly has an 'any' type.` The library works fine at runtime, but TypeScript knows nothing about it, and the "fix" in a forum post says to write `declare module "legacy-charts";` and move on. What did that line actually do, and what should you do instead?
+
+TypeScript can only check what it can *see*. Code you write is visible, but most code in a real project (the browser's DOM, Node, React, thousands of npm packages) is JavaScript that was compiled elsewhere. **Declaration files** are how TypeScript learns the shape of code it can't read the source of. This chapter explains what they are, where they come from, how to write your own, and how to extend other people's.
+
+> 🧠 **Mental model.** **A `.d.ts` file is a type-only description of JavaScript that exists elsewhere: a contract with no implementation.** It says "there is a function `render` taking these arguments", and the real function lives in some `.js` file.
+
+## 28.1 What declaration files are
+
+A declaration file ends in `.d.ts` and contains **only types and declarations**, never runnable code. Imagine a plain JavaScript file `math.js`:
+
+```js
+// math.js
+export function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+```
+
+Its companion declaration file describes it for TypeScript:
+
+```ts
+// math.d.ts
+export declare function clamp(value: number, min: number, max: number): number;
+```
+
+When you `import { clamp } from "./math"`, TypeScript finds `math.d.ts`, learns the signature, and checks every call, while at runtime Node loads the real `math.js`. The word `declare` means "this exists somewhere else; don't generate code for it."
+
+You've been using declaration files all along without writing one. `lib.dom.d.ts` ships inside TypeScript and describes everything the browser provides (`document`, `HTMLElement`, `fetch`). `@types/node` describes `process`, `Buffer`, and `fs`. Your editor's "Go to definition" on `document.querySelector` lands in one of these files.
+
+```ts
+// From lib.dom.d.ts (simplified): a description, not an implementation
+interface Document {
+  querySelector<E extends Element = Element>(selectors: string): E | null;
+  getElementById(elementId: string): HTMLElement | null;
+}
+declare var document: Document;
+```
+
+> 💡 **Tip.** A `.d.ts` file never produces JavaScript, so `tsc` emits nothing for it. If you find yourself wanting to put a function body in one, you want a `.ts` file.
+
+## 28.2 @types and DefinitelyTyped
+
+Where do the types for third-party packages come from? There are two places:
+
+1. **Bundled types.** The package ships its own `.d.ts` files and points to them with a `"types"` field in its `package.json`. Most modern packages (Zod, TanStack Query, Vitest) do this. You install the package and it just works.
+2. **`@types/*` packages.** For older JavaScript packages, volunteers maintain declarations in a huge repository called **DefinitelyTyped**, published to npm under the `@types` scope.
+
+```sh
+npm install lodash                 # the library: JavaScript only
+npm install --save-dev @types/lodash   # its declarations, a dev dependency
+```
+
+```ts
+import { chunk } from "lodash";
+chunk([1, 2, 3, 4], 2);   // ✅ number[][]
+chunk([1, 2, 3, 4], "2"); // ❌ compile error: the declarations say the size is a number
+```
+
+Types are a **dev dependency** because they are erased at runtime. And `@types` packages should track the library's version: `@types/react@19` describes `react@19`. A mismatch (new library, old types) produces confusing errors about functions that exist but "don't".
+
+```json
+{
+  "dependencies": { "react": "^19.0.0" },
+  "devDependencies": { "@types/react": "^19.0.0" }
+}
+```
+
+> ⚠️ **Common mistake.** Editing a file inside `node_modules/@types`. Your change disappears on the next install and never reaches your teammates. If a type is wrong, fix it with module augmentation (28.6) or a local declaration.
+
+## 28.3 declare and ambient declarations
+
+`declare` tells TypeScript "a thing with this name and type exists at runtime". Declarations like that are called **ambient** (they describe the environment rather than create anything). There are a few forms:
+
+```ts
+// globals provided by a <script> tag or the host environment
+declare const API_BASE_URL: string;
+declare function gtag(command: string, ...args: unknown[]): void;
+
+// a whole module's shape
+declare module "legacy-charts" {
+  export interface ChartOptions { width: number; title?: string }
+  export function render(el: HTMLElement, options: ChartOptions): void;
+}
+
+// a wildcard: every import ending in .svg is a URL string (bundlers do this)
+declare module "*.svg" {
+  const url: string;
+  export default url;
+}
+```
+
+Now the imports are typed, and mistakes are caught:
+
+```ts
+import { render } from "legacy-charts";
+import logo from "./logo.svg";
+
+const l: number = logo; // ❌ Type 'string' is not assignable to type 'number'.
+render(document.body, { width: "100" }); // ❌ Type 'string' is not assignable to type 'number'.
+render(document.body);                   // ❌ Expected 2 arguments, but got 1.
+```
+
+`declare module "name" { … }` in a script-style `.d.ts` file (one with no top-level `import` or `export`) is how you describe a module that has no types of its own. Include the file in your `tsconfig.json`'s `include` and TypeScript picks it up automatically.
+
+## 28.4 Typing an untyped library
+
+Back to the opening error. You have three escalating options, and the right strategy is to start small and refine:
+
+```ts
+// types/legacy-charts.d.ts
+
+// Level 0: silence the error. Everything from the module is `any`.
+declare module "legacy-charts";
+```
+
+That one line is an escape hatch, not a solution: every import becomes `any`, so nothing is checked. It's fine as a *first step* to unblock yourself. Next, type only what you actually use:
+
+```ts
+// Level 1: just the functions you call today
+declare module "legacy-charts" {
+  export function render(el: HTMLElement, options: { width: number }): void;
+}
+```
+
+```ts
+// Level 2: as you use more of the library, grow the declaration, and document quirks
+declare module "legacy-charts" {
+  export interface ChartOptions {
+    width: number;
+    title?: string;
+    /** Legacy: pass "bar" | "line". Defaults to "line". */
+    kind?: "bar" | "line";
+  }
+  export function render(el: HTMLElement, options: ChartOptions): void;
+  export function destroy(el: HTMLElement): void;
+}
+```
+
+Declare what you use, not what the library has: a small accurate declaration beats a large guessed one. If the library matters, consider contributing the finished declaration to DefinitelyTyped so everyone benefits.
+
+> ⚠️ **Common mistake.** A catch-all `declare module "*";` hides **every** missing-types error in the project, because it makes every unresolved import `any`. Declare specific modules by name.
+
+## 28.5 Global declarations
+
+Sometimes code relies on something **global**: an analytics snippet added by a `<script>` tag, a value injected by the bundler, a property on `window`. You tell TypeScript about it with a global declaration. In a file that is a *module* (has any top-level `import` or `export`), wrap global additions in `declare global`:
+
+```ts
+// types/globals.d.ts
+export {}; // makes this file a module, so `declare global` is allowed
+
+declare global {
+  interface Window {
+    analytics: { track(event: string, props?: Record<string, unknown>): void };
+  }
+  var APP_VERSION: string; // `var` (not let/const) is what creates a global property
+}
+```
+
+```ts
+window.analytics.track("task_created", { id: 1 }); // ✅
+window.analytics.trak("x");
+// ❌ Property 'trak' does not exist on type '{ track(event: string, props?: Record<string, unknown> | undefined): void; }'. Did you mean 'track'?
+
+const v: number = APP_VERSION; // ❌ Type 'string' is not assignable to type 'number'.
+```
+
+The `interface Window { … }` works because of declaration merging (28.7): you're adding fields to the `Window` interface that `lib.dom.d.ts` already declared.
+
+Notice the `export {}` line. Without any top-level `import` or `export`, the file is a *script*, and `declare global` is an error there; with it, TypeScript treats the file as a module and the augmentation applies. (In a script file you could instead write `interface Window { … }` directly at the top level.)
+
+> 🚫 **When not to.** Globals are a last resort. They're invisible at the import site, can't be tree-shaken, and collide across libraries. Prefer a typed module that wraps the global (`export const analytics = window.analytics`) and use that.
+
+## 28.6 Module augmentation
+
+What if a library's types are *almost* right, and you need to add a field? You **augment** the module: reopen its declarations and merge your additions in. The classic cases are adding a `user` to a framework's request object or custom tokens to a theme.
+
+```ts
+// theme.ts: a module we own (stands in for a library)
+export interface Theme { primary: string }
+export function makeTheme(): Theme { return { primary: "#000" }; }
+```
+
+```ts
+// theme-augment.ts: add a field from elsewhere
+import "./theme";            // makes this file a module that refers to ./theme
+
+declare module "./theme" {
+  interface Theme {
+    danger?: string;          // optional: existing code that builds a Theme must keep compiling
+  }
+}
+```
+
+```ts
+import { makeTheme } from "./theme";
+
+const t = makeTheme();
+t.danger?.toUpperCase(); // ✅ augmented field is visible everywhere
+t.nope;                  // ❌ Property 'nope' does not exist on type 'Theme'.
+```
+
+A realistic augmentation for a web framework looks the same, only the module name is the library's:
+
+```ts
+// express.d.ts
+import type { User } from "./models";
+
+declare module "express-serve-static-core" {
+  interface Request {
+    user?: User;     // set by your auth middleware
+  }
+}
+```
+
+Two rules decide whether augmentation works. The file **must be a module** (it needs a top-level `import` or `export`), and the module name in `declare module "…"` must match what the library's own types use. Add new fields as optional if existing code constructs the type, or every constructor call will stop compiling.
+
+> ⚠️ **Common mistake.** An augmentation "doesn't apply" because the file is a script. Add `export {}` or an import, and make sure the file is included by `tsconfig.json`.
+
+## 28.7 Declaration merging, revisited
+
+You met merging in [Chapter 12](/chapter/12): two `interface` declarations with the same name combine into one. Augmentation and global declarations are that same rule applied across files. Each of the mergeable kinds works a little differently:
+
+```ts
+// Interfaces: members from every declaration are merged
+interface Box { w: number }
+interface Box { h: number }
+const b: Box = { w: 1 };
+// ❌ Property 'h' is missing in type '{ w: number; }' but required in type 'Box'.
+
+// Namespace + function: attach properties to a function (a JavaScript idiom)
+function greet(name: string) { return "hi " + name; }
+namespace greet {
+  export const polite = true;
+}
+greet("Ada");     // ✅ callable
+greet.polite;     // ✅ true
+```
+
+Type aliases do **not** merge, so declaring `type Box` twice is an error ("Duplicate identifier"). This is the main practical reason library authors prefer `interface` for shapes meant to be extended: consumers can augment them. A namespace can also merge with a class (adding static members) or an enum.
+
+> 🔗 **Connection.** The `namespace greet` form is mostly useful in declaration files, where it describes JavaScript functions that carry properties (like `express()` and `express.static`). In your own `.ts` code, prefer modules; note that `namespace` is not allowed in Node's type-stripping mode ([Chapter 27](/chapter/27)).
+
+## 28.8 Generating declarations
+
+If you publish a library (or share code between packages in a monorepo), consumers need `.d.ts` files for **your** code. You don't write them: `tsc` generates them from your `.ts` source. Three settings control it:
+
+```json
+{
+  "compilerOptions": {
+    "declaration": true,
+    "declarationMap": true,
+    "emitDeclarationOnly": true,
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src"]
+}
+```
+
+`declaration` emits the `.d.ts` files, `declarationMap` adds `.d.ts.map` files so "Go to definition" jumps to your original `.ts` source instead of the generated file, and `emitDeclarationOnly` skips JavaScript when a bundler produces that part. Given this source:
+
+```ts
+// src/task.ts
+export interface Task { id: string; title: string }
+export function createTask(title: string, priority = 1) {
+  return { id: "x", title, priority };
+}
+```
+
+the generated `dist/task.d.ts` keeps only the public surface, with inferred types written out:
+
+```ts
+// dist/task.d.ts (generated)
+export interface Task {
+    id: string;
+    title: string;
+}
+export declare function createTask(title: string, priority?: number): {
+    id: string;
+    title: string;
+    priority: number;
+};
+//# sourceMappingURL=task.d.ts.map
+```
+
+Finally, tell consumers where to find them in `package.json`:
+
+```json
+{
+  "name": "@taskflow/utils",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts"
+}
+```
+
+Publishing is a bigger topic (the `exports` map, dual ESM/CJS builds, checking your output with tools like `publint`), deepened in [Chapter 92](/chapter/92). For now, remember that your *return types are part of your public API*: a function whose inferred type changes will change the generated `.d.ts`.
+
+## Common mistakes
+
+> ⚠️ **A `declare module "*"` catch-all.** It turns every untyped import into `any` and hides real problems everywhere. Declare each module by name, and refine over time.
+
+> ⚠️ **Editing `node_modules/@types`.** The next `npm install` erases your fix. Use augmentation, or a local `.d.ts`, committed to your repo.
+
+> ⚠️ **Augmentations that don't apply because the file isn't a module.** `declare global` and `declare module "x"` augmentations need a top-level `import` or `export` in that file.
+
+> ⚠️ **Mismatched `@types` versions.** `@types/node` for Node 18 on a Node 24 project, or `@types/react@18` with React 19, produces errors about APIs that really exist. Keep them aligned.
+
+> ⚠️ **A `.d.ts` file outside `include`.** If TypeScript never reads the file, the declarations don't exist. Put it under a folder your `tsconfig.json` includes.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** a dependency has no types, a global needs describing, or a library's types need one extra field. Also when you produce a library others will consume.
+
+> 🚫 **When not to.** If you control the code, convert the JavaScript file to TypeScript instead of writing a `.d.ts` beside it. A hand-written declaration can drift from the real implementation and nothing will warn you, whereas types written in the source are checked against it.
+
+## How it connects
+
+> 🔗 **Connection.** Declaration files are what `tsconfig.json` settings like `types` and `lib` ([Chapter 26](/chapter/26)) choose between. Interfaces and merging came from [Chapter 12](/chapter/12). In migration ([Chapter 29](/chapter/29)) you'll write many small declarations for untyped modules, and in [Chapter 92](/chapter/92) you'll ship them.
+
+> 🌍 **Real world.** Almost everything you `import` in a TypeScript project depends on `.d.ts` files: `@types/react` and `@types/node` are among the most downloaded packages on npm. Tools like Vite document `vite/client` types for exactly the `declare module "*.svg"` pattern shown here.
+
+## Exercises
+
+### Level 1 — Recall
+
+You're given a JavaScript file with three functions: `slugify(text)`, `truncate(text, max)`, and `isEmail(text)`. Write the `.d.ts` file describing them (string in, string out; `isEmail` returns a boolean).
+
+### Level 2 — Application
+
+Augment `Window` with a typed analytics global that has `track(event, props?)` and `identify(userId)`. Use it from a component file, and show the compiler error for a misspelled method.
+
+### Level 3 — Challenge
+
+Type an untyped event-based JavaScript library `tiny-bus` that has `on(event, handler)`, `off(event, handler)`, and `emit(event, ...args)`. Use **overloads** so that `on("ready", () => void)` and `on("data", (chunk: string) => void)` are typed per event name, and unknown event names are rejected.
+
+*Hint: declare one overload per event, or an event map plus a generic.*
+
+### Level 4 — Real-world
+
+**Ticket TF-301: Ship types for the utility library.** The P04 utility library is about to be used from another package.
+
+- Turn on declaration output (`declaration`, `declarationMap`, `emitDeclarationOnly`) and point `package.json` `types` at the result.
+- Create a second small package that installs your library and imports from it, with no type errors.
+- Show that a wrong call from the consuming package fails to compile.
+- List the generated files you expect to publish.
+
+## Key takeaways
+
+- A `.d.ts` file is a contract with no implementation: types for JavaScript that lives elsewhere.
+- Types come bundled with a package or from `@types/*` on DefinitelyTyped; keep versions aligned and install `@types` as dev dependencies.
+- `declare const`, `declare function`, and `declare module` describe things that exist at runtime.
+- Type an untyped library in steps: a one-line `declare module`, then just the functions you use, then the rest as needed.
+- `declare global` (in a module file) adds globals, but a typed wrapper module is usually better.
+- Module augmentation and declaration merging extend other people's types; the file must be a module, and interfaces merge but type aliases do not.
+- `declaration` and `declarationMap` make `tsc` generate `.d.ts` files for your own library.
+
+## What comes next
+
+You can now describe code that has no types. The mirror-image problem is a whole *codebase* without types: thousands of lines of working JavaScript that you need to move to TypeScript without stopping the team. That calls for a strategy, not a rewrite, and it's the subject of [Chapter 29: From JavaScript to TypeScript](/chapter/29).
+

@@ -1,0 +1,324 @@
+> 📖 **The problem.** TaskFlow has a `Select` component for choosing a project, and it works. Its `onChange` receives a `string` (the option's value), so every caller does `projects.find((p) => p.id === value)` to get back the object it *already had*. Then the team needs the same dropdown for users, and someone copies the file and renames `Project` to `User`. Then for priorities. Now there are three near-identical components, and a bug fix has to be made three times.
+
+The problem is the same one from [Chapter 16](/chapter/16): code that's identical except for one *type*. The fix is the same too, a type parameter, applied to a component. A generic component takes a list of anything, remembers what it was, and hands that exact type back to every callback. By the end of this chapter, you'll be able to write `List<T>`, `Table<T>`, and `Select<T>`, know when a constraint like `T extends { id: string }` helps, and recognize the few places where generics and React's own helpers (like `memo`) don't mix.
+
+> 🧠 **Mental model.** **A generic component is a generic function that returns UI.** The `items` you pass decide `T`, and every callback (`renderItem`, `onChange`, `getLabel`) receives that same `T` back.
+
+## 57.1 Why generic components
+
+Compare the two ways to build a reusable list. The first uses a loose type, and the second keeps the caller's:
+
+```tsx
+// Loose: items are `unknown`, so renderItem can't know what it gets
+type LooseListProps = {
+  items: unknown[];
+  renderItem: (item: unknown) => ReactNode;
+};
+
+function LooseList({ items, renderItem }: LooseListProps) {
+  return <ul>{items.map((item, i) => <li key={i}>{renderItem(item)}</li>)}</ul>;
+}
+
+<LooseList items={tasks} renderItem={(task) => task.title} />;
+// ❌ 'task' is of type 'unknown'.
+```
+
+You could write `renderItem={(task) => (task as Task).title}`, but that's a cast at every call site, which turns the type system off exactly where it should help. `any` has the same problem in disguise: nothing checks `task.titel`.
+
+A generic component asks TypeScript to *remember*. The `items` array has a type; `renderItem`'s parameter is **the same type**:
+
+```tsx
+type ListProps<T> = {
+  items: readonly T[];
+  renderItem: (item: T) => ReactNode;
+};
+// "for any T: give me a list of T, and a way to render one T"
+```
+
+Whatever you pass for `items` decides `T`, and the callback is checked against it. One implementation serves tasks, projects, users, and strings, each with full autocomplete and compile-time checking.
+
+## 57.2 Declaring a generic component
+
+Declare the type parameter on the function, right after its name, and use it in the props type, exactly like a generic function:
+
+```tsx
+import type { ReactNode } from "react";
+
+type ListProps<T> = {
+  items: readonly T[];
+  renderItem: (item: T) => ReactNode;
+  emptyMessage?: string;
+};
+
+function List<T>({ items, renderItem, emptyMessage = "Nothing here yet." }: ListProps<T>) {
+  if (items.length === 0) return <p>{emptyMessage}</p>;
+  return (
+    <ul>
+      {items.map((item, index) => (
+        <li key={index}>{renderItem(item)}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+(Using the index as the key is a placeholder; 57.4 fixes it with a constraint.) A generic component is still a plain function that React calls with props, so everything else works as usual: hooks, children, and so on.
+
+You can also write it as an arrow function, but in a `.tsx` file there's a snag: `<T>(props) => …` looks like the start of a JSX element, and the parser gets confused. Two small workarounds:
+
+```tsx
+const ListArrow = <T,>({ items, renderItem }: ListProps<T>) => (
+  <ul>{items.map((item, i) => <li key={i}>{renderItem(item)}</li>)}</ul>
+);
+//                ^ the trailing comma tells the parser "this is a type parameter list"
+
+const ListArrow2 = <T extends unknown>({ items }: ListProps<T>) => <p>{items.length}</p>;
+//                   ^^^^^^^^^^^^^^^^ an `extends` clause does the same job
+```
+
+Most teams just use `function` declarations for generic components and avoid the issue entirely.
+
+## 57.3 Inference from props
+
+You almost never write the type argument. TypeScript infers `T` from the props at each use, the same way it infers `T` for `first([1, 2, 3])`:
+
+```tsx
+const tasks: Task[] = [/* … */];
+const projects: Project[] = [/* … */];
+
+<List items={tasks} renderItem={(task) => task.title} />;
+// T inferred as Task: `task` is Task inside the callback
+
+<List items={projects} renderItem={(p) => p.name} />;
+// T inferred as Project
+
+<List items={tasks} renderItem={(task) => task.name} />;
+// ❌ Property 'name' does not exist on type 'Task'.
+```
+
+Inference flows from `items` into the callback, so put the *data* prop where TypeScript sees it first. (In practice, order within JSX attributes doesn't matter, because TypeScript solves for `T` from the non-function props first, then types the callbacks.) That's why `renderItem={(task) => …}` needs no annotation: it is **contextually typed** by the now-known `T`.
+
+If `items` is an empty literal there's nothing to learn from, so you tell TypeScript explicitly:
+
+```tsx
+<List items={[]} renderItem={(x) => String(x)} />;  // T inferred as never (nothing to infer from)
+<List<Task> items={[]} renderItem={(t) => t.title} />; // ✅ explicit type argument
+```
+
+The `<List<Task> … />` syntax is legal TSX. You'll need it rarely (typically for an empty initial array), and 57.6 returns to it.
+
+## 57.4 Constraining T
+
+An unconstrained `T` is "anything", so inside the component you can't touch any property of it. That's why the list above fell back to the index as a React key, which is a bad key when items are reordered or removed. If the component needs every item to have an `id`, say so with a **constraint** ([Chapter 17](/chapter/17)): `T extends { id: string }`.
+
+```tsx
+type KeyedListProps<T extends { id: string }> = {
+  items: readonly T[];
+  renderItem: (item: T) => ReactNode;
+};
+
+function KeyedList<T extends { id: string }>({ items, renderItem }: KeyedListProps<T>) {
+  return (
+    <ul>
+      {items.map((item) => (
+        <li key={item.id}>{renderItem(item)}</li> // ✅ item.id exists: T is guaranteed to have it
+      ))}
+    </ul>
+  );
+}
+
+<KeyedList items={tasks} renderItem={(t) => t.title} />;   // ✅ Task has an id
+<KeyedList items={projects} renderItem={(p) => p.name} />; // ✅ Project has an id
+<KeyedList items={[{ title: "x" }]} renderItem={(t) => t.title} />;
+// ❌ Object literal may only specify known properties, and 'title' does not exist in type '{ id: string; }'.
+```
+
+The constraint is a *minimum*, not an exact shape. `T` is still inferred as the full `Task`, so `renderItem` sees every `Task` field, and the component only relies on `id`. Constrain to what the component actually uses and nothing more, so it stays reusable.
+
+> 💡 **Tip.** If different data types name their identity differently (`id`, `uuid`, `slug`), don't force a shape. Accept a `getKey: (item: T) => string` prop instead. That's exactly what the `Select` in the next section does.
+
+## 57.5 A generic Select
+
+Now the opening problem. A `Select<T>` receives options of any type, plus two small functions that teach it how to display and identify a `T`. Its `onChange` hands back the **whole `T`**, so callers never search for the object again.
+
+```tsx
+type SelectProps<T> = {
+  options: readonly T[];
+  value: T | null;
+  onChange: (value: T) => void;
+  getLabel: (option: T) => string; // what the user sees
+  getKey: (option: T) => string;   // what identifies it (the <option> value)
+  placeholder?: string;
+};
+
+function Select<T>({ options, value, onChange, getLabel, getKey, placeholder = "Choose…" }: SelectProps<T>) {
+  function handleChange(e: React.ChangeEvent<HTMLSelectElement>) {
+    const chosen = options.find((o) => getKey(o) === e.currentTarget.value);
+    if (chosen !== undefined) onChange(chosen); // chosen: T
+  }
+
+  return (
+    <select value={value === null ? "" : getKey(value)} onChange={handleChange}>
+      <option value="" disabled>{placeholder}</option>
+      {options.map((o) => (
+        <option key={getKey(o)} value={getKey(o)}>{getLabel(o)}</option>
+      ))}
+    </select>
+  );
+}
+```
+
+One component now serves every entity, and each use is fully typed:
+
+```tsx
+function Filters({ projects, users }: { projects: Project[]; users: User[] }) {
+  const [project, setProject] = useState<Project | null>(null);
+  const [assignee, setAssignee] = useState<User | null>(null);
+
+  return (
+    <>
+      <Select
+        options={projects}
+        value={project}
+        onChange={setProject}          // (value: Project) => void ✅
+        getLabel={(p) => p.name}
+        getKey={(p) => p.id}
+      />
+      <Select
+        options={users}
+        value={assignee}
+        onChange={(u) => console.log(u.email)} // u: User, no lookup needed
+        getLabel={(u) => u.name}
+        getKey={(u) => u.id}
+      />
+    </>
+  );
+}
+```
+
+Passing the wrong setter is caught: giving `onChange={setAssignee}` to the project select fails, because `T` is `Project` and `setAssignee` accepts a `User`.
+
+## 57.6 Limits and pitfalls
+
+Generic components are wonderful until they meet a tool that isn't generic. Three cases come up repeatedly.
+
+**`memo` erases the type parameter.** `memo(List)` returns a component typed from `List`'s signature *with `T` already resolved to `unknown`*, so inference is lost:
+
+```tsx
+const MemoList = memo(List);
+<MemoList items={tasks} renderItem={(t) => t.title} />;
+// ❌ 't' is of type 'unknown'.
+
+// ✅ Restore the generic signature with a cast. It is a deliberate, local assertion:
+const MemoList2 = memo(List) as typeof List;
+<MemoList2 items={tasks} renderItem={(t) => t.title} />; // t: Task again
+```
+
+The cast is safe because `memo` doesn't change the props. Do it once, next to the definition, and export the cast version.
+
+**Explicit type arguments are legal but usually unnecessary.** `<List<Task> items={…} />` works, and is the right tool for an empty literal. If you find yourself writing it everywhere, the component is probably designed so `T` can't be inferred: check that `T` appears in a *data* prop, not only in callbacks.
+
+**`T` can't live in context.** `createContext` is created once at module level, so it can't be generic *per use*. A generic provider must pick a single `T` or store `unknown` behind a typed hook. If you need per-instance typing, pass the data as props instead.
+
+> ⚠️ **Common mistake.** Reaching for `any` inside a generic component to satisfy a type error. Usually the fix is a constraint (`T extends …`) or an accessor prop (`getKey`). If it truly needs a cast, make it a single, commented one.
+
+## 57.7 When not to
+
+Generics have a cost: harder-to-read signatures, trickier errors, and the limits above. Apply the golden rule from [Chapter 16](/chapter/16): a type parameter earns its place by connecting two things. If a component's `T` appears only once, or every caller uses the same type, drop it.
+
+```tsx
+// ❌ Pointless: T appears once and connects nothing
+function Badge<T>({ label }: { label: T }) {
+  return <span>{String(label)}</span>;
+}
+
+// ✅ Honest
+function Badge({ label }: { label: string | number }) {
+  return <span>{label}</span>;
+}
+```
+
+A second alternative is a plain **union of props** when there are only a few known cases. A `StatusPill` that shows `"todo" | "doing" | "done"` doesn't need `T`; a union of literal types says it all:
+
+```tsx
+type StatusPillProps = { status: TaskStatus };
+
+function StatusPill({ status }: StatusPillProps) {
+  return <span className={`pill pill-${status}`}>{status}</span>;
+}
+```
+
+And a component used with one type in one place should stay concrete. Write `TaskList` first. When the second list (projects, users) appears and the code is the same except for the type, *then* extract `List<T>`. Generalizing on the first use means guessing the abstraction before you've seen the variation.
+
+> 🚫 **When not to.** One caller, one type: stay concrete. A fixed set of options: use a union. `T` appears once: use `unknown`, `ReactNode`, or a concrete type.
+
+## Common mistakes
+
+> ⚠️ **Wrapping a generic component in `memo` without a cast.** The type parameter becomes `unknown`, and callbacks lose their types. Use `memo(List) as typeof List`.
+
+> ⚠️ **Forgetting the trailing comma in an arrow function.** In `.tsx`, `<T>(props) => …` is parsed as JSX. Write `<T,>` or use a `function` declaration.
+
+> ⚠️ **Typing the callback's parameter by hand.** `renderItem={(t: Task) => …}` repeats what inference provides, and quietly turns a mismatch with `items` into a confusing error elsewhere.
+
+> ⚠️ **Constraining too tightly.** `T extends Task` makes `List` useless for projects. Constrain to the minimum the component uses (`{ id: string }`), or take accessor functions.
+
+> ⚠️ **Using the index as a key.** Items that are reordered or removed will keep the wrong state. Constrain `T` to have an `id`, or take `getKey`.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** the same UI logic (lists, tables, selects, pickers, comboboxes) must work over different data types and callbacks should receive the caller's exact type.
+
+> 🚫 **When not to.** A single concrete use, a small closed set of cases (use a union), or a type parameter that appears only once.
+
+## How it connects
+
+> 🔗 **Connection.** Everything here is generic functions ([Chapter 16](/chapter/16)) and constraints ([Chapter 17](/chapter/17)) applied to components. Props design comes from [Chapter 50](/chapter/50), event types from [Chapter 51](/chapter/51), and the `getKey` and `getLabel` idea mirrors the parser parameter from [Chapter 56](/chapter/56). Next up is the Part IX checkpoint project, [P12](/projects/p12).
+
+> 🌍 **Real world.** Design systems and table libraries are built this way: TanStack Table's `useReactTable<TData>`, Headless UI's `Listbox`, and MUI's `Autocomplete<T>` all infer the row or option type from the data you pass, then give it back in every callback.
+
+## Exercises
+
+### Level 1 — Recall
+
+Make this `List` generic so that `renderItem` receives the right type for whatever `items` holds, then check by hovering that the first call infers `Task` and the second infers `string`:
+
+```tsx
+function List({ items, renderItem }: { items: unknown[]; renderItem: (item: unknown) => ReactNode }) {
+  return <ul>{items.map((item, i) => <li key={i}>{renderItem(item)}</li>)}</ul>;
+}
+
+<List items={tasks} renderItem={(t) => t.title} />;
+<List items={["a", "b"]} renderItem={(s) => s.toUpperCase()} />;
+```
+
+### Level 2 — Application
+
+Build `Select<T>` (with `options`, `value`, `onChange`, `getLabel`, `getKey`) and use it for both a project picker and a user picker. `onChange` must receive the whole object. Show that passing a `User` setter to the project picker is a compile error.
+
+### Level 3 — Challenge
+
+Make a generic `Table<T>` with typed `columns`. Each column has a `header: string` and either a `key: keyof T` or a `render: (row: T) => ReactNode`. Rows need an `id`, so constrain `T`. A column with a key that isn't in `T` must not compile. This is the seed of [P19](/projects/p19).
+
+*Hint: model a column as a union of two object types, so a column can't have neither `key` nor `render`.*
+
+### Level 4 — Real-world
+
+**Ticket TF-402: Collapse the duplicate list components.** The dashboard in [P12](/projects/p12) has `TaskList`, `ProjectList`, and `UserList`, which are identical apart from the item type and the row markup.
+
+- Replace them with one generic component that renders an empty state, loading state, and each row via a typed render prop.
+- Every call site infers `T` and has no explicit type arguments or casts.
+- If the component is wrapped in `memo`, its generic signature is preserved.
+- Delete the three old components, and `tsc --noEmit` passes.
+
+## Key takeaways
+
+- A generic component is a generic function that returns UI: `items` decides `T`, and callbacks receive `T`.
+- Declare it with `function List<T>(props: ListProps<T>)`. In `.tsx` arrow functions, write `<T,>`.
+- Let inference work, since you rarely need `<List<Task> … />`. Use an explicit argument only when there's nothing to infer from.
+- Constrain with `T extends { id: string }` to the minimum the component uses, or take accessor props like `getKey` and `getLabel`.
+- `memo` erases the type parameter. Restore it with `memo(List) as typeof List`.
+- Don't make a component generic when `T` appears once, there is one concrete use, or a union will do.
+
+## What comes next
+
+You can now type props, events, state, refs, context, reducers, hooks, and generic components, which is everything needed to build a real interface. Time to put it together: [P12](/projects/p12), the React Dashboard, is the Part IX checkpoint project.

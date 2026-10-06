@@ -1,0 +1,413 @@
+> 📖 **The problem.** TaskFlow's "All tasks" page shows a table of 2,000 tasks with a filter box above it. On your laptop it feels fine. On a teammate's older laptop, typing "rel" into the filter lags: nothing appears for a moment, then all three letters show up at once, about 300 ms per keystroke. Someone has already tried a fix: half the components in the folder are now wrapped in `memo`, and several values in `useMemo`. Nothing improved, and the code is harder to read. Nobody measured anything before changing it.
+
+Performance work has a bad reputation because people do it by superstition: sprinkle `useMemo`, hope, repeat. This chapter teaches the opposite. By the end, you'll know how to measure a slow interaction, explain exactly why each component re-rendered, apply structural fixes that remove the work instead of caching it, use memoization (and the React Compiler) when the evidence calls for it, keep input responsive with transitions, render huge lists by virtualizing them, keep context from re-rendering everything, and turn all of this into budgets your CI enforces.
+
+> 🧠 **Mental model.** **Measure, find the cause, then apply the smallest fix.** Most render problems are about **where state lives**, not about a missing `useMemo`. A re-render is React calling your component function again; it's only a problem when it happens to *many* components, or to *expensive* ones, on an interaction the user is waiting for.
+
+## 72.1 Measuring first
+
+Before you change a line, find out where the time goes. You have three instruments, and each answers a different question. The **React DevTools Profiler** answers "which components rendered, why, and for how long?" You press record, type into the filter, stop, and get one bar per commit (each time React applied an update), with a flame chart of the components that rendered. Turn on "Record why each component rendered while profiling" in its settings; that one checkbox answers most performance questions.
+
+The **browser's Performance panel** answers "what did the main thread spend its time on?" It shows JavaScript, layout, and painting together, and flags **long tasks**: anything that blocks the main thread for more than 50 ms. Always record with **CPU throttling** (4x or 6x slowdown) so your fast laptop behaves like your users' phones. And **web vitals** answer "how does this feel to real users?" The three core ones are **LCP** (Largest Contentful Paint: how fast the main content appears), **INP** (Interaction to Next Paint: how fast the page responds to clicks and keystrokes), and **CLS** (Cumulative Layout Shift: how much things jump around). Our filter lag is an INP problem.
+
+Here is what the Profiler shows for one keystroke in the filter box, written out as text:
+
+```text
+Commit 14 of 31: 286 ms
+  TasksPage        0.4 ms   why: hook 1 (useState) changed
+  ├ FilterInput    0.1 ms   why: parent rendered
+  ├ ProjectHeader  0.2 ms   why: parent rendered
+  └ TaskTable      284 ms   why: parent rendered
+     └ TaskRow ×2000  ~0.14 ms each   why: parent rendered
+```
+
+The diagnosis is already visible: one keystroke re-renders all 2,000 rows, and the table, not the input, is where the time goes. You can also measure from code with the `Profiler` component, which reports every commit inside it. It's useful for logging slow renders in a staging build:
+
+```tsx
+import { Profiler, type ProfilerOnRenderCallback } from "react";
+
+const reportSlowRender: ProfilerOnRenderCallback = (id, phase, actualDuration, baseDuration) => {
+  // actualDuration: time spent rendering this commit; baseDuration: cost of rendering the whole subtree with no memoization
+  if (actualDuration > 16) {
+    console.warn(`[perf] ${id} ${phase} took ${actualDuration.toFixed(1)} ms (base ${baseDuration.toFixed(1)} ms)`);
+  }
+};
+
+<Profiler id="TaskTable" onRender={reportSlowRender}>
+  <TaskTable tasks={tasks} query={query} />
+</Profiler>;
+```
+
+> 💡 **Tip.** Use the dev build to find *what* re-renders, but don't trust its absolute timings: development React does extra checking and is several times slower. Confirm the improvement in a production build (`npm run build && npm run preview`) with CPU throttling on.
+
+> 🆕 **Modern note.** Since React 19.2, the browser's Performance panel shows React's own tracks (scheduler priorities and component renders) alongside everything else, so you can see React work and browser work on one timeline.
+
+## 72.2 Why components re-render
+
+A component re-renders for exactly three reasons. **Its own state changed**: a `useState` setter or `useReducer` dispatch was called with a new value. **Its parent re-rendered**: by default, when a component renders, React renders all of its children too, *whether or not their props changed*. **A context it reads changed**: the nearest provider received a new `value`. That's the whole list.
+
+Notice what's *not* on it: "its props changed". Props only change because a parent rendered, and the parent rendering is already enough to re-render the child, even with identical props. This surprises almost everyone:
+
+```tsx
+function TasksPage({ allTasks }: { allTasks: Task[] }) {
+  const [query, setQuery] = useState("");
+  const visible = allTasks.filter((t) => t.title.toLowerCase().includes(query.toLowerCase()));
+
+  return (
+    <>
+      <input value={query} onChange={(e) => setQuery(e.target.value)} aria-label="Filter tasks" />
+      <ProjectHeader />            {/* no props at all, still re-renders on every keystroke */}
+      <TaskTable tasks={visible} /> {/* re-renders 2,000 rows on every keystroke */}
+    </>
+  );
+}
+```
+
+Re-rendering is not the same as updating the DOM. React calls the function, compares the new output with the previous one, and touches the DOM only where something differs. For most components this is cheap, and you should let it happen freely. It becomes a problem only when a single interaction re-renders **a lot** of components (2,000 rows) or a few **expensive** ones (a chart that recomputes its layout), and the user is waiting.
+
+> ⚠️ **Common mistake.** Trying to prevent every re-render. A component that renders in 0.1 ms can re-render a thousand times a minute and nobody will notice. Optimize the interactions the Profiler says are slow, not the re-renders you happen to spot.
+
+## 72.3 Structural fixes
+
+The cheapest render is the one that never happens, and you can often get it by **rearranging components** instead of adding memoization. The first fix is **state colocation**: keep state in the lowest component that needs it. When state sits too high, every keystroke re-renders everything below that component. Here, a "quick add" input lives on the page, so typing a new task's title re-renders the whole table:
+
+```tsx
+// ❌ The draft title lives at the page level, so the table re-renders on every keystroke
+function TasksPage({ tasks }: { tasks: Task[] }) {
+  const [draftTitle, setDraftTitle] = useState("");
+  return (
+    <>
+      <input value={draftTitle} onChange={(e) => setDraftTitle(e.target.value)} />
+      <TaskTable tasks={tasks} />
+    </>
+  );
+}
+
+// ✅ Move the state into the component that uses it. The table no longer re-renders while typing.
+function QuickAddTask({ onAdd }: { onAdd: (title: string) => void }) {
+  const [draftTitle, setDraftTitle] = useState("");
+  return (
+    <form onSubmit={(e) => { e.preventDefault(); onAdd(draftTitle); setDraftTitle(""); }}>
+      <input value={draftTitle} onChange={(e) => setDraftTitle(e.target.value)} aria-label="New task title" />
+    </form>
+  );
+}
+```
+
+The second fix is **splitting components**: when one component mixes fast-changing state with expensive output, extract the fast-changing part into its own component, as `QuickAddTask` did. The third is **passing children**, sometimes called lifting content up. A component that owns state and wraps `children` can re-render as often as it likes, because the `children` elements were created by *its* parent, which didn't re-render. React sees the same element objects and skips them:
+
+```tsx
+// The panel's open/closed state changes often; its children are expensive.
+function CollapsiblePanel({ title, children }: { title: string; children: ReactNode }) {
+  const [open, setOpen] = useState(true);
+  return (
+    <section>
+      <button type="button" aria-expanded={open} onClick={() => setOpen(!open)}>{title}</button>
+      {open && children} {/* toggling doesn't re-render WorkloadChart's internals */}
+    </section>
+  );
+}
+
+<CollapsiblePanel title="Team workload">
+  <WorkloadChart projectId={projectId} />
+</CollapsiblePanel>;
+```
+
+> 🔗 **Connection.** These are the state-placement rules from [Chapter 42](/chapter/42), seen through a performance lens. Good state structure and good performance usually turn out to be the same decision.
+
+## 72.4 Memoization with evidence
+
+When structure isn't enough, memoization lets React **skip work it has already done**. `memo(Component)` makes a component skip re-rendering when every prop is identical (compared with `Object.is`) to last time. `useMemo` caches a computed value until its dependencies change. `useCallback` caches a function's identity, which matters only when that function is passed to a memoized child or used in a dependency array ([Chapter 47](/chapter/47)). The three work as a team: `memo` is useless if the parent passes a new object or function on every render.
+
+```tsx
+const TaskRow = memo(function TaskRow({ task, onToggle }: TaskRowProps) {
+  return (
+    <tr>
+      <td><input type="checkbox" checked={task.status === "done"} onChange={() => onToggle(task.id)} /></td>
+      <td>{task.title}</td>
+    </tr>
+  );
+});
+
+function TaskTable({ tasks, onToggle }: TaskTableProps) {
+  return (
+    <table>
+      <tbody>
+        {tasks.map((t) => (
+          <TaskRow key={t.id} task={t} onToggle={onToggle} />          // ✅ skips unchanged rows, if onToggle is stable
+        ))}
+        {tasks.map((t) => (
+          <TaskRow key={t.id} task={t} onToggle={(id) => toggle(id)} /> // ❌ new function every render: memo never skips
+        ))}
+      </tbody>
+    </table>
+  );
+}
+```
+
+The word that matters in this section's title is **evidence**. Memoization has costs: every comparison takes time, cached values use memory, dependency arrays are a new place for bugs, and the code is harder to read. Add it when the Profiler shows a component re-rendering with the same props *and* taking real time, then profile again to confirm it helped. If it didn't, remove it.
+
+The **React Compiler** changes the economics. It's a build-time tool that analyzes your components and inserts the equivalent of `memo`, `useMemo`, and `useCallback` automatically, at a finer grain than you'd write by hand. It requires that your code follows the Rules of React (pure render, no mutating props or state), and the `eslint-plugin-react-hooks` rules flag code it can't optimize. With Vite, it runs as a Babel preset:
+
+```ts
+// vite.config.ts
+import babel from "@rolldown/plugin-babel";
+import react, { reactCompilerPreset } from "@vitejs/plugin-react";
+import { defineConfig } from "vite";
+
+export default defineConfig({
+  plugins: [react(), babel({ presets: [reactCompilerPreset()] })],
+});
+```
+
+> 🌍 **Real world.** Teams adopting the compiler usually roll it out gradually (the `compilationMode: "annotation"` option compiles only components marked with a `"use memo"` directive), watch the Profiler and error tracker, then widen it. With the compiler on, new code rarely needs manual `memo` or `useCallback`. The structural fixes from 72.3 still matter: the compiler can skip re-rendering a row, but it can't make 2,000 rows cheap to render the first time.
+
+## 72.5 Transitions
+
+Sometimes the work is genuinely necessary: filtering 2,000 tasks really does mean rendering a different table. The problem in the opening story isn't that the table re-renders; it's that the **input waits for it**. React 18 introduced a way to tell React which updates are **urgent** (typing, clicking, pressing) and which can wait. Non-urgent renders happen "in the background": React works on them, but if an urgent update arrives, it pauses or throws away the background work and handles the keystroke first.
+
+`useDeferredValue` is the simplest tool for the filter. It returns a copy of a value that **lags behind** during urgent renders. The input uses the real `query`, so it updates instantly; the table uses `deferredQuery`, which catches up when React has time. For this to help, the slow component must skip rendering when it receives the *old* deferred value, so it's wrapped in `memo` (or compiled by the React Compiler):
+
+```tsx
+function TasksPage({ tasks }: { tasks: Task[] }) {
+  const [query, setQuery] = useState("");
+  const deferredQuery = useDeferredValue(query);
+  const isStale = query !== deferredQuery; // true while the table is catching up
+
+  return (
+    <>
+      <input value={query} onChange={(e) => setQuery(e.target.value)} aria-label="Filter tasks" />
+      <div style={{ opacity: isStale ? 0.6 : 1 }}>
+        <TaskTable tasks={tasks} query={deferredQuery} />
+      </div>
+    </>
+  );
+}
+
+const TaskTable = memo(function TaskTable({ tasks, query }: { tasks: Task[]; query: string }) {
+  const visible = tasks.filter((t) => t.title.toLowerCase().includes(query.toLowerCase()));
+  return <table>{/* … rows for visible … */}</table>;
+});
+```
+
+`useTransition` does the same job when *you* trigger the update, such as a click on a status filter. You wrap the state update in `startTransition`, and React gives you `isPending` to show that the new view is on its way:
+
+```tsx
+function StatusFilter({ onChange }: { onChange: (status: TaskStatus | "all") => void }) {
+  const [isPending, startTransition] = useTransition();
+  const statuses = ["all", "todo", "doing", "done"] as const;
+
+  return (
+    <div role="group" aria-label="Filter by status" aria-busy={isPending}>
+      {statuses.map((s) => (
+        <button key={s} type="button" onClick={() => startTransition(() => onChange(s))}>
+          {s}
+        </button>
+      ))}
+    </div>
+  );
+}
+```
+
+> 🚫 **When not to.** Transitions don't make work faster; they make it **interruptible**. If a render takes 3 seconds, it still takes 3 seconds. And never put a controlled input's own value in a transition: the input must update urgently, or typing feels broken. Defer what the input *drives*, not the input.
+
+## 72.6 Virtualizing long lists
+
+Even with perfect memoization, the first render of 10,000 rows creates 10,000 sets of DOM nodes, and the browser has to lay out and paint all of them. But the user can only *see* about 15 rows at a time. **Virtualization** (also called windowing) renders only the rows in view, plus a few extra above and below (the **overscan**) so scrolling stays smooth. A tall inner element keeps the scrollbar the right size, and each visible row is positioned where it would have been.
+
+TanStack Virtual does the math and leaves the markup to you. You tell it how many items there are, which element scrolls, and roughly how tall a row is; it tells you which items to render and where:
+
+```tsx
+import { useVirtualizer } from "@tanstack/react-virtual";
+import { useRef } from "react";
+
+export function VirtualTaskList({ tasks }: { tasks: Task[] }) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const virtualizer = useVirtualizer({
+    count: tasks.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: () => 44, // px per row; measured precisely as rows render
+    overscan: 8,
+  });
+
+  return (
+    <div ref={scrollRef} style={{ height: 600, overflowY: "auto" }} role="list" aria-label="Tasks">
+      <div style={{ height: virtualizer.getTotalSize(), position: "relative" }}>
+        {virtualizer.getVirtualItems().map((item) => {
+          const task = tasks[item.index];
+          if (task === undefined) return null; // noUncheckedIndexedAccess keeps us honest
+          return (
+            <div
+              key={task.id}
+              role="listitem"
+              style={{ position: "absolute", top: 0, left: 0, width: "100%", transform: `translateY(${item.start}px)` }}
+            >
+              <TaskRow task={task} />
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+```
+
+Virtualization has real costs, so know them before you reach for it. The browser's find-in-page (`Ctrl+F`) can't find rows that aren't rendered. Screen readers only see the rendered rows, so tables need `aria-rowcount` and `aria-rowindex` to announce "row 4,210 of 10,000". Keyboard navigation must call `virtualizer.scrollToIndex()` to bring the next row into existence before focusing it. Rows of varying height need measuring. For a few hundred simple rows, plain rendering plus `memo` is usually fast enough; and for many lists, **pagination** is the better product decision anyway.
+
+## 72.7 Context performance
+
+Context has one performance rule: **when a provider's `value` changes, every component that reads that context re-renders**, no matter which part of the value it uses. "Changes" means a new identity under `Object.is`. The classic mistake is a single app-wide context holding everything, with a fresh object created on every render of the provider:
+
+```tsx
+// ❌ A new object every time BoardProvider renders: every consumer re-renders, every time
+function BoardProvider({ children }: { children: ReactNode }) {
+  const [state, dispatch] = useReducer(boardReducer, initialBoardState);
+  return <BoardContext value={{ state, dispatch }}>{children}</BoardContext>;
+}
+```
+
+The first fix is to **split contexts by how often they change**. A reducer's `dispatch` function never changes identity, so components that only *send* actions (a "New task" button) can read a dispatch-only context and never re-render because of state changes. Split by domain too: the current user, the theme, and the board's filters change at very different rates and shouldn't share a provider.
+
+```tsx
+const BoardStateContext = createContext<BoardState | null>(null);
+const BoardDispatchContext = createContext<Dispatch<BoardAction> | null>(null);
+
+function BoardProvider({ children }: { children: ReactNode }) {
+  const [state, dispatch] = useReducer(boardReducer, initialBoardState);
+  return (
+    <BoardDispatchContext value={dispatch}>       {/* stable: consumers never re-render from it */}
+      <BoardStateContext value={state}>{children}</BoardStateContext>
+    </BoardDispatchContext>
+  );
+}
+```
+
+The second fix is **selecting state**. Context has no way to say "re-render me only when `filters.length` changes". When many components each need a small slice of a large, frequently changing state, move that state into an external store with **selectors**, such as Zustand ([Chapter 60](/chapter/60)). A component re-renders only when the slice it selected changes:
+
+```ts
+import { create } from "zustand";
+
+type BoardStore = { filters: TaskFilter[]; selectedTaskId: string | null; select: (id: string | null) => void };
+
+export const useBoardStore = create<BoardStore>()((set) => ({
+  filters: [],
+  selectedTaskId: null,
+  select: (id) => set({ selectedTaskId: id }),
+}));
+
+const filterCount = useBoardStore((s) => s.filters.length); // re-renders only when the count changes
+```
+
+## 72.8 Performance budgets
+
+Everything above fixes performance *once*. Without a guard, it erodes again: each pull request adds a few kilobytes or a few milliseconds, nobody notices any single one, and six months later the app is slow again. A **performance budget** is a set of limits, written down and checked automatically, that turns "keep it fast" into a requirement like any other. Good budgets cover both **load** (bundle sizes from [Chapter 70](/chapter/70)) and **experience** (web vitals). Google's "good" thresholds, measured at the 75th percentile of real users, are a sensible start: LCP of 2.5 s or less, INP of 200 ms or less, and CLS of 0.1 or less.
+
+Bundle budgets are the easiest to enforce, because the build output is deterministic. `size-limit` checks file sizes after the build and fails if any limit is exceeded:
+
+```json
+[
+  { "name": "main chunk", "path": "dist/assets/index-*.js", "limit": "200 kB", "gzip": true },
+  { "name": "reports route", "path": "dist/assets/ReportsPage-*.js", "limit": "120 kB", "gzip": true }
+]
+```
+
+```sh
+npm install -D size-limit @size-limit/file
+npm run build && npx size-limit   # exits non-zero when a budget is exceeded
+```
+
+Lab metrics come from Lighthouse CI, which loads your built app in a throttled browser and asserts on the results. One subtlety: a lab run doesn't involve a real user interacting, so it can't measure INP. **Total Blocking Time** is the lab stand-in for responsiveness, and real INP comes from field data, which [Chapter 75](/chapter/75) collects.
+
+```json
+{
+  "ci": {
+    "collect": { "staticDistDir": "./dist" },
+    "assert": {
+      "assertions": {
+        "largest-contentful-paint": ["error", { "maxNumericValue": 2500 }],
+        "cumulative-layout-shift": ["error", { "maxNumericValue": 0.1 }],
+        "total-blocking-time": ["warn", { "maxNumericValue": 200 }]
+      }
+    }
+  }
+}
+```
+
+> 💡 **Tip.** Set budgets slightly above where you are today, then ratchet them down as you improve. A budget the app already fails gets ignored; a budget that fails only on regressions gets respected.
+
+## Common mistakes
+
+> ⚠️ **Optimizing without measuring.** Wrapping everything in `memo` adds comparisons, memory, and complexity, and often fixes nothing because the real cause is elsewhere. Profile first, change one thing, profile again.
+
+> ⚠️ **Memoizing a component, then passing it fresh props.** An inline object (`style={{ … }}`), array, or arrow function creates a new identity every render, so `memo` never skips. Stabilize the prop, or let the React Compiler do it.
+
+> ⚠️ **State too high in the tree.** Form drafts, hover state, and open/closed flags at the page level re-render everything below. Colocate them.
+
+> ⚠️ **One giant context.** Every consumer re-renders on every change. Split by change frequency and domain, or use a store with selectors.
+
+> ⚠️ **Trusting dev-mode timings.** Development React is much slower. Find the cause in dev; confirm the fix in a throttled production build.
+
+```tsx
+// ❌ new style object and new handler every render: memo(TaskRow) never skips
+<TaskRow task={t} style={{ padding: 8 }} onToggle={() => toggle(t.id)} />
+// ✅ stable props: unchanged rows are skipped
+<TaskRow task={t} onToggle={toggle} />
+```
+
+## When to use it, and when not to
+
+> ✅ **Use it when** the Profiler or a web-vitals report points at a specific slow interaction. Reach first for structural fixes (colocation, splitting, children), then transitions for necessary-but-slow renders, virtualization for lists of many hundreds of rows or more, and memoization where the evidence shows repeated identical renders that cost real time.
+
+> 🚫 **When not to.** Don't memoize cheap components, don't virtualize short lists (you lose find-in-page and add complexity for nothing), and don't split context or add a store "for performance" before a measurement says consumers are the problem. If you can't name the interaction you're making faster and by how many milliseconds, you're not done measuring.
+
+## How it connects
+
+> 🔗 **Connection.** Re-render rules build on the React mental model from [Chapter 37](/chapter/37) and state placement from [Chapter 42](/chapter/42). `memo`, `useMemo`, and `useCallback` were introduced in [Chapter 47](/chapter/47); this chapter adds *when* to use them. Context splitting continues [Chapter 46](/chapter/46) and [Chapter 54](/chapter/54), and stores with selectors come from [Chapter 60](/chapter/60). Load performance was [Chapter 70](/chapter/70). Real-user INP and LCP are collected in [Chapter 75](/chapter/75), and budgets become required CI checks in [Chapter 76](/chapter/76).
+
+> 🌍 **Real world.** Most production performance fixes are boring: a piece of state moved down, a context split in two, a long list virtualized, a heavy chart deferred. The teams that stay fast are the ones that measure in CI and in the field, not the ones with the most `useMemo` calls.
+
+## Exercises
+
+### Level 1 — Recall
+
+Each Profiler reading below comes from one interaction. For each, name the cause of the re-renders and the smallest fix:
+
+```text
+A) Typing in the "new task" box: TasksPage (hook changed) → TaskTable 180 ms (parent rendered)
+B) Toggling dark mode: 340 components re-render, all with "context changed: AppContext"
+C) Clicking a row's checkbox: TaskRow ×2000 re-render (props changed: onToggle)
+D) Typing in the filter: TaskTable 260 ms (props changed: query); the input itself lags
+```
+
+### Level 2 — Application
+
+Reproduce the laggy filter: a page with 2,000 generated tasks and a text filter. Profile one keystroke with 6x CPU throttling and record the commit time. Fix it with `useDeferredValue` (and `memo` on the table if you aren't using the React Compiler), dim the table while it's stale, and record the new numbers. Write two sentences explaining why the input now stays responsive.
+
+### Level 3 — Challenge
+
+Virtualize a 10,000-row task table with TanStack Virtual while keeping full keyboard navigation: `ArrowUp`/`ArrowDown` move focus between rows, `Home`/`End` jump to the first and last row, and screen readers announce the row's position out of 10,000.
+
+*Hint: the row you want to focus may not exist yet. Scroll it into existence with `scrollToIndex`, then focus it once it renders.*
+
+### Level 4 — Real-world
+
+**Ticket TF-338: Enforce a performance budget for TaskFlow Web.** We fixed the slow pages last quarter, and they've crept back. Make performance a CI requirement.
+
+- A `budgets` config limits the main chunk and each route chunk (gzip), with limits set just above today's measured sizes.
+- Lighthouse CI asserts LCP and CLS ("error") and Total Blocking Time ("warn") on the board and reports pages.
+- A pull request that exceeds a budget fails CI with a message that names the budget and the overage.
+- A short `PERFORMANCE.md` explains each budget, how to measure locally, and how to request a budget change.
+
+## Key takeaways
+
+- **Measure first**: the React Profiler (what rendered and why), the Performance panel (main-thread time, long tasks), and web vitals (LCP, INP, CLS).
+- Components re-render because their **state** changed, their **parent** rendered, or a **context** they read changed. Props alone aren't a cause.
+- Prefer **structural fixes**: colocate state, split components, pass `children`.
+- Memoize **with evidence**. `memo` needs stable props; the **React Compiler** automates this but can't make inherently heavy rendering cheap.
+- `useDeferredValue` and `useTransition` keep urgent updates responsive by making heavy renders **interruptible**, not faster.
+- **Virtualize** genuinely long lists, and account for find-in-page, screen readers, and keyboard focus.
+- Split contexts by change frequency; use selectors for fine-grained subscriptions; enforce **budgets** in CI.
+
+## What comes next
+
+The board is fast now. But turn on a screen reader and tab through it, and you hear "button, button, button, clickable, clickable". A fast app that some users can't operate at all isn't finished. [Chapter 73: Accessibility](/chapter/73) treats accessibility as what it is: correctness, for every user.

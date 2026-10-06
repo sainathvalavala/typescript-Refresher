@@ -1,0 +1,431 @@
+> 📖 **The problem.** It's Monday morning. TaskFlow's weekly-report email went out to every customer, and the support inbox is filling up: one project shows "0 tasks finished" after a busy week, another lists tasks titled "undefined", a third says the team logged "2358" hours, and for some users the email never sent at all. The module that builds the report is 40 lines long. It passed code review. Somewhere in it are five bugs.
+
+Here is the module. Before you read on, give yourself five minutes to find all five bugs by hand:
+
+```js
+// weekly-report.js: builds the Monday summary email for one project
+export function weeklyReport(projects, tasks, projectId, extraHours) {
+  const project = projects.find((p) => p.id === projectId);
+  const projectTasks = tasks.filter((t) => t.projectId === projectId);
+
+  const finished = projectTasks.filter((t) => t.status === "complete");
+  const open = projectTasks.filter((t) => t.status !== "done");
+
+  let hours = extraHours;
+  for (const task of projectTasks) {
+    hours += task.estimate;
+  }
+
+  const lines = open.map((t) => `- ${t.titel}, due ${formatDue(t.dueDate)}`);
+
+  return {
+    subject: `Weekly report: ${project.name}`,
+    body: lines.join("\n"),
+    finishedCount: finished.length,
+    hours,
+  };
+}
+
+function formatDue(dueDate) {
+  return dueDate.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+// settings-page.js: the manager can add extra hours through the URL
+const extra = new URLSearchParams(location.search).get("extraHours"); // e.g. "2"
+const report = weeklyReport(allProjects, allTasks, currentProjectId, extra);
+sendEmail(report);
+
+// Elsewhere in the codebase, tasks look like this:
+// { id: "t1", projectId: "p1", title: "Write docs", status: "done",
+//   estimate: 3, dueDate: "2026-03-14" }
+```
+
+If you found all five, well done. Now imagine the module is 4,000 lines, the task shape is defined in a file you've never opened, and you wrote none of it. That's the situation this chapter is about. You'll see each problem that appears when JavaScript gets big, why it appears, and how a type checker changes the picture. In section 2.9 you'll watch TypeScript find all five bugs in under a second.
+
+> 🧠 **Mental model.** **Types are machine-checked documentation of the contracts between pieces of code.** Every function makes promises ("give me a task, I'll give you a string"). Comments describe those promises, and nobody checks them. Types describe them too, and a machine checks every one, on every change, forever.
+
+## 2.1 What JavaScript was designed for
+
+As [Chapter 1](/chapter/1) told it, JavaScript was built for small jobs: a form check, a hover effect, a few dozen lines written by one person. For that job, **dynamic typing** is a genuine feature. Dynamic typing means values carry types, but variables and parameters don't: any variable can hold any value, and the language works out what to do when the code runs.
+
+That flexibility makes small programs pleasant to write. You don't declare anything, you don't wait for a compiler, and functions happily accept whatever you hand them:
+
+```js
+// A whole program that fits on one screen. Dynamic typing is a pleasure here.
+function greet(name) {
+  return "Hello, " + name + "!";
+}
+
+greet("Ada");   // "Hello, Ada!"
+greet(42);      // "Hello, 42!"  (flexible, and fine for this job)
+
+const button = document.querySelector("#hello");
+button.addEventListener("click", () => alert(greet("visitor")));
+```
+
+When the program is this small, *you* are the type checker. You can see the definition of `greet` and every call to it at the same time, so you know what `name` holds. Nothing is ambiguous because nothing is out of sight.
+
+## 2.2 Dynamic typing at scale
+
+The same freedom that makes small programs pleasant makes large programs **ambiguous**. Once the code no longer fits in one person's head, "any value can go anywhere" turns into "nobody knows what value goes here".
+
+Consider a function you find in a large codebase. What is `task`? A task object, or a task ID? What is `changes`? An object of fields, or a new status string?
+
+```js
+// tasks/update.js
+export function updateTask(task, changes) {
+  /* 80 lines you haven't read yet */
+}
+
+// Three call sites, written by three different people. Which ones are right?
+updateTask("t1", { status: "done" });       // passes an ID
+updateTask(currentTask, { status: "done" }); // passes the whole object
+updateTask(currentTask.id, "done");          // passes a bare status string
+```
+
+JavaScript accepts all three. At most one of them is correct, and you can only find out by reading the 80-line body, or by running the code and seeing what breaks. Multiply that by every function in a 300-file project and you get the defining feeling of large JavaScript: **reading code requires reading *more* code**, because no line tells you what it expects.
+
+## 2.3 Runtime type errors
+
+A **runtime type error** is a crash that happens because a value has the wrong shape for what the code does with it: calling something that isn't a function, reading a property of `undefined`, or using a misspelled name. JavaScript reports these only when the faulty line actually runs.
+
+```js
+const task = tasks.find((t) => t.id === "t99"); // no such task: find returns undefined
+task.title;
+// 💥 TypeError: Cannot read properties of undefined (reading 'title')
+
+const user = { name: "Ada", greet() { return "hi"; } };
+user.greeet();
+// 💥 TypeError: user.greeet is not a function
+
+const formatDue = (date) => date.toLocaleDateString();
+formatDue("2026-03-14");
+// 💥 TypeError: date.toLocaleDateString is not a function
+```
+
+None of these are hard bugs. The problem is *when* you find them. A runtime error only appears if that exact line runs with that exact data, which might be in a rarely used branch, for one customer, months later. The later a bug is found, the more it costs:
+
+```text
+Where the bug is found        Who notices it        Rough cost to fix
+In the editor, as you type    You, instantly        seconds
+In a test run                 You, minutes later    minutes
+In code review or QA          A teammate            hours
+In production                 A customer            hours to days, plus their trust
+```
+
+A type checker moves an entire category of bugs to the top row of that table.
+
+## 2.4 Silent wrong values
+
+Crashes are bad, but at least they're loud. Worse are bugs that **never crash**. JavaScript's forgiving nature includes **type coercion**: when an operation gets the "wrong" kind of value, the language converts it to something that works instead of complaining. The result is a value that is plausible-looking and wrong.
+
+```js
+// Form fields and URL parameters always give you strings
+const subtotal = document.querySelector("#subtotal").value; // "100"
+const total = subtotal + 20;      // "10020"  string concatenation, not addition
+
+const estimate = parseInt("two"); // NaN
+const hours = estimate + 5;       // NaN, and it spreads through every calculation after it
+
+"10" < "9";                       // true   compared as strings, character by character
+`Task: ${task.titel}`;            // "Task: undefined"  the typo becomes text in an email
+```
+
+Look back at the opening module: `extraHours` arrives as the string `"2"`, so `hours += task.estimate` turns `"2"` into `"23"`, then `"235"`, then `"2358"`. The report sends without errors. Silent wrong values **corrupt data** instead of stopping the program, and corrupted data is often discovered by accountants and customers, not by developers.
+
+## 2.5 Refactoring without a safety net
+
+**Refactoring** means changing the structure of code without changing what it does: renaming things, reorganizing modules, changing a function's parameters. Healthy codebases refactor constantly. In large JavaScript codebases, people often stop, because every change might break something far away.
+
+Suppose you change `createTask` from positional parameters to a single options object, which is easier to read and extend:
+
+```js
+// Before
+function createTask(title, projectId, priority) { /* … */ }
+
+// After
+function createTask({ title, projectId, priority }) { /* … */ }
+
+// There are 47 call sites. Your search finds 46 and you update them.
+// The 47th was built with a variable name you didn't search for:
+const make = createTask;
+make("Fix login bug", "p1", "high");
+// No crash: destructuring a string gives title === undefined.
+// A task with no title is silently saved to the database.
+```
+
+Renames are worse. Change `user.name` to `user.fullName` and a text search for `name` finds thousands of unrelated matches: `fileName`, `project.name`, CSS classes, comments. Miss one real usage and you ship `undefined` to production.
+
+With types, the compiler knows *which* `name` belongs to `User`, so the editor's rename can update exactly the right places. And when a signature changes, every stale call becomes an error:
+
+```ts
+type Priority = "low" | "medium" | "high";
+
+function createTask(options: { title: string; projectId: string; priority: Priority }) {
+  return { id: crypto.randomUUID(), status: "todo", ...options };
+}
+
+const make = createTask;
+make("Fix login bug", "p1", "high"); // ❌ Expected 1 arguments, but got 3.
+```
+
+The fear goes away, and with it the "don't touch that file" culture that freezes old codebases.
+
+## 2.6 Large teams and invisible contracts
+
+Every function call is an **agreement between two people**: the author promises "give me X and I'll give you Y", and the caller relies on it. On a large team, those two people may never meet, may work in different time zones, or may be separated by five years.
+
+In JavaScript, those agreements are invisible. At best they're written in a comment, and comments drift out of date because nothing checks them:
+
+```js
+/**
+ * Returns the tasks assigned to a user.
+ * @param {string} userId
+ * @returns {Task[]}
+ */
+async function tasksFor(user) {
+  // Two years ago this took an ID and returned an array.
+  // Now it takes a user object and returns a Promise. The comment never changed.
+  const response = await fetch(`/api/users/${user.id}/tasks`);
+  return response.json();
+}
+```
+
+With TypeScript, the signature *is* the contract, and the compiler holds both sides to it at every call site:
+
+```ts
+type Task = { id: string; title: string };
+type User = { id: string; name: string };
+
+async function tasksFor(user: User): Promise<Task[]> {
+  const response = await fetch(`/api/users/${user.id}/tasks`);
+  return response.json();
+}
+
+const list = tasksFor("u1"); // ❌ Argument of type 'string' is not assignable to parameter of type 'User'.
+list.length;                 // ❌ Property 'length' does not exist on type 'Promise<Task[]>'.
+```
+
+The contract can't drift, because the moment it changes, every caller that disagrees turns red.
+
+> 💡 **Tip.** `response.json()` returns `any`, so `Promise<Task[]>` here is a promise the compiler can't verify against the real server. [Chapter 3](/chapter/3) explains why, and [Chapter 32](/chapter/32) fixes it properly.
+
+## 2.7 API discoverability
+
+**Discoverability** is how easily you can find out what a function or module accepts and returns *without reading its source*. In JavaScript, the honest answer to "what does `options` accept?" is often "go read the code, three folders away" or "ask whoever wrote it".
+
+```js
+scheduleReminder(task, options); // Which options exist? Is one of them required? What units?
+```
+
+When the options have a type, your editor becomes the documentation. Type `{` and it lists every allowed option, with comments, and catches misspellings on the spot:
+
+```ts
+type Task = { id: string; title: string; dueDate: string };
+
+type ReminderOptions = {
+  /** How many minutes before the due date to send the reminder. Defaults to 30. */
+  leadMinutes?: number;
+  channel: "email" | "push" | "sms";
+  repeatDaily?: boolean;
+};
+
+function scheduleReminder(task: Task, options: ReminderOptions): void {
+  /* … */
+}
+
+declare const task: Task;
+scheduleReminder(task, { channel: "push", leadMinutes: 15 }); // ✅
+scheduleReminder(task, { chanel: "push" }); // ❌ Object literal may only specify known properties, but 'chanel' does not exist in type 'ReminderOptions'. Did you mean to write 'channel'?
+```
+
+For many teams, this turns out to be the biggest day-to-day benefit of TypeScript: autocomplete that is always correct, because it's generated from the same types the compiler checks.
+
+## 2.8 Maintainability over years
+
+Code is **read far more often than it is written**. A function is written once, in an afternoon, and then read dozens of times over the years: during reviews, while debugging, before changing it, when onboarding a new teammate. A codebase is maintainable when those readers can understand a function quickly and change it confidently.
+
+Here is a function as you might find it three years after it was written. Try to say what it accepts:
+
+```js
+function applyFilter(items, f, opts) {
+  return items.filter((i) =>
+    opts.strict ? i[f.key] === f.value : String(i[f.key]).includes(f.value),
+  );
+}
+```
+
+And here is the same function with types. The body is identical; the reading time isn't:
+
+```ts
+type Task = { id: string; title: string; status: "todo" | "doing" | "done"; assigneeId: string };
+type TaskFilter = { key: "title" | "status" | "assigneeId"; value: string };
+
+function applyFilter(tasks: Task[], filter: TaskFilter, opts: { strict: boolean }): Task[] {
+  return tasks.filter((task) =>
+    opts.strict ? task[filter.key] === filter.value : task[filter.key].includes(filter.value),
+  );
+}
+```
+
+The types answer the questions a future reader will ask, and unlike comments or wiki pages, they **can't go stale**: if the code changes and the types don't, the build fails.
+
+## 2.9 Static analysis
+
+**Static analysis** means examining code *without running it*. You've probably used one kind already: a **linter** such as ESLint, which looks for suspicious *patterns* within a file. A **type checker** such as TypeScript does something different: it tracks what kind of value every expression holds and checks that values are used consistently *across* files.
+
+```js
+// What a linter flags: patterns that are usually mistakes
+if (task.status = "done") { /* … */ } // no-cond-assign: assignment where a comparison was expected
+const unused = computeTotals();        // no-unused-vars: this value is never used
+
+// What a linter can't know: whether `task` even HAS a status property,
+// or what computeTotals() returns. That needs types, tracked across files.
+```
+
+| | Linter | Type checker |
+|---|---|---|
+| Looks for | Risky patterns and style | Inconsistent use of values |
+| Scope | Mostly one file at a time | The whole program |
+| Example catch | `==` instead of `===`, unused variables | Misspelled properties, wrong arguments, possible `undefined` |
+
+You want both, and in [Chapter 27](/chapter/27) you'll set them up together. Now, the payoff from the opening. Give the module's parameters types (the `Task` and `Project` shapes from the comment, with `extraHours` as a `number`) and run the checker:
+
+```sh
+$ npx tsc --noEmit
+weekly-report.ts:16:47 - error TS2367: This comparison appears to be unintentional because the types 'TaskStatus' and '"complete"' have no overlap.
+weekly-report.ts:24:40 - error TS2551: Property 'titel' does not exist on type 'Task'. Did you mean 'title'?
+weekly-report.ts:27:32 - error TS18048: 'project' is possibly 'undefined'.
+weekly-report.ts:35:18 - error TS2339: Property 'toLocaleDateString' does not exist on type 'string'.
+weekly-report.ts:42:55 - error TS2345: Argument of type 'string | null' is not assignable to parameter of type 'number'.
+
+Found 5 errors in the same file, starting at: weekly-report.ts:16
+```
+
+All five bugs, in well under a second: a status that doesn't exist (the "0 finished" report), a typo (the "undefined" titles), a missing project (the crash), a string treated as a `Date` (another crash), and a string passed where a number belongs (the "2358" hours). You didn't write a single test.
+
+## 2.10 Why Microsoft created TypeScript
+
+In the early 2010s, Microsoft had the same problem as everyone else: its own teams were building large browser applications in JavaScript and finding them hard to scale. The language effort was led by **Anders Hejlsberg**, who had previously designed Turbo Pascal, Delphi, and C#. Microsoft announced TypeScript publicly in **October 2012** (version 0.8) and released 1.0 in 2014.
+
+The project's published design goals explain almost everything about how TypeScript behaves today. The key goals:
+
+- **Statically identify constructs that are likely to be errors.**
+- **Impose no runtime overhead**, and emit clean, recognizable JavaScript.
+- **Align with current and future ECMAScript** (the JavaScript standard).
+- **Preserve the runtime behavior** of all JavaScript code.
+
+Just as revealing are the explicit **non-goals**. TypeScript is *not* a new runtime and does not add runtime type information. And it does *not* aim for a fully **sound** type system (one where "it compiles" guarantees no type errors at runtime). Instead it strikes a balance between correctness and productivity. Here's a deliberate gap it accepts because closing it would reject a lot of reasonable JavaScript:
+
+```ts
+type DoneTask = { status: "done" };
+type AnyTask = { status: string };
+
+const doneTasks: DoneTask[] = [{ status: "done" }];
+const allTasks: AnyTask[] = doneTasks; // ✅ allowed: arrays are treated as covariant
+
+allTasks.push({ status: "todo" });     // ✅ also allowed…
+doneTasks[1]?.status;                  // …and now a "done" list holds a "todo" task
+```
+
+TypeScript is a pragmatic tool built to work with JavaScript as people actually write it. You'll study exactly where it's unsound, and why, in [Chapter 77](/chapter/77).
+
+## 2.11 A superset of JavaScript
+
+TypeScript describes itself as **"JavaScript with syntax for types."** It's a **superset**: every JavaScript program is also valid TypeScript *syntax*. (The checker may still complain about it, which is the point.) TypeScript adds type annotations and a few related features, then removes them on output.
+
+That one design decision makes **gradual adoption** possible. You don't rewrite your app; you rename files one at a time, and JavaScript and TypeScript files import each other freely in the meantime:
+
+```text
+src/
+  api.ts        converted last week, fully typed
+  board.js      still JavaScript: works unchanged, imported by api.ts
+  format.ts     converted today
+```
+
+You can even get type checking in a plain `.js` file, using JSDoc comments and a `// @ts-check` directive at the top. The editor runs the same checker:
+
+```js
+// @ts-check
+
+/**
+ * @param {number} price
+ * @param {number} rate
+ */
+function addTax(price, rate) {
+  return price + price * rate;
+}
+
+addTax("100", 0.2); // the editor flags this, even in a .js file
+```
+
+The low cost of starting, and of stopping, is a big part of why TypeScript spread so widely. [Chapter 29](/chapter/29) covers real migrations, including `allowJs` and `checkJs`.
+
+## Common mistakes
+
+> ⚠️ **Expecting TypeScript to catch every bug.** A 2017 study of bugs in public JavaScript projects ("To Type or Not to Type", Gao, Bird, and Barr) estimated that a static type checker would have caught about 15% of them. That's a large, cheap win, but wrong business logic and bad data from the network still need tests and validation ([Chapter 66](/chapter/66)).
+
+> ⚠️ **Treating types as paperwork.** Types written *after* the code, just to make errors go away, tend to be vague (`any`, `object`) and catch nothing. Types pay off when they describe what the code actually promises.
+
+> ⚠️ **Confusing linters with type checkers.** ESLint can't tell you a property is misspelled in another file, and TypeScript won't warn you about a confusing `==`. They're complementary tools, and professional projects run both.
+
+> ⚠️ **Thinking adoption is all or nothing.** You don't need to convert a codebase in one heroic weekend. One file, one module, one new feature at a time is the normal, recommended path.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** code will be read or changed by more than one person, will live longer than a few weeks, exposes functions that other code calls, or needs to be refactored with confidence. That describes nearly all application and library code.
+
+> 🚫 **When not to.** A 30-line one-off script you'll run once, or a throwaway spike you'll delete tomorrow, may not be worth a build setup. Even then, the editor's TypeScript-powered hints work in plain `.js` files, and `// @ts-check` gives you most of the checking with no build step at all.
+
+## How it connects
+
+> 🔗 **Connection.** [Chapter 3](/chapter/3) explains *how* TypeScript finds these bugs without running anything, and why it can't see bad data arriving at runtime. You'll install it and run it yourself in [Chapter 5](/chapter/5). The "15%" question returns in [Chapter 66](/chapter/66), which maps exactly what types catch versus what tests catch.
+
+> 🌍 **Real world.** In code review at TypeScript shops, you'll rarely see comments like "what does this function take?" The types answer that. Review time shifts to what types can't check: naming, business logic, edge cases, and design.
+
+## Exercises
+
+### Level 1 — Recall
+
+For each snippet, say whether the bug would be caught by a **type checker**, a **linter**, a **test**, or **none of them** (only discovered at runtime). Some may have more than one answer.
+
+```js
+task.titel.toUpperCase();                              // 1
+if (user.role = "admin") { grantAccess(); }            // 2
+const discount = price * 10;                           // 3: the business rule is "10% off"
+const saved = JSON.parse(localStorage.getItem("tasks")); // 4: the stored data is from an old app version
+formatDue(task.dueDate, "en-US", true, false);         // 5: formatDue takes one parameter
+tasks.sort((a, b) => a.priority - b.priority);         // 6: the UI should show highest priority first
+```
+
+### Level 2 — Application
+
+Paste the opening `weekly-report.js` module into the [TypeScript Playground](https://www.typescriptlang.org/play). Define `Task` and `Project` types from the comment at the bottom of the module, then add types **only to the function parameters**. Write down which of the five bugs surface, and in what order. Which bug did TypeScript find that you missed by hand, if any?
+
+### Level 3 — Challenge
+
+Construct a bug that TypeScript *cannot* catch even if every annotation is perfect and `strict` mode is on. Write the code, describe the wrong behavior, and explain in two or three sentences why no type annotation could prevent it.
+
+*Hint: think about what the types describe (the shape of values) versus what the code is supposed to accomplish.*
+
+### Level 4 — Real-world
+
+**Ticket TF-002: Refactoring risk audit.** Before the team commits to TypeScript, the tech lead wants to know where the current JavaScript code is too risky to change.
+
+- Take a small JavaScript repository you own (a side project, a course project, or a script you maintain).
+- List the five refactors you'd be most nervous to make today (a rename, a signature change, a data shape change…), with the file and function for each.
+- For each one, explain how you'd find every affected place today, and how types would change that.
+- Rank the five by risk and say which one you'd type first.
+
+## Key takeaways
+
+- Dynamic typing is a **feature for small, single-author programs** and a source of **ambiguity at scale**.
+- JavaScript's errors arrive **late** (runtime type errors) or **never** (silent wrong values from coercion), and late bugs are expensive.
+- Without types, **refactoring is risky**, contracts between teammates are **invisible**, and APIs are **undiscoverable**.
+- **Static analysis** reads code without running it. Linters find risky patterns; type checkers find inconsistent use of values across the whole program.
+- TypeScript was designed to **describe JavaScript, not replace it**: no runtime, erased types, aligned with the standard, and deliberately not fully sound.
+- As a **superset**, it can be adopted one file at a time.
+
+## What comes next
+
+TypeScript found five bugs without running a single line. But how? And if it checks types so thoroughly, why can a TypeScript app still crash on a `User` with no `email`? [Chapter 3: How TypeScript Works](/chapter/3) opens up the compiler and draws the most important line in this book: the one between compile time and runtime.

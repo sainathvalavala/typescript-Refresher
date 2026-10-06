@@ -1,0 +1,360 @@
+> 📖 **The problem.** TaskFlow's first week of code has the same six-property task shape written inline in eight function signatures: `{ id: string; title: string; done: boolean; priority: number; dueDate?: string; assignee?: string }`. Then a teammate adds `tags` to *five* of the copies. The other three quietly keep the old shape, and a function that should accept any task starts rejecting some of them.
+
+When the same idea appears more than once, it deserves a **name**. This chapter shows you how to name types: with type aliases and interfaces for shapes, and with literal types for vocabularies like `"todo" | "doing" | "done"`. You will also see why many teams avoid `enum`, and what to use instead.
+
+By the end, you'll replace repeated inline types and magic strings with a small, shared vocabulary, which is the foundation of TaskFlow's domain model.
+
+> 🧠 **Mental model.** **Naming a type is like naming a function.** It creates a reusable concept with a single place to change it. If you'd extract a function for repeated logic, extract a type for repeated shape.
+
+## 8.1 Type aliases
+
+A **type alias** gives a name to any type, using the `type` keyword. Here it names an object shape, so the eight copies become one:
+
+```ts
+type Task = {
+  id: string;
+  title: string;
+  done: boolean;
+  priority: number;
+  dueDate?: string;
+};
+
+function complete(task: Task): Task {
+  return { ...task, done: true };
+}
+function isOverdue(task: Task, today: string): boolean {
+  return task.dueDate !== undefined && task.dueDate < today;
+}
+```
+
+Aliases aren't limited to objects. They can name a union, a primitive, a function type, a tuple, or an array, which is what makes them so flexible:
+
+```ts
+type TaskId = string;                              // a primitive, given a meaningful name
+type Status = "todo" | "doing" | "done";           // a union of literals
+type Range = [start: number, end: number];         // a tuple
+type Predicate = (task: Task) => boolean;          // a function type
+type TaskList = readonly Task[];                   // an array type
+```
+
+An alias is **just another name**, not a new type. `TaskId` and `string` are interchangeable: TypeScript won't stop you passing a `string` where a `TaskId` is expected. (To make them *incompatible*, you'd use branded types, covered in [Chapter 78](/chapter/78).)
+
+```ts
+type TaskId = string;
+const id: TaskId = "t1";
+const raw: string = id;   // ✅ identical types, so no complaint
+```
+
+Aliases also disappear at runtime, like all types. Declaring `type Task = {...}` emits nothing.
+
+> 💡 **Tip.** Alias descriptively. `type Status` is better than `type S`. A name is documentation that the compiler keeps current.
+
+## 8.2 Interfaces
+
+An **interface** names an object shape too, with its own keyword:
+
+```ts
+interface User {
+  id: string;
+  name: string;
+  email?: string;
+}
+
+function welcome(user: User): string {
+  return `Hello, ${user.name}`;
+}
+```
+
+For plain object shapes, `type` and `interface` behave almost identically: either can describe `User`, and both are erased at runtime. The differences that matter at this stage:
+
+```ts
+// 1. Interfaces can be re-opened ("declaration merging"); aliases cannot.
+interface User { role: "admin" | "member" }   // ✅ merged into the User above
+
+type Point = { x: number };
+type Point = { y: number };
+// ❌ Duplicate identifier 'Point'.
+
+// 2. Interfaces extend with `extends`; aliases combine with `&` (Chapter 13).
+interface Admin extends User { permissions: string[] }
+
+// 3. Only an alias can name a union or a primitive.
+type Id = string | number;
+// There is no interface equivalent.
+```
+
+So the practical rule: an **interface** is for the shape of an object, particularly one that other code will `extend` or `implement` ([Chapter 15](/chapter/15)). A **type alias** is for everything else: unions, tuples, function types, and derived types. Beyond that, pick one and be consistent. The full comparison is in [Chapter 12](/chapter/12).
+
+> ⚠️ **Common mistake.** Spending a team meeting arguing `type` vs `interface` for plain objects. Both work; consistency matters more than the choice.
+
+## 8.3 Literal types
+
+So far, `string` means "any string". A **literal type** means "exactly this value": a set with one member. Strings, numbers, and booleans can all be literal types:
+
+```ts
+let direction: "left";            // only the string "left"
+direction = "left";               // ✅
+direction = "right";              // ❌ Type '"right"' is not assignable to type '"left"'.
+
+let level: 3;                     // only the number 3
+let on: true;                     // only the boolean true
+```
+
+One literal alone is rarely useful. The power appears when you **combine literals into a union** with `|`, creating a small, closed set of allowed values:
+
+```ts
+type Status = "todo" | "doing" | "done";
+type Dice = 1 | 2 | 3 | 4 | 5 | 6;
+
+let status: Status = "todo";
+status = "doing";                 // ✅
+status = "tood";                  // ❌ Type '"tood"' is not assignable to type 'Status'.
+
+const roll: Dice = 7;             // ❌ Type '7' is not assignable to type 'Dice'.
+```
+
+A literal union is a *vocabulary*: it lists every word the field is allowed to hold. The compiler checks each assignment against that list, including the typos that a plain `string` happily accepts. Section 8.4 applies this to real code, and [Chapter 13](/chapter/13) generalizes it into a full algebra of unions.
+
+## 8.4 Literal unions as vocabulary
+
+Many programs are full of **magic strings**: bare string values that mean something specific, scattered across the code. A typo in any of them is a silent bug.
+
+```ts
+// Before: stringly typed
+function setStatus(task: { status: string }, status: string) {
+  task.status = status;
+}
+setStatus(task, "complete");   // 😬 compiles, but the real status is "done"
+```
+
+Replace the `string` with a literal union and the compiler becomes the spell-checker:
+
+```ts
+type TaskStatus = "todo" | "doing" | "done";
+
+interface Task {
+  id: string;
+  title: string;
+  status: TaskStatus;
+}
+
+function setStatus(task: Task, status: TaskStatus): void {
+  task.status = status;
+}
+
+setStatus(task, "doing");      // ✅
+setStatus(task, "complete");   // ❌ Argument of type '"complete"' is not assignable to parameter of type 'TaskStatus'.
+```
+
+You also get **autocomplete**: when you type the quotes in `setStatus(task, "`, your editor offers exactly `"todo"`, `"doing"`, `"done"`. The type *is* the documentation of what values are allowed.
+
+A rename is also safe. Change `"doing"` to `"in-progress"` in the type, and the compiler marks every place that used the old word.
+
+```ts
+const labels: Record<TaskStatus, string> = {
+  todo: "To do",
+  doing: "In progress",
+  done: "Done",
+};
+// If you add "blocked" to TaskStatus, this object errors until you add a label:
+// ❌ Property 'blocked' is missing in type '{ todo: string; doing: string; done: string; }'
+//    but required in type 'Record<TaskStatus, string>'.
+```
+
+(`Record<K, V>` is a utility type covered in [Chapter 21](/chapter/21). Read it as "an object with a key for each member of `K`".)
+
+> ⚠️ **Common mistake.** A `status: string` field. It accepts anything, which means it protects against nothing.
+
+## 8.5 Enums, and why many teams avoid them
+
+TypeScript also has an `enum` keyword, borrowed from other languages. You will see it in existing code, so you need to understand it.
+
+```ts
+enum Priority {
+  Low,      // 0
+  Medium,   // 1
+  High,     // 2
+}
+
+enum Status {
+  Todo = "TODO",
+  Done = "DONE",
+}
+
+const p: Priority = Priority.High;
+const s: Status = Status.Done;
+```
+
+Unlike almost everything else in TypeScript, an enum **produces JavaScript at runtime**. It is not erased:
+
+```js
+// Emitted for `enum Priority { Low, Medium, High }`
+var Priority;
+(function (Priority) {
+    Priority[Priority["Low"] = 0] = "Low";
+    Priority[Priority["Medium"] = 1] = "Medium";
+    Priority[Priority["High"] = 2] = "High";
+})(Priority || (Priority = {}));
+```
+
+That's why many teams avoid enums:
+
+- **They break the "types are erased" rule.** Tools that only strip types, such as Node's type stripping ([Chapter 5](/chapter/5)), cannot run them. The `erasableSyntaxOnly` flag reports them as errors: `This syntax is not allowed when 'erasableSyntaxOnly' is enabled.`
+- **Numeric enums behave oddly.** They also emit a reverse mapping (`Priority[0] === "Low"`), and in older TypeScript versions any number was assignable to a numeric enum, so `const p: Priority = 42` compiled. Modern TypeScript rejects this, but the habit of treating enums as numbers lingers.
+- **String enums are *nominal*.** `const s: Status = "DONE"` fails, so callers must import the enum just to pass a value, and plain JSON strings need conversion.
+
+```ts
+const s: Status = "DONE";
+// ❌ Type '"DONE"' is not assignable to type 'Status'.
+```
+
+The alternatives are lighter. A **literal union** needs no runtime code (the `TaskStatus` above). When you also need the values at runtime, for example to loop over them or populate a dropdown, use an **`as const` object**:
+
+```ts
+const Priority = { Low: 1, Medium: 2, High: 3 } as const;
+type Priority = (typeof Priority)[keyof typeof Priority];   // 1 | 2 | 3
+
+const p: Priority = Priority.High;   // ✅
+const q: Priority = 4;               // ❌ Type '4' is not assignable to type 'Priority'.
+Object.values(Priority);             // [1, 2, 3] works at runtime
+```
+
+> 🚫 **When not to.** Don't write new enums in a codebase that uses type stripping or `erasableSyntaxOnly`. If an existing codebase uses enums consistently, don't rewrite them just for style. Just don't add more by habit.
+
+## 8.6 as const, first look
+
+By default, TypeScript widens literal values inside objects and arrays ([Chapter 6](/chapter/6)). The suffix `as const` says: *freeze this value, and keep the narrowest type possible*.
+
+```ts
+const config = { method: "GET", retries: 3 };
+// config: { method: string; retries: number }
+
+const frozen = { method: "GET", retries: 3 } as const;
+// frozen: { readonly method: "GET"; readonly retries: 3 }
+
+frozen.method = "POST";   // ❌ Cannot assign to 'method' because it is a read-only property.
+```
+
+With arrays, `as const` produces a **readonly tuple** of literals. From that, you can derive a union, so the list of values and the type can never drift apart:
+
+```ts
+const STATUSES = ["todo", "doing", "done"] as const;
+// STATUSES: readonly ["todo", "doing", "done"]
+
+type Status = (typeof STATUSES)[number];
+// Status: "todo" | "doing" | "done"
+
+STATUSES.map((s) => s.toUpperCase());   // ✅ loop over them at runtime
+```
+
+Read `(typeof STATUSES)[number]` as "the type of the elements of that array". You are not expected to master it now. [Chapter 20](/chapter/20) unpacks `typeof`, indexed access, `as const`, and `satisfies` properly. What matters today: **one source of truth, both a value and a type.**
+
+> ⚠️ **Common mistake.** Writing the list twice (a `type` and an array) and updating only one. Derive one from the other.
+
+## 8.7 Naming conventions
+
+Good names make types readable at a glance. The conventions that nearly every TypeScript codebase follows:
+
+- **PascalCase** for types, interfaces, and aliases: `Task`, `TaskStatus`, `ApiResponse`.
+- **No `I` prefix** on interfaces. Write `User`, not `IUser`. (The prefix is a leftover from other languages; the compiler already tracks what is an interface.)
+- **No `Type` suffix** unless needed. `Task`, not `TaskType`.
+- **Domain names, not technical ones.** `Invoice` beats `DataObject`; `TaskStatus` beats `StringUnion1`.
+- **Singular for entities, plural for collections.** `Task` is one; `Task[]` or a variable named `tasks` is many.
+- **Generic type parameters** are short and capitalized: `T`, or descriptive like `TItem` ([Chapter 16](/chapter/16)).
+
+```ts
+// ❌ Technical, prefixed, vague
+interface ITaskObj { s: string; d: boolean }
+type StrUnion = "a" | "b";
+
+// ✅ Domain-driven, readable
+interface Task {
+  status: TaskStatus;
+  done: boolean;
+}
+type TaskStatus = "todo" | "doing" | "done";
+type ProjectRole = "owner" | "editor" | "viewer";
+```
+
+> 🚫 **When not to.** Don't name a type that is used exactly once in a small local scope. A one-off `{ x: number; y: number }` parameter doesn't need its own alias. Name a type when it is **reused** or when the name **explains** something.
+
+## Common mistakes
+
+> ⚠️ **Stringly-typed status fields.** `status: string` with values checked in `if` statements. A literal union moves the check to compile time.
+
+> ⚠️ **Numeric enums accepting surprising values.** In older TypeScript versions, `const p: Priority = 42` compiled. Even today, numeric enums leak implementation details through reverse mappings. A literal union of numbers is more honest.
+
+> ⚠️ **Duplicate inline types.** The same shape written in several signatures will drift. Extract it after the *second* copy.
+
+> ⚠️ **Believing an alias creates a new type.** `type UserId = string` is just another name. Anything typed `string` is accepted.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** a shape or vocabulary appears more than once, when a name explains the domain (`TaskStatus`), or when a value must come from a closed set.
+
+> 🚫 **When not to.** Skip the name for one-off local shapes. Skip enums unless you are maintaining code that already relies on them. Don't invent an alias that only renames `string` unless the name carries real meaning.
+
+## How it connects
+
+> 🔗 **Connection.** The deeper `type` vs `interface` comparison, declaration merging, and `extends` are in [Chapter 12](/chapter/12). Literal unions grow into discriminated unions in [Chapter 13](/chapter/13). `as const` and `typeof` are fully explained in [Chapter 20](/chapter/20). The vocabulary you define in the Level 4 exercise is used by [P02](/projects/p02).
+
+> 🌍 **Real world.** Libraries like React ship literal-union types for things like `"button" | "submit" | "reset"`, and the TypeScript compiler's own `--target` option accepts a union of strings. Both let the editor autocomplete the allowed words.
+
+## Exercises
+
+### Level 1 — Recall
+
+Convert each inline type into a named alias or interface, and decide which keyword you would use for each (and why).
+
+```ts
+function area(shape: { kind: string; width: number; height: number }): number { return 0; }
+function paint(color: "red" | "green" | "blue"): void {}
+function send(handler: (message: string) => void): void {}
+function save(user: { id: string; name: string; email?: string }): void {}
+```
+
+### Level 2 — Application
+
+Replace every magic string in this order-processing module with literal unions. The compiler should reject `"shiped"` and `"express"` typos after your change.
+
+```ts
+function nextState(state: string): string {
+  if (state === "pending") return "paid";
+  if (state === "paid") return "shipped";
+  return state;
+}
+
+function shippingCost(method: string, kg: number): number {
+  if (method === "standard") return 5 + kg;
+  if (method === "overnight") return 20 + kg * 2;
+  return 0;
+}
+```
+
+### Level 3 — Challenge
+
+Write the same small module (a `Priority` with `Low`, `Medium`, and `High`, a function that returns a label, and a function that sorts tasks by priority) **three ways**: with a numeric `enum`, with a literal union, and with an `as const` object. Compile each with `tsc` and compare the emitted JavaScript. Then write four sentences on ergonomics: what changes for the caller, the autocomplete, and `Object.values`?
+
+*Hint: only one of the three versions emits extra JavaScript beyond your own functions.*
+
+### Level 4 — Real-world
+
+**Ticket TF-008: TaskFlow vocabulary.** Project P02 needs one shared domain file that every module imports.
+
+- Create `src/domain.ts` exporting `TaskStatus`, `Priority`, `Task`, and `Project`, with a `Task` that belongs to a `Project`.
+- Statuses and priorities are closed sets: no `string` or `number` fields where a vocabulary applies.
+- Provide a runtime list of statuses (for a dropdown) that cannot drift from the `TaskStatus` type.
+- The file compiles with `erasableSyntaxOnly` turned on, and follows the naming conventions in 8.7.
+
+## Key takeaways
+
+- A **type alias** names any type; an **interface** names an object shape. For plain objects, either works. Be consistent.
+- A name is not a new type: `type UserId = string` accepts any string.
+- **Literal unions** (`"todo" | "doing" | "done"`) replace magic strings with a checked, autocompleted vocabulary.
+- Enums emit runtime code and are not erasable. Prefer literal unions, or an `as const` object when you also need runtime values.
+- `as const` freezes a value and preserves its literal types. Derive types from the value so they never drift.
+- Name types in PascalCase using domain words; skip the `I` prefix.
+
+## What comes next
+
+So far every type has been precise. But sometimes you truly don't know what a value is: the result of `JSON.parse`, a thrown error, input from a user. TypeScript has special types for those moments, and one of them quietly turns off the whole type checker. [Chapter 9: The Edge Types](/chapter/9) covers `any`, `unknown`, `never`, `void`, `null`, and `undefined`.

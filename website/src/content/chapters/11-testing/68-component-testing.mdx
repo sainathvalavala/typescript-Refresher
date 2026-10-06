@@ -1,0 +1,412 @@
+> 📖 **The problem.** TaskFlow has a test suite of 140 component tests. Last week a designer changed a `div` to a `section` and wrapped a button in a new container, with no visible change at all, and 37 tests failed. Nobody could say which of the failures were real. Meanwhile, a genuine bug shipped: the "Create task" button had been disabled for keyboard users because of a bad `onKeyDown`, and not one test noticed, because the tests clicked with `fireEvent.click(container.querySelector(".btn-primary"))`. They tested the markup's *implementation*, not what a person experiences.
+
+A good component test should break when the *behavior* breaks and stay green when the markup is merely reorganized. This chapter teaches the one habit that makes that happen: find things the way a user (and a screen reader) finds them, interact the way a person does, and assert on what is visible. You will also build a typed custom `render` so providers stop being copy-pasted into every test.
+
+> 🧠 **Mental model.** **Test like a user.** A user cannot see class names, component names, or state. They see roles ("a button called Create task"), labels, and text, they type and click and press keys, and they judge the result by what appears. Your tests should have exactly those senses and no more.
+
+## 68.1 Testing like a user
+
+React Testing Library (RTL) renders your component into a real DOM (via jsdom in tests) and gives you queries to find elements. Its key idea is a **priority order**: prefer the queries that look most like how a person or assistive technology finds things.
+
+| Priority | Query | Finds by |
+|---|---|---|
+| 1 | `getByRole` | The accessible role and name: `button`, `textbox`, `heading`, `checkbox` |
+| 2 | `getByLabelText` | The label of a form field |
+| 3 | `getByPlaceholderText`, `getByText` | Visible text |
+| 4 | `getByDisplayValue`, `getByAltText`, `getByTitle` | Specific attributes |
+| Last resort | `getByTestId` | A `data-testid` you added only for tests |
+
+```tsx
+import { render, screen } from "@testing-library/react";
+
+test("shows the task title and a complete button", () => {
+  render(<TaskCard task={buildTask({ title: "Write docs", status: "doing" })} />);
+
+  expect(screen.getByRole("heading", { name: "Write docs" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /complete/i })).toBeEnabled();
+
+  // ❌ fragile: breaks when a class, tag, or wrapper changes
+  // container.querySelector(".task-card > div:nth-child(2) button.btn-primary")
+});
+```
+
+Role queries have a bonus: `getByRole("button", { name: "Create task" })` fails if the button has no accessible name, so the test doubles as an accessibility check.
+
+Queries come in three flavors, and choosing the right one is half the skill:
+
+```tsx
+screen.getByRole("alert");         // must exist NOW, or the test fails (throws)
+screen.queryByRole("alert");       // returns null if absent: use to assert something is NOT there
+await screen.findByRole("alert");  // waits (up to ~1s) for it to appear: use for async UI
+```
+
+```tsx
+expect(screen.queryByRole("alert")).not.toBeInTheDocument(); // ✅ the way to say "no error is shown"
+expect(screen.getByRole("alert")).not.toBeInTheDocument();   // ❌ throws: Unable to find role="alert"
+```
+
+> 💡 **Tip.** When a query fails, RTL prints the accessible tree and suggests available roles. When you are unsure what to query, call `screen.logTestingPlaygroundURL()` or `screen.debug()`, or install the Testing Playground browser extension.
+
+## 68.2 Rendering with providers
+
+Real components need context: a router for `Link`, a query client for server data, the auth state. Wrapping each test by hand is noisy and easy to get wrong. The standard solution is a **custom `render`** that wraps everything once and gives tests a few typed options.
+
+```tsx
+// test/render.tsx
+import { render, type RenderOptions } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter } from "react-router";
+
+type Options = Omit<RenderOptions, "wrapper"> & {
+  route?: string;           // the URL to start on
+  auth?: AuthState;         // default: signed in as a member
+  queryClient?: QueryClient;
+};
+
+export function renderWithProviders(ui: React.ReactElement, options: Options = {}) {
+  const {
+    route = "/",
+    auth = { status: "authenticated", user: buildUser({ role: "member" }) },
+    queryClient = createTestQueryClient(), // fresh per test, retries off (Chapter 62)
+    ...rest
+  } = options;
+
+  function Wrapper({ children }: { children: React.ReactNode }) {
+    return (
+      <QueryClientProvider client={queryClient}>
+        <AuthContext value={fakeAuth(auth)}>
+          <MemoryRouter initialEntries={[route]}>{children}</MemoryRouter>
+        </AuthContext>
+      </QueryClientProvider>
+    );
+  }
+
+  return {
+    user: userEvent.setup(),        // ready-made user for interactions (68.3)
+    queryClient,                    // exposed so a test can inspect or seed the cache
+    ...render(ui, { wrapper: Wrapper, ...rest }),
+  };
+}
+```
+
+Tests then say only what is *different* about them:
+
+```tsx
+const { user } = renderWithProviders(<BoardPage />, {
+  route: "/projects/p1",
+  auth: { status: "authenticated", user: buildUser({ role: "viewer" }) },
+});
+```
+
+The `Options` type matters. `auth` is typed as `AuthState` (from [Chapter 65](/chapter/65)), so a test cannot pass a half-built user. And because `queryClient` is created *inside* the function by default, no two tests share a cache, which removes a classic source of flaky failures.
+
+> ⚠️ **Common mistake.** Creating one `QueryClient` at the top of the test file. Data cached by test A appears in test B, and the failure depends on test order. Create it per render.
+
+## 68.3 User interactions
+
+`fireEvent.click(button)` dispatches a single synthetic event. A real click is a sequence: pointer moves, mouse down, focus changes, mouse up, click. A real typing action is a keydown, keypress, input, and keyup per character. **`@testing-library/user-event`** simulates those sequences, so focus handling, `disabled`, and input behavior match a browser. Create one `user` per test with `userEvent.setup()`, and `await` every action:
+
+```tsx
+import userEvent from "@testing-library/user-event";
+
+test("renames a task", async () => {
+  const user = userEvent.setup();
+  render(<RenameTask task={buildTask({ title: "Old" })} />);
+
+  await user.click(screen.getByRole("button", { name: "Rename" }));
+  const input = screen.getByRole("textbox", { name: "Task title" });
+  await user.clear(input);
+  await user.type(input, "New title{Enter}"); // {Enter} presses the Enter key
+
+  expect(screen.getByRole("heading", { name: "New title" })).toBeVisible();
+});
+```
+
+The same API covers the rest of what a user does: keyboard navigation, selects, and checkboxes.
+
+```tsx
+await user.tab();                                   // focus moves to the next focusable element
+await user.keyboard("{ArrowDown}{ArrowDown}{Enter}"); // arrow through a list, then choose
+await user.selectOptions(screen.getByRole("combobox", { name: "Status" }), "done");
+await user.click(screen.getByRole("checkbox", { name: "Show completed" }));
+await user.hover(screen.getByRole("button", { name: "Assign" }));
+```
+
+If you forget `await`, the assertion runs before the interaction finishes, and you get tests that pass or fail depending on timing. A lint rule (`testing-library/await-async-events`) catches it.
+
+Assertions like `toBeVisible`, `toBeEnabled`, `toHaveValue`, and `toHaveAccessibleName` come from `@testing-library/jest-dom`. Register them once in your test setup file so TypeScript knows about them too:
+
+```ts
+// test/setup.ts
+import "@testing-library/jest-dom/vitest"; // adds matchers to expect() and to its types
+```
+
+## 68.4 Async UI
+
+Most interesting UI changes *later*: after a fetch, a timeout, or a mutation. If you assert immediately, the data is not there yet. RTL gives you two tools, and one of them is almost always the right one.
+
+**`findBy*`** is `getBy*` plus waiting. It polls until the element appears (default timeout about one second) and then resolves:
+
+```tsx
+test("lists tasks once they load", async () => {
+  renderWithProviders(<BoardPage />);
+
+  expect(screen.getByRole("status", { name: "Loading tasks" })).toBeInTheDocument();
+
+  // waits for the network mock (Chapter 69) to respond and React to re-render
+  expect(await screen.findByRole("heading", { name: "Write docs" })).toBeVisible();
+});
+```
+
+**`waitFor`** retries a *callback* until it stops throwing. Use it for assertions that are not "an element appears", such as a count or an attribute changing:
+
+```tsx
+import { waitFor } from "@testing-library/react";
+
+await user.click(screen.getByRole("button", { name: "Complete" }));
+
+await waitFor(() => {
+  expect(screen.getByRole("checkbox", { name: "Write docs" })).toBeChecked();
+});
+```
+
+Keep exactly **one assertion**, or only assertions, inside `waitFor`. Side effects inside it (like clicking) would run again on every retry.
+
+You may see warnings like *"An update to BoardPage inside a test was not wrapped in act(...)"*. `act` is how React batches updates in tests. RTL wraps its own helpers (`render`, `user-event`, `findBy*`, `waitFor`) in `act` for you, so the warning almost always means **something updated state after the test moved on**: you finished the test before the async work did. The cure is to wait for the visible result, not to sprinkle `act` around.
+
+```tsx
+test("creates a task", async () => {
+  const { user } = renderWithProviders(<NewTask />);
+  await user.type(screen.getByLabelText("Title"), "Ship it");
+  await user.click(screen.getByRole("button", { name: "Create" }));
+
+  // ❌ ends here: the mutation resolves after the test, and React warns about the unwrapped update
+  // ✅ wait for the observable outcome, which also lets the update finish inside the test
+  expect(await screen.findByText("Task created")).toBeVisible();
+});
+```
+
+> ⚠️ **Common mistake.** `await waitFor(() => screen.getByText("Done"))` when `findByText` says the same thing more clearly. Reach for `findBy` first, and `waitFor` only when there is no element to find.
+
+## 68.5 Testing loading and error states
+
+The states that are hardest to see by hand (a slow response, a failing server, an empty list) are the easiest to test, *if* the test controls the data. Do not make the real network misbehave; **replace the network response** per test. [Chapter 69](/chapter/69) sets up the mock server (MSW); here is how a test uses it to force each state.
+
+```tsx
+import { http, HttpResponse, delay } from "msw";
+import { server } from "../../test/server";
+
+test("shows a loading skeleton while tasks load", async () => {
+  server.use(
+    http.get("/api/projects/p1/tasks", async () => {
+      await delay("infinite");          // never answers
+      return HttpResponse.json({ items: [], nextCursor: null });
+    }),
+  );
+  renderWithProviders(<BoardPage />, { route: "/projects/p1" });
+
+  expect(await screen.findByRole("status", { name: /loading/i })).toBeInTheDocument();
+});
+
+test("shows an error with a retry button when the server fails", async () => {
+  server.use(http.get("/api/projects/p1/tasks", () => new HttpResponse(null, { status: 500 })));
+  renderWithProviders(<BoardPage />, { route: "/projects/p1" });
+
+  expect(await screen.findByRole("alert")).toHaveTextContent(/something went wrong/i);
+  expect(screen.getByRole("button", { name: /retry/i })).toBeEnabled();
+});
+
+test("shows the empty state for a project with no tasks", async () => {
+  server.use(http.get("/api/projects/p1/tasks", () => HttpResponse.json({ items: [], nextCursor: null })));
+  renderWithProviders(<BoardPage />, { route: "/projects/p1" });
+
+  expect(await screen.findByText(/no tasks yet/i)).toBeVisible();
+});
+```
+
+These tests map one-to-one onto the `loading | error | empty | success` states from [Chapter 61](/chapter/61), which is the point: every branch of that exhaustive `switch` deserves a test, and the union tells you how many there are.
+
+For time-based behavior, such as a toast that disappears after three seconds or a search that **debounces**, use fake timers, and tell user-event how to advance them:
+
+```tsx
+vi.useFakeTimers();
+const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+
+await user.type(screen.getByRole("searchbox"), "docs");
+vi.advanceTimersByTime(300);                                  // the debounce delay
+expect(await screen.findByText("Write docs")).toBeVisible();
+vi.useRealTimers();
+```
+
+## 68.6 Testing forms
+
+A form test reads like the user's story: fill in, submit, see the outcome. Two outcomes matter most: the **validation messages** and the **submission**.
+
+```tsx
+test("shows validation errors and does not submit an empty form", async () => {
+  const onSubmit = vi.fn();
+  const { user } = renderWithProviders(<CreateTaskForm onSubmit={onSubmit} />);
+
+  await user.click(screen.getByRole("button", { name: "Create task" }));
+
+  expect(screen.getByLabelText("Title")).toBeInvalid(); // aria-invalid="true"
+  expect(screen.getByText("Enter a title.")).toBeVisible();
+  expect(screen.getByLabelText("Title")).toHaveFocus(); // focus moved to the first error (Chapter 63)
+  expect(onSubmit).not.toHaveBeenCalled();
+});
+
+test("submits valid values", async () => {
+  const onSubmit = vi.fn();
+  const { user } = renderWithProviders(<CreateTaskForm onSubmit={onSubmit} />);
+
+  await user.type(screen.getByLabelText("Title"), "Write docs");
+  await user.selectOptions(screen.getByLabelText("Priority"), "high");
+  await user.click(screen.getByRole("button", { name: "Create task" }));
+
+  expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ title: "Write docs", priority: "high" }));
+});
+```
+
+Notice that the field is found by its **label**. If the label were not connected with the input, `getByLabelText` would fail, so the test enforces the accessibility from [Chapter 63](/chapter/63) as a side effect.
+
+A server rejection is the third outcome: override the mock to return a `400` and check the message lands on the field.
+
+```tsx
+test("shows the server's message on the title field", async () => {
+  server.use(
+    http.post("/api/tasks", () =>
+      HttpResponse.json({ errors: { title: ["Title already used."] } }, { status: 400 }),
+    ),
+  );
+  const { user } = renderWithProviders(<CreateTaskForm />);
+
+  await user.type(screen.getByLabelText("Title"), "Write docs");
+  await user.click(screen.getByRole("button", { name: "Create task" }));
+
+  expect(await screen.findByText("Title already used.")).toBeVisible();
+  expect(screen.getByLabelText("Title")).toBeInvalid();
+});
+```
+
+## 68.7 Accessibility in tests
+
+Role-based queries are an accessibility test in disguise. `getByRole("button", { name: "Delete task" })` only succeeds if the element is *exposed to assistive technology* as a button, with that accessible name. A `div onClick` with no role will not be found. A button with an icon and no label will not be found by name. When a role query is hard to write, the component is usually hard to use.
+
+```tsx
+test("the board is navigable by role", () => {
+  renderWithProviders(<BoardPage />);
+
+  expect(screen.getByRole("main")).toBeInTheDocument();
+  expect(screen.getByRole("navigation", { name: "Projects" })).toBeInTheDocument();
+  expect(screen.getAllByRole("listitem")).toHaveLength(3);
+
+  const iconButton = screen.getByRole("button", { name: "Delete Write docs" }); // not just "Delete"
+  expect(iconButton).toHaveAccessibleName("Delete Write docs");
+});
+```
+
+Automated checkers go one step further. **axe** scans rendered output for rule violations: missing labels, bad ARIA, low-contrast attributes it can see, duplicate ids. Run it in a few important component tests:
+
+```tsx
+import { axe } from "vitest-axe";
+import * as matchers from "vitest-axe/matchers";
+expect.extend(matchers);
+
+test("the create-task form has no detectable accessibility violations", async () => {
+  const { container } = renderWithProviders(<CreateTaskForm />);
+  expect(await axe(container)).toHaveNoViolations();
+});
+```
+
+Be clear about what axe is. Automated tools catch only a *fraction* of accessibility problems (commonly cited as around a third). It cannot tell you that your focus order makes sense, that an error message is understandable, or that a custom widget feels right with a screen reader. Use it as a safety net for the easy mistakes, and combine it with keyboard interaction tests (`user.tab()`, `user.keyboard(...)`) and occasional manual checks.
+
+> 🔗 **Connection.** The ARIA attributes this relies on (`aria-invalid`, `aria-describedby`, roles) are the ones you wrote in [Chapter 63](/chapter/63). Writing tests by role is what keeps them from quietly breaking.
+
+## 68.8 What not to test
+
+Every test is a promise you have to maintain. Tests that assert on **implementation details** break on refactors and still miss real bugs. Avoid:
+
+- **Internal state and component structure**: "state `isOpen` is true", "child component `TaskCard` rendered 3 times". The user does not see state, only what it displays.
+- **Hook calls and prop plumbing**: "`useState` was called", "the child received `onChange`". Test what the child *does*.
+- **Class names and DOM shape**: `.task-card--active`, nth-child selectors. Use roles and text.
+- **Third-party libraries**: you do not need to verify that React Router navigates or that Zod parses. Test *your* decisions.
+- **Snapshots of whole components**: a 400-line snapshot gets approved with `-u` without being read, and fails for every unrelated change.
+
+```tsx
+// ❌ Implementation detail: breaks if you rename the state or switch to a reducer
+expect(wrapper.state("isEditing")).toBe(true);
+
+// ❌ A huge snapshot nobody reads
+expect(container).toMatchSnapshot();
+
+// ✅ Behavior: what the user would see or be able to do
+await user.click(screen.getByRole("button", { name: "Edit" }));
+expect(screen.getByRole("textbox", { name: "Task title" })).toHaveFocus();
+```
+
+Small, focused snapshots have a place: a serialized error object, a formatted string, or a data structure produced by a mapper. They fail when the *data* changes, and the diff is short enough to review.
+
+> 🚫 **When not to.** Do not chase 100% coverage with component tests. Pure logic belongs in unit tests ([Chapter 67](/chapter/67)); types prove structure ([Chapter 66](/chapter/66)); component tests cover *behavior at the screen*. A test that duplicates what a type or a unit test already proves is cost without confidence.
+
+## Common mistakes
+
+> ⚠️ **Querying by `data-testid` first.** It works, so it hides the missing role or label. Try `getByRole` and `getByLabelText` first.
+
+> ⚠️ **Forgetting `await` on `user` actions.** The assertion runs mid-interaction. Always `await user.click(...)`.
+
+> ⚠️ **`fireEvent` instead of `user-event`.** It skips focus, disabled handling, and the key sequence, so it can pass where a real user fails.
+
+> ⚠️ **Using `getBy*` to assert absence.** `getBy` throws when nothing is found. Use `queryBy*` with `.not.toBeInTheDocument()`.
+
+> ⚠️ **A shared `QueryClient` or global state between tests.** Create fresh state per test, or failures depend on order.
+
+> ⚠️ **Putting several actions inside `waitFor`.** It reruns the callback repeatedly. Do actions outside, assert inside.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** you want confidence that a screen *works for a person*: forms, flows, conditional UI, error and empty states, keyboard behavior.
+
+> 🚫 **When not to.** Pixel-level appearance (use visual regression tooling), pure calculations (unit test them), and exhaustive combinations of props for a simple presentational component. For one-off layout checks, a human and a browser are faster.
+
+## How it connects
+
+> 🔗 **Connection.** The custom `render` assembles the providers from [Chapter 54](/chapter/54), [Chapter 62](/chapter/62), and [Chapter 65](/chapter/65). Fresh `QueryClient` per test comes from [Chapter 62](/chapter/62). The factories (`buildTask`, `buildUser`) are from [Chapter 67](/chapter/67), and the mock network is built in [Chapter 69](/chapter/69).
+
+> 🌍 **Real world.** Testing Library's guiding principle ("the more your tests resemble the way your software is used, the more confidence they can give you") is shared by Vue, Angular, and Svelte versions of the library. Learning it once pays off in every framework.
+
+## Exercises
+
+### Level 1 — Recall
+
+Rewrite these five fragile queries as role- or label-based ones: `container.querySelector(".btn-primary")`, `getByTestId("title-input")`, `container.querySelectorAll("li.task")`, `getByText("Delete")` (when three buttons say "Delete"), and `container.querySelector("input[type=checkbox]")`.
+
+### Level 2 — Application
+
+Test the create-task form from [Chapter 63](/chapter/63): show validation errors on an empty submit (and focus on the first invalid field), submit valid values, and display a server `400` message on the right field. Use the custom `renderWithProviders`.
+
+### Level 3 — Challenge
+
+Test a combobox's keyboard interaction completely: open with Down, move with arrows, Home and End, select with Enter, close with Escape (focus returns to the input), and type-ahead. Assert on roles (`combobox`, `listbox`, `option`) and `aria-activedescendant`, not on class names.
+
+### Level 4 — Real-world
+
+**Ticket TF-611: Board state coverage.** The task board has shipped three bugs this quarter, all in states nobody tested.
+
+- Write component tests for each state of the board: loading, empty, error (with retry), and ready.
+- The ready state covers completing a task and a viewer role who sees no edit controls.
+- No query uses a class name, a tag name, or `data-testid`, and `axe` finds no violations in the ready state.
+- Each test creates its own `QueryClient` and passes whether run alone or in any order.
+
+## Key takeaways
+
+- Find elements the way a user does: **role**, then label, then text. `testid` is the last resort.
+- `getBy*` throws, `queryBy*` returns `null` (for absence), and `findBy*` waits (for async UI).
+- Use `user-event`: `const user = userEvent.setup()`, and `await` every interaction.
+- Build one typed custom `render` for providers, with a fresh `QueryClient` per test.
+- Control loading, error, and empty states by controlling the **network response**, not the component.
+- Do not test implementation details or giant snapshots, and do not expect axe to catch everything.
+
+## What comes next
+
+Component tests exercise one screen with a faked network. But bugs also live between layers: the real API contract, routing, auth, and a browser. [Chapter 69: Integration Testing, API Mocking & E2E](/chapter/69) builds an honest mock server, keeps its data in step with the real schemas, and finishes with Playwright tests of the full flow.

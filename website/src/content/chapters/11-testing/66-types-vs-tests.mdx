@@ -1,0 +1,344 @@
+> 📖 **The problem.** TaskFlow Web has strict mode on, no `any` anywhere, zero type errors, and a clean lint run. A user ticks the checkbox next to "Write release notes", and "Book venue" gets marked as done instead. No tool complained, because nothing about this bug is a *type* problem. The code passes a `string` where a `string` is expected. It just passes the wrong one.
+
+Somewhere along the way it's easy to start believing that a program that compiles is a program that works. TypeScript is so good at catching mistakes that its silence starts to feel like approval. This chapter replaces that feeling with a precise answer to the question that organizes all of Part XI: **what does TypeScript already guarantee, and what must tests prove?**
+
+By the end, you'll be able to look at any bug and name the cheapest layer that would have caught it. You'll also be able to choose between unit, component, integration, and end-to-end tests on purpose, and write a test strategy for a React application that doesn't waste effort re-proving what the compiler already proves.
+
+> 🧠 **Mental model.** *Layers of safety, each catching a different class of failure.* Read the list from top to bottom: each layer is cheaper and faster than the one below it, and each one sees less of reality. No single layer is enough, and no layer should do another layer's job.
+
+```text
+ Types ............ consistency: shapes, nullability, exhaustiveness, contracts between modules
+ Lint ............. suspicious patterns: floating promises, hook rules, unsafe any
+ Runtime validation  the outside world: API data, env, storage, input
+ Unit tests ....... logic: "given this input, this output"
+ Component tests .. behavior from the user's view: "clicking X shows Y"
+ Integration tests  features working together, with mocked network
+ E2E tests ........ the real app, real browser, critical paths
+ Monitoring ....... what actually happens to real users in production
+```
+
+## 66.1 The layered safety model
+
+Every safety tool looks at your application from a particular vantage point, and it can only catch what it can see. The type checker reads your source code, but only the version of the world your declarations describe. A linter reads the same code looking for *patterns* that are legal but usually wrong. Runtime validation sees the actual bytes arriving from the network. Tests run your code, but in a small world you built yourself. An end-to-end (E2E) test drives the real, built application in a real browser. Monitoring watches real users on real devices.
+
+The higher a layer sits in the diagram, the faster and cheaper it is: types give feedback as you type, while an E2E test takes seconds and a monitoring alert takes a production incident. The lower a layer sits, the more of reality it can see. That trade-off gives us the rule for the whole part: **catch each bug at the cheapest layer that can see it.**
+
+Here is one real TaskFlow bug for each layer. Notice that each one is invisible to every layer above it.
+
+```tsx
+// Types: inconsistency. Caught as you type.
+const label = task.dueDate.toLocaleDateString(); // ❌ 'task.dueDate' is possibly 'null'.
+
+// Lint: legal but suspicious. A failed save vanishes silently.
+saveTask(task); // ❌ no-floating-promises: Promises must be awaited, end with a call to .catch, …
+
+// Runtime validation: the server changed its response to { items, nextCursor }.
+const tasks = TaskListSchema.parse(await res.json()); // 💥 ZodError: expected array, received object
+
+// Unit test: wrong logic, right types. Done tasks are flagged as overdue.
+const isOverdue = (t: Task, now: Date) => t.dueDate !== null && t.dueDate < now;
+
+// Component test: works with a mouse, unreachable by keyboard or screen reader.
+<div className="checkbox" onClick={() => onComplete(task.id)} />
+
+// Integration test: the list never refreshes after "Create task", because of a key typo.
+queryClient.invalidateQueries({ queryKey: ["task"] }); // the list query uses ["tasks"]
+
+// E2E test: fine in dev; in the production build, refreshing /projects/p1 returns 404
+// because the static host has no single-page-app fallback configured.
+
+// Monitoring: a popular browser extension rewrites the DOM, and React crashes for 0.4% of users.
+```
+
+Read the list as a sieve. A bug that slips through the types should be caught by lint; one that slips past lint should be caught by validation or a unit test, and so on down. A healthy codebase catches *most* bugs in the top layers, because that's where catching them is cheapest, and keeps the bottom layers for what only they can see.
+
+## 66.2 What types prove
+
+When `tsc` reports zero errors, it has proved something specific: **every value in your program is used consistently with the types you declared.** That proof covers a lot of ground. It covers *shapes*: no misspelled property, no missing field, no object passed where a different object was expected. It covers *nullability*: under `strictNullChecks`, you can't touch a value that might be `null` without handling that case first. It covers *exhaustiveness*: a `switch` over a union with an `assertNever` default can't forget a member. And it covers *contracts between modules*: props, function signatures, and return types, so a change in one file surfaces at every caller.
+
+The most important word there is **every**. A type check is a proof over *all possible executions*, not a sample. A test checks one input; the type checker checks them all at once. So wherever a property can be expressed as a type, types are both stronger and cheaper than tests.
+
+```tsx
+type TaskStatus = "todo" | "doing" | "done";
+
+function statusLabel(status: TaskStatus): string {
+  switch (status) {
+    case "todo":  return "To do";
+    case "doing": return "In progress";
+    case "done":  return "Done";
+    default:      return assertNever(status); // proof: every status is handled
+  }
+}
+
+task.titel;                                    // ❌ Property 'titel' does not exist on type 'Task'. Did you mean 'title'?
+<TaskRow task={task} onComplete={complete} />; // ✅ proof: the props match TaskRowProps
+```
+
+But "it compiles" comes with two silent assumptions. First, that everything crossing a boundary (API responses, `localStorage`, URL params) really matches your declarations. Second, that you didn't opt out of checking with `any`, `as`, `!`, or `@ts-ignore`. And even when both assumptions hold, types prove **consistency, not correctness**:
+
+```ts
+const tasks = (await res.json()) as Task[]; // compiles: you asserted it, nothing checked it
+const first = tasks[0]!;                    // compiles: you promised it exists
+const total = price + discount;             // compiles: but it should have been price - discount
+```
+
+`price + discount` and `price - discount` have exactly the same type. The type checker has no opinion about which one your business needs. That's the territory of the next section.
+
+## 66.3 What only tests prove
+
+A test *runs* your code and checks what happened. That lets it prove things a type can't express, because the right answer and the wrong answer have the same type. Tests cover four families of failure. **Behavior**: clicking this checkbox completes *this* task. **Logic**: priorities sort high before low; done tasks are never overdue. **Integration**: after a mutation, the list query really refetches. **Accessibility**: the checkbox is reachable by keyboard and announced with a useful name.
+
+Here is the bug from the opening of the chapter. TypeScript complained that `selectedId` might be `null`, and someone "fixed" the error in the fastest way available:
+
+```tsx
+function TaskBoard({ tasks, onComplete }: TaskBoardProps) {
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+
+  return tasks.map((task) => (
+    <TaskRow
+      key={task.id}
+      task={task}
+      onSelect={() => setSelectedId(task.id)}
+      onComplete={() => onComplete(selectedId ?? task.id)} // compiles. Completes the wrong task.
+    />
+  ));
+}
+```
+
+Every type is satisfied: `selectedId ?? task.id` is a `string`, which is exactly what `onComplete` wants. Even the branded IDs from [Chapter 78](/chapter/78) wouldn't help, since both values are genuine task IDs. Only running the code reveals the bug, and a short component test does exactly that:
+
+```tsx
+it("completes the task whose checkbox was clicked", async () => {
+  const user = userEvent.setup();
+  const onComplete = vi.fn<(taskId: string) => void>();
+  const tasks = [buildTask({ id: "t1", title: "Write release notes" }), buildTask({ id: "t2", title: "Book venue" })];
+  render(<TaskBoard tasks={tasks} onComplete={onComplete} />);
+
+  await user.click(screen.getByRole("button", { name: "Book venue" }));        // select t2
+  await user.click(screen.getByRole("checkbox", { name: "Complete Write release notes" }));
+
+  expect(onComplete).toHaveBeenCalledWith("t1"); // ❌ fails against the buggy board: called with "t2"
+});
+```
+
+Don't worry about the details of `userEvent` and `getByRole` yet; [Chapter 68](/chapter/68) covers them. The point is the *kind* of claim: "when the user does this, that happens". The price of that claim is that a test only proves it for the inputs you ran. That's why tests and types are partners, not rivals: types cover all inputs for consistency, and tests cover chosen inputs for correctness.
+
+## 66.4 What only runtime validation proves
+
+There is one class of failure that neither types nor tests can catch: **the outside world changing.** Your types describe the data you *expect*. Your tests run against fixtures you *wrote*, which are just your expectations in another form. Neither one has seen what the real server will send tomorrow, what's sitting in a user's `localStorage` from last year's version of the app, or what someone typed into the URL bar.
+
+Only a check that runs *in production, on every piece of incoming data* can prove the data is what you think it is. That's the "parse, don't validate" rule from [Chapter 32](/chapter/32), applied in React at the API boundary in [Chapter 61](/chapter/61). The boundaries of a React app are API responses, environment variables, browser storage, URL params and search params, form input, and messages from third-party scripts.
+
+```ts
+// Types: "I believe this is a Task[]." Nothing checks the belief.
+const believed = (await res.json()) as Task[];
+
+// Tests: "with the fixture I wrote, it works." The fixture is also a belief.
+server.use(http.get(apiUrl("/tasks"), () => HttpResponse.json([buildTaskDto()])));
+
+// Validation: "every response, for every user, is checked." Fails here, loudly, with details.
+const checked = TaskListSchema.parse(await res.json());
+
+// The same rule for the environment: fail at startup, not at the first API call.
+const env = EnvSchema.parse(import.meta.env);
+```
+
+Tests still have a job at the boundary, but it's a different job. They prove that validation *exists* where it should, and that the app *reacts well* when it fails: an error state with a retry button instead of a white screen. You'll write exactly those tests in [Chapter 69](/chapter/69). Tests can check your *reaction* to bad data; only validation can *detect* bad data in the wild.
+
+## 66.5 Choosing test levels
+
+Within the testing layers, you still have choices. The same behavior can usually be tested as a **unit test** (call a function directly), a **component test** (render one component and interact with it), an **integration test** (render a whole feature with real providers and a mocked network), or an **E2E test** (drive the built app in a browser against a real backend). Each level trades along the same axes: how much confidence a pass gives you, how fast it runs, how much it costs to write, how often it breaks for reasons that aren't bugs, and how precisely a failure points at the cause.
+
+Two famous shapes describe how to balance them. The **test pyramid** (Mike Cohn, 2009) says: many unit tests at the base, fewer service tests in the middle, very few UI tests on top. It was drawn in an era when UI tests meant slow, brittle browser automation. The **testing trophy** (Kent C. Dodds, 2018) is shaped for modern frontends: static analysis as a wide base, some unit tests, the *most* integration tests, and a few E2E tests on top. Its argument is that tools like Testing Library and MSW made integration tests nearly as fast as unit tests while being far closer to how users actually use the app.
+
+Neither shape is a law. The useful question is **confidence per minute of effort**: "if this test passes, how sure am I that users are fine, and what did it cost to write, run, and maintain?" Here is one behavior, "late tasks are flagged", at three levels:
+
+```tsx
+// Unit: ~1 ms. Proves the rule exactly. Says nothing about whether the UI shows it.
+it("never flags done tasks as overdue", () => {
+  expect(isOverdue(buildTask({ status: "done", dueDate: yesterday }), now)).toBe(false);
+});
+
+// Component: ~30 ms. Proves the user sees the badge, given a task.
+it("shows an Overdue badge on late tasks", () => {
+  render(<TaskRow task={buildTask({ dueDate: yesterday })} onComplete={vi.fn()} />);
+  expect(screen.getByText("Overdue")).toBeVisible();
+});
+
+// E2E: ~3 s plus a running backend. Proves it in a real browser, against real data.
+test("late tasks are flagged", async ({ page }) => {
+  await page.goto("/projects/launch");
+  await expect(page.getByRole("row", { name: /Book venue/ }).getByText("Overdue")).toBeVisible();
+});
+```
+
+| Level | Speed | Confidence | Breaks without a bug | Best for |
+|---|---|---|---|---|
+| Unit | Milliseconds | Narrow but precise | Rarely | Rules with many branches and edge cases |
+| Component | Tens of ms | What one component shows and does | Sometimes | UI states, interactions, forms |
+| Integration | Tens to hundreds of ms | A whole feature working together | Sometimes | The bulk of a React app's tests |
+| E2E | Seconds | The real system | Most often | A handful of critical paths |
+
+A good habit: test edge cases at the lowest level that can express them (twelve date edge cases are unit tests), and test *wiring* at the highest level you need (one E2E test proves the date shows up at all).
+
+## 66.6 A test strategy for TaskFlow Web
+
+A strategy is just the layered model with names filled in: for each layer, which parts of TaskFlow Web it's responsible for. Writing it down stops two common failures, which are testing the same thing at every level and testing nothing at a level everyone assumed someone else covered.
+
+| Layer | Responsible for in TaskFlow Web |
+|---|---|
+| Types | Domain unions (`TaskStatus`, `Priority`), DTO types inferred from schemas, typed routes and query keys, `strict` plus `noUncheckedIndexedAccess` |
+| Lint | Type-aware typescript-eslint, hook rules, JSX accessibility rules |
+| Validation | Every API response parsed, env parsed at startup, search params parsed |
+| Unit ([Chapter 67](/chapter/67)) | Domain functions, DTO-to-domain mappers, reducers, logic-heavy hooks |
+| Component ([Chapter 68](/chapter/68)) | Every UI state of every component, forms, keyboard interaction |
+| Integration ([Chapter 69](/chapter/69)) | Each feature with mocked network: create, complete, delete, filter, auth redirects, error rollback |
+| E2E ([Chapter 69](/chapter/69)) | Four critical paths on the production build: sign in, create project, add task, complete task |
+| Monitoring ([Chapter 75](/chapter/75)) | Error tracking and performance from real sessions |
+
+The strategy also shows up in the file tree and in the scripts, so the whole team runs the same checks the same way:
+
+```text
+src/features/tasks/
+  domain/isOverdue.ts
+  domain/isOverdue.test.ts            unit
+  components/TaskRow.tsx
+  components/TaskRow.test.tsx         component
+  TasksPage.integration.test.tsx      integration (MSW)
+test/
+  render.tsx  factories.ts  msw/      shared test utilities
+e2e/
+  critical-paths.spec.ts              Playwright
+```
+
+```json
+{
+  "scripts": {
+    "typecheck": "tsc -b --noEmit",
+    "lint": "eslint .",
+    "test": "vitest",
+    "test:run": "vitest run --coverage",
+    "test:e2e": "playwright test",
+    "check": "npm run typecheck && npm run lint && npm run test:run"
+  }
+}
+```
+
+> 💡 **Tip.** If you set coverage thresholds, aim them at `src/features/**/domain` and the feature folders, not at the whole repository. A global 100% target rewards tests of glue code and punishes nobody for leaving the reducer untested.
+
+## 66.7 Don't test what the compiler guarantees
+
+A **redundant test** re-proves something the type checker has already proved, for every input, before the test runner even starts. Such tests cost time to write and run, they add noise to every refactor, and they create a false sense of thoroughness ("we have 400 tests!") while the real behavior goes unchecked. A quick way to spot one: *if the bug the test targets would already be a compile error, the test is redundant.*
+
+```ts
+// ❌ Redundant: the Task type already says title is a string.
+it("task title is a string", () => {
+  expect(typeof buildTask().title).toBe("string");
+});
+
+// ❌ Redundant: this call can't compile, so no user can ever reach the throw.
+it("rejects a numeric priority", () => {
+  // @ts-expect-error: priority must be a Priority
+  expect(() => setPriority(task, 3)).toThrow();
+});
+
+// ✅ Valuable: right and wrong answers have the same type, so only a test can tell.
+it("labels in-progress tasks 'In progress'", () => {
+  expect(statusLabel("doing")).toBe("In progress");
+});
+
+// ✅ Valuable: the input is untyped data from outside, so the type proves nothing here.
+it("rejects a task DTO with an unknown status", () => {
+  expect(TaskDtoSchema.safeParse({ ...validDto, status: "archived" }).success).toBe(false);
+});
+```
+
+There are three honest exceptions. At a **boundary**, data has no trustworthy type yet, so testing the parser is real work. When the **type itself is the product**, such as a hook's public return type or a utility type, you test it with a *type test* (`expectTypeOf`), which [Section 67.8](/chapter/67) covers. And if **JavaScript callers** use your code (a published package, a script), they get no compile errors, so runtime checks and their tests matter again.
+
+## Common mistakes
+
+> ⚠️ **"It compiles, so it works."** Compiling proves consistency. It says nothing about whether `+` should have been `-`, or whether the right task was completed.
+
+> ⚠️ **Silencing a type error in the fastest way.** `selectedId ?? task.id`, a stray `!`, or an `as` makes the error disappear *and* hides the question TypeScript was asking. When the compiler asks "what if this is `null`?", answer it on purpose.
+
+> ⚠️ **Writing runtime tests for type facts.** Tests like "returns an object with an `id`" re-prove the compiler's work and break on every harmless refactor.
+
+> ⚠️ **Treating tests as a substitute for validation.** Fixtures describe what you expect the server to send. Only validation in production sees what it actually sends.
+
+> ⚠️ **Chasing coverage numbers.** Coverage measures which lines *ran*, not which behavior was *checked*. A test with no assertions still raises coverage.
+
+> ⚠️ **All E2E or no E2E.** Testing every edge case through a browser makes the suite slow and flaky. Having no E2E tests at all means nothing ever checks the real build.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** you're deciding where a check belongs. For each new risk, ask which layer can *see* it and pick the cheapest of those: a type for a shape, a lint rule for a pattern, a schema for outside data, a unit test for a rule, a component or integration test for behavior, an E2E test for a critical path through the real system.
+
+> 🚫 **When not to.** Don't add a layer whose bugs you can't name: if you can't say what an E2E test would catch that your integration tests don't, skip it. Don't validate data that never crossed a boundary; a function called from your own typed code doesn't need a schema. And don't let the model become a checklist where every feature gets every kind of test. Each layer should earn its place by catching something the others can't.
+
+## How it connects
+
+> 🔗 **Connection.** The idea that types vanish at runtime comes from [Chapter 3](/chapter/3), and exhaustive `switch` with `assertNever` from [Chapter 14](/chapter/14). [Chapter 27](/chapter/27) gave each tool one question ("is it consistent? suspicious? formatted? does it behave?"); this chapter extends that list to the whole React stack. Runtime validation is [Chapter 32](/chapter/32) and [Chapter 61](/chapter/61). The next three chapters fill in the testing layers: units and hooks ([Chapter 67](/chapter/67)), components ([Chapter 68](/chapter/68)), and integration plus E2E ([Chapter 69](/chapter/69)). Monitoring is [Chapter 75](/chapter/75), and running everything automatically is [Chapter 76](/chapter/76).
+
+> 🌍 **Real world.** Mature frontend teams rarely argue "pyramid or trophy?" in the abstract. They write down which risks each layer owns, keep E2E suites deliberately small (often well under a hundred tests for a large app), and treat a bug that reached production as a question: "which layer *should* have caught this, and why didn't it?"
+
+## Exercises
+
+### Level 1 — Recall
+
+For each bug, name the **cheapest** layer that would catch it (types, lint, runtime validation, unit, component, integration, E2E, or monitoring), and say in one sentence why the layers above it can't:
+
+1. `task.assignee.name` crashes for unassigned tasks.
+2. `saveTask(task)` is called without `await`, so a failed save is never reported.
+3. The API renamed `dueDate` to `dueAt`.
+4. Sorting by priority puts `"low"` above `"high"`.
+5. The trash-can icon button has no accessible name.
+6. After "Create task", the list only shows the new task after a page refresh.
+7. Refreshing `/projects/p1` in production returns a 404.
+8. A `switch` over task status forgets the new `"blocked"` status.
+9. `VITE_API_URL` is missing in the production environment.
+10. The "Assigned to me" filter also shows tasks from other projects.
+11. The task dialog opens, but keyboard focus stays on the page behind it.
+12. Users on one specific older browser see a blank page.
+
+### Level 2 — Application
+
+Here are the test names from a suite for TaskFlow's `tasks` module. Five are redundant because they test what the types already guarantee. Identify and delete them, and for each one write the type (or compiler setting) that makes it redundant.
+
+1. "createTask returns an object with an id property"
+2. "createTask sets status to 'todo' by default"
+3. "statusLabel only accepts valid statuses"
+4. "sortTasks puts high priority before low"
+5. "toTask converts the dueDate string into a Date"
+6. "TaskRow requires a task prop"
+7. "isOverdue returns a boolean"
+8. "completeTask leaves other tasks unchanged"
+9. "the reducer has a case for every action type" (with `assertNever` in the default branch)
+
+### Level 3 — Challenge
+
+Write a small, realistic bug in TaskFlow Web that passes the type checker, lint, runtime validation, and a full set of unit, component, and integration tests with MSW, but that a single Playwright test against the production build would catch. Then write that Playwright test.
+
+*Hint: think about what's different between the test environment and the real one: the production build, the real server's headers and cookies, routing on the static host, or the real browser.*
+
+### Level 4 — Real-world
+
+**Ticket TF-301: Write TaskFlow Web's testing strategy.** New contributors keep asking "what kind of test should I write?", and reviewers disagree. Add a `TESTING.md` to the repository root.
+
+- It lists every layer from this chapter with what it owns in TaskFlow Web, using real module names from the codebase.
+- It explains when to write a unit, component, integration, or E2E test, with one concrete example of each.
+- It names the critical paths that get E2E coverage, and explains why each one earned it.
+- It includes a "don't test this" section with at least three examples of redundant tests.
+
+## Key takeaways
+
+- Safety comes in **layers**: types, lint, runtime validation, unit, component, integration, E2E, and monitoring. Each catches a different class of failure.
+- Catch each bug at the **cheapest layer that can see it**.
+- Types prove **consistency for every input**: shapes, nullability, exhaustiveness, contracts. They don't prove correctness.
+- Tests prove **correctness for the inputs you run**: behavior, logic, integration, accessibility.
+- Only **runtime validation** sees what the outside world actually sends. Tests check your *reaction* to bad data, not its arrival.
+- Choose test levels by **confidence per minute of effort**. For React apps, that usually means many integration-style tests, fewer unit tests for logic, and a handful of E2E tests.
+- If the bug a test targets would already be a compile error, **delete the test**.
+
+## What comes next
+
+The cheapest tests of all are the ones that call a function and check its result. To get many of those, you have to push logic *out* of components and into pure functions, reducers, and hooks, and then test those directly, including a debounce hook that only breaks when two timers overlap. That's [Chapter 67: Unit Testing Logic, Reducers & Hooks](/chapter/67).

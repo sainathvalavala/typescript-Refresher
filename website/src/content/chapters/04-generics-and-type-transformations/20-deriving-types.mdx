@@ -1,0 +1,311 @@
+> 📖 **The problem.** TaskFlow has a `ROLES` array used by the permission checker and a `Role` union used by the type checker, written in two places. Someone adds `"auditor"` to the array for a new feature and forgets the union. Everything compiles. Then a user with the `auditor` role hits an `if (role === "auditor")` branch that TypeScript considers impossible, and the feature silently never runs.
+
+Two copies of the same fact will drift apart. This chapter teaches you to write the fact **once**, as a runtime value, and let TypeScript *derive* the type from it. You'll learn `typeof` in type position, `keyof typeof`, indexed access types, `as const`, and `satisfies`, then use them to replace overloads with lookup tables and to drive routes, flags, and permissions from one object.
+
+> 🧠 **Mental model.** **Single source of truth: write the value once, and derive its type.** Types should follow data, not shadow it. A hand-written type that mirrors a value is a second copy waiting to go stale.
+
+## 20.1 typeof in type position
+
+You already know `typeof x` at runtime: it returns a string like `"number"`. TypeScript adds a second `typeof` that works in **type** position, and it means something different: "the compile-time type of this value."
+
+```ts
+const defaultTask = {
+  id: "t1",
+  title: "Write docs",
+  done: false,
+  tags: ["docs"],
+};
+
+type DraftTask = typeof defaultTask;
+// type DraftTask = { id: string; title: string; done: boolean; tags: string[] }
+
+const copy: DraftTask = { ...defaultTask, title: "Edited" }; // ✅
+const bad: DraftTask = { ...defaultTask, done: "no" };       // ❌ Type 'string' is not assignable to type 'boolean'.
+```
+
+The same operator works on functions, which is handy when the function exists but nobody wrote a type for it:
+
+```ts
+function createTask(title: string, priority = 1) {
+  return { id: `t-${Date.now()}`, title, priority, done: false };
+}
+
+type CreateTask = typeof createTask;
+// (title: string, priority?: number) => { id: string; title: string; priority: number; done: boolean }
+```
+
+> ⚠️ **Common mistake.** `typeof` only works on **values** (variables, functions, classes), never on types. `typeof Task` fails if `Task` is an interface, because an interface has no runtime existence. And the two worlds don't mix: `typeof` in an `if` is the runtime one, `typeof` after a `type X =` is the type-level one.
+
+## 20.2 keyof typeof
+
+`keyof T` produces a union of the keys of a **type**. But what you often have is an **object value**, such as a lookup table. Combine the two: first `typeof` to get the object's type, then `keyof` for its keys.
+
+```ts
+const STATUS_LABELS = {
+  todo: "To do",
+  doing: "In progress",
+  done: "Finished",
+};
+
+type Status = keyof typeof STATUS_LABELS; // "todo" | "doing" | "done"
+
+function label(status: Status): string {
+  return STATUS_LABELS[status];
+}
+
+label("doing");   // ✅
+label("blocked"); // ❌ Argument of type '"blocked"' is not assignable to parameter of type '"todo" | "doing" | "done"'.
+```
+
+Read `keyof typeof STATUS_LABELS` right to left: "the type of `STATUS_LABELS`, then its keys." Add `blocked: "Blocked"` to the object and `Status` grows by itself, and every `switch` or `Record<Status, …>` that needs the new case lights up with errors telling you where to update.
+
+```ts
+function isStatus(value: string): value is Status {
+  return value in STATUS_LABELS; // the object is the validator AND the type source
+}
+```
+
+> 🔗 **Connection.** `keyof` on its own was introduced in [Chapter 17](/chapter/17). Here the only new idea is that you can feed it a value's type.
+
+## 20.3 Indexed access types
+
+Indexed access types look up the type of a **property** the way `obj["key"]` looks up its value. You write them as `T["key"]`.
+
+```ts
+interface User {
+  id: string;
+  name: string;
+  address: { city: string; zip: string };
+  roles: string[];
+}
+
+type UserId = User["id"];             // string
+type City = User["address"]["city"];  // string (nested lookups chain)
+type Contact = User["name" | "id"];   // string (a union of keys gives a union of types)
+type Role = User["roles"][number];    // string (number indexes an array's element type)
+```
+
+The `[number]` trick deserves a second look. An array type is "indexable by number", so `Tasks[number]` means "what comes out when I index with any number", which is the element type:
+
+```ts
+type Task = { id: string; title: string; done: boolean };
+type Tasks = Task[];
+
+type OneTask = Tasks[number];         // Task
+type Title = Tasks[number]["title"];  // string
+
+type Keys = User[keyof User];         // every property type of User, as one union
+// string | { city: string; zip: string } | string[]
+```
+
+You'll use this constantly to pull a piece out of a larger type (for example one field of an API response) instead of copy-pasting it.
+
+## 20.4 as const in depth
+
+Here is the `ROLES` bug from the opening, and why the obvious derivation doesn't work yet:
+
+```ts
+const ROLES = ["admin", "member", "guest"];
+type Role = (typeof ROLES)[number];
+// type Role = string   ← useless: TypeScript widened the elements
+```
+
+A plain `const` array is still *mutable*, so TypeScript assumes you may push other strings in and widens the elements to `string`. The `as const` assertion says "treat this value as a frozen literal": every string stays a literal type, arrays become `readonly` tuples, and object properties become `readonly`.
+
+```ts
+const ROLES = ["admin", "member", "guest"] as const;
+// readonly ["admin", "member", "guest"]
+
+type Role = (typeof ROLES)[number]; // "admin" | "member" | "guest"
+
+ROLES.push("auditor"); // ❌ Property 'push' does not exist on type 'readonly ["admin", "member", "guest"]'.
+```
+
+Now the array drives the union. Adding `"auditor"` to `ROLES` updates `Role` automatically, and the runtime code can loop over the same list that the type was built from:
+
+```ts
+const PRIORITY = { low: 1, medium: 2, high: 3 } as const;
+// { readonly low: 1; readonly medium: 2; readonly high: 3 }
+
+type PriorityName = keyof typeof PRIORITY;          // "low" | "medium" | "high"
+type PriorityValue = (typeof PRIORITY)[PriorityName]; // 1 | 2 | 3
+
+function isRole(value: string): value is Role {
+  return (ROLES as readonly string[]).includes(value); // widen for the lookup, narrow for the caller
+}
+```
+
+> ⚠️ **Common mistake.** `as const` on **mutable state**. If you write `let filters = { status: "todo" } as const`, you can never assign `filters.status = "done"`. Use `as const` for tables, option lists, and configuration, not for data that changes.
+
+## 20.5 satisfies
+
+You have three ways to tell TypeScript about a value's type, and each trades something away. Take a theme object that must have the right keys:
+
+```ts
+type Theme = Record<string, string | number[]>;
+
+// 1. Annotation: checks the shape, but forgets the specifics.
+const a: Theme = { primary: "#336", spacing: [4, 8] };
+a.primary.toUpperCase(); // ❌ Property 'toUpperCase' does not exist on type 'string | number[]'.
+
+// 2. Assertion: silences the checker. A typo or missing field slips through.
+const b = { primary: 42 } as Theme; // ❌ Conversion of type '{ primary: number; }' to type 'Theme' may be a mistake...
+
+// 3. satisfies: checks the shape AND keeps the exact inferred type.
+const c = { primary: "#336", spacing: [4, 8] } satisfies Theme;
+c.primary.toUpperCase(); // ✅ c.primary is string
+c.spacing.map((n) => n * 2); // ✅ c.spacing is number[]
+```
+
+`satisfies` means "make sure this value is assignable to `Theme`, but do not replace its type with `Theme`." You get validation and precise inference at once. It also catches typos in a way an assertion never will:
+
+```ts
+const d = { primay: "#336" } satisfies Theme; // ✅ compiles: Record<string, …> accepts any key
+type Strict = { primary: string; spacing: number[] };
+const e = { primay: "#336", spacing: [4] } satisfies Strict;
+// ❌ Object literal may only specify known properties, but 'primay' does not exist in type 'Strict'.
+```
+
+> 💡 **Tip.** Rule of thumb: an annotation when you *want* the wide type (a function parameter, a public API), `satisfies` for **config and constant tables** where you want checking *and* the precise type, and `as` only when you know something the compiler cannot.
+
+## 20.6 Lookup tables instead of overloads
+
+[Chapter 11](/chapter/11) left you with `createElement`: a function that takes `"a"`, `"canvas"`, or `"table"` and returns the matching element type. The overload version needs one signature per tag, and every new tag means another overload. A lookup table type does the same job with one line per tag, in one place:
+
+```ts
+interface ElementMap {
+  button: HTMLButtonElement;
+  input: HTMLInputElement;
+  canvas: HTMLCanvasElement;
+}
+
+function createElement<K extends keyof ElementMap>(tag: K): ElementMap[K] {
+  return document.createElement(tag); // ✅ DOM lib's own map makes this assignable
+}
+
+const btn = createElement("button"); // btn: HTMLButtonElement
+const cnv = createElement("canvas");  // cnv: HTMLCanvasElement
+createElement("div");                 // ❌ Argument of type '"div"' is not assignable to parameter of type 'keyof ElementMap'.
+```
+
+The generic `K` is the connector: whatever key the caller passes, `ElementMap[K]` looks up the matching type. The same pattern works for TaskFlow, where each notification kind has its own payload:
+
+```ts
+interface NotificationPayloads {
+  assigned: { taskId: string; userId: string };
+  commented: { taskId: string; text: string };
+  completed: { taskId: string };
+}
+
+function notify<K extends keyof NotificationPayloads>(kind: K, payload: NotificationPayloads[K]): void {
+  console.log(kind, payload);
+}
+
+notify("completed", { taskId: "t1" });              // ✅
+notify("commented", { taskId: "t1" });              // ❌ Property 'text' is missing in type '{ taskId: string; }' but required in type '{ taskId: string; text: string; }'.
+```
+
+Add a new notification kind by adding one line to the interface. No overloads to keep in sync.
+
+## 20.7 Deriving types from config
+
+The payoff is a single config object that feeds the runtime *and* the types. Here is TaskFlow's route table, written once:
+
+```ts
+const ROUTES = {
+  home: { path: "/", auth: false },
+  tasks: { path: "/tasks", auth: true },
+  project: { path: "/projects/:id", auth: true },
+} as const satisfies Record<string, { path: string; auth: boolean }>;
+
+type RouteName = keyof typeof ROUTES;              // "home" | "tasks" | "project"
+type RoutePath = (typeof ROUTES)[RouteName]["path"]; // "/" | "/tasks" | "/projects/:id"
+
+function pathFor(name: RouteName): RoutePath {
+  return ROUTES[name].path;
+}
+```
+
+`as const satisfies …` combines both tools: `satisfies` validates every entry has `path` and `auth`, and `as const` keeps the literal values. Feature flags and permissions follow the same recipe:
+
+```ts
+const FLAGS = { darkMode: true, betaBoard: false, exportCsv: true } as const;
+type FlagName = keyof typeof FLAGS;
+
+const PERMISSIONS = {
+  admin: ["read", "write", "delete"],
+  member: ["read", "write"],
+  guest: ["read"],
+} as const;
+
+type Role = keyof typeof PERMISSIONS;                       // "admin" | "member" | "guest"
+type Permission = (typeof PERMISSIONS)[Role][number];       // "read" | "write" | "delete"
+
+function can(role: Role, action: Permission): boolean {
+  return (PERMISSIONS[role] as readonly Permission[]).includes(action);
+}
+
+can("guest", "delete"); // ✅ compiles, returns false
+can("guest", "ban");    // ❌ Argument of type '"ban"' is not assignable to parameter of type '"read" | "write" | "delete"'.
+```
+
+Adding a role, route, or permission is now a one-line change in one place, and the compiler tells you everywhere else that needs to react.
+
+## Common mistakes
+
+> ⚠️ **Annotating a config object and losing its literals.** `const ROUTES: Record<string, { path: string }> = {…}` makes `keyof typeof ROUTES` just `string`. Use `satisfies` so the keys survive.
+
+> ⚠️ **Mixing the two `typeof` worlds.** `typeof x === "string"` is a runtime check that returns a string. `type T = typeof x` is a compile-time query that returns a type. The same word, different jobs, and the position tells you which.
+
+> ⚠️ **`as const` on mutable state.** Freezing the type of something you plan to modify just moves the error to the first assignment. Reserve it for tables and constants.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** a list or table of values already exists at runtime (roles, statuses, routes, option lists) and a type would otherwise repeat it. If the runtime code loops over the data, derive the type from the data.
+
+> 🚫 **When not to.** Pure type contracts that have no runtime counterpart (an API response shape, a component's props) should stay as `interface` or `type`. Don't invent a runtime object just to derive a type from it, and don't use `as const` for data you intend to mutate.
+
+## How it connects
+
+> 🔗 **Connection.** `keyof` and generic constraints came from [Chapter 17](/chapter/17). Next, [Chapter 21](/chapter/21) shows the built-in utility types that transform what you derive here, and [Chapter 22](/chapter/22) shows how to build such transformations yourself. In React, deriving option lists for dropdowns from a constant is a daily pattern ([Chapter 50](/chapter/50)).
+
+> 🌍 **Real world.** Libraries lean on this: Zod's `z.infer`, TanStack Router's typed route names, and Drizzle's table types all derive their types from a value you write once.
+
+## Exercises
+
+### Level 1 — Recall
+
+Given `const STATUSES = ["todo", "doing", "done"]`, add whatever is needed and derive `Status` as `"todo" | "doing" | "done"`. Then write `type Last = ...` that extracts just the type of the last element of the **tuple** (hint: a numeric literal index such as `2`).
+
+### Level 2 — Application
+
+TaskFlow has `const routeList = ["home", "tasks", "settings"]` and a hand-written `type RouteName = "home" | "tasks" | "settings"`, plus a `Record<RouteName, string>` of page titles. Turn all three into a single `as const` object (with `path` and `title` per route) and derive `RouteName` and `RoutePath` from it.
+
+### Level 3 — Challenge
+
+Write a `THEME` object (colors, spacing, font sizes) and use `satisfies` so that it is validated against a `ThemeShape` type but `typeof THEME["colors"]` still has the **exact token names** (`"primary" | "danger"`, not `string`). Show one error that `satisfies` catches and one lookup that an annotation would have broken.
+
+*Hint: compare `keyof typeof THEME.colors` under an annotation and under `satisfies`.*
+
+### Level 4 — Real-world
+
+**Ticket TF-203: One source of truth for TaskFlow literals.** Today, `Status`, `Priority`, and `Role` are hand-written unions and are also hard-coded as arrays in the filter dropdowns.
+
+- Define each as a `readonly` constant and derive the union type from it.
+- Replace every `<option>` list with a loop over the constants.
+- Adding a new value in one place must update the type, the dropdown, and any `Record<Status, …>` that needs a new key (with a compile error pointing at it).
+- No hand-written duplicates of the literals remain.
+
+## Key takeaways
+
+- `typeof` in a type position captures the type of a value; `keyof typeof obj` yields an object's keys as a union.
+- Indexed access (`T["key"]`, `T[number]`) pulls a piece out of a type so you never copy it.
+- `as const` freezes literals so arrays and objects can drive unions.
+- `satisfies` validates a value against a type **without** widening it; annotations widen, assertions skip checking.
+- Lookup-table types plus a generic key replace long overload lists.
+- If a value exists at runtime, derive the type from it. Otherwise two copies will drift.
+
+## What comes next
+
+You can now derive types from values. But TaskFlow also has types derived from *other types*: the update payload that is `Task` with every field optional, the preview that is `Task` with three fields. TypeScript ships a standard library of type-level transformations for exactly that. Meet it in [Chapter 21: Utility Types: TypeScript's Standard Library](/chapter/21).
+

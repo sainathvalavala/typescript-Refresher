@@ -1,0 +1,355 @@
+> 📖 **The problem.** TaskFlow's marketing pages (pricing, changelog, public project boards) need to rank in search and paint fast on cheap phones. The app is a client-rendered SPA, so the first response is an empty `div` and a megabyte of JavaScript. The team asks, in a meeting with a whiteboard: "Should we rewrite it in a framework?" Half the room says yes, half says "the app is fine", and nobody can say precisely what a framework would *change*.
+
+This chapter answers that question honestly. You'll learn the four ways to render a page, what a React framework actually gives you, how **Server Components** let a component run only on the server, how `"use client"` draws a boundary, why everything crossing that boundary must be serializable (and therefore untrusted), and how Server Functions behave like public HTTP endpoints, so they need validation exactly like the API routes of [Chapter 32](/chapter/32). At the end you'll be able to decide, for TaskFlow, whether to migrate and why.
+
+> 🧠 **Mental model.** Frameworks move work to the server: rendering (SSR/SSG), data fetching, and with Server Components, entire components. Every server-to-client crossing is a **serialization boundary**, which means it is also a **trust boundary**.
+
+## 96.1 Rendering strategies
+
+*When* and *where* is HTML produced? There are four answers, and real apps mix them page by page.
+
+- **Client rendering (CSR).** The server sends an empty shell and JavaScript; the browser builds the page. Simple hosting, great after load, poor first paint and SEO.
+- **Server-side rendering (SSR).** The server renders HTML for each request. The user sees content immediately; JavaScript then **hydrates** it (attaches event handlers to the existing HTML).
+- **Static site generation (SSG).** HTML is rendered once at build time and served from a CDN. Fastest and cheapest, but stale until rebuilt.
+- **Streaming.** The server sends HTML in pieces as data becomes ready, using Suspense boundaries, so a slow query doesn't block the whole page.
+
+```text
+CSR :  request → [empty HTML + JS] → JS runs → fetch data → UI appears
+SSR :  request → [server fetches + renders HTML] → UI appears → JS hydrates
+SSG :  build → [HTML files on a CDN] → request → UI appears → JS hydrates
+Stream: request → [shell HTML] → UI appears → [slow section streams in later]
+```
+
+```tsx
+// A streamed page: the shell renders instantly, the slow list arrives when ready
+import { Suspense } from "react";
+
+export default function ProjectPage() {
+  return (
+    <main>
+      <h1>Launch plan</h1>
+      <Suspense fallback={<p>Loading tasks…</p>}>
+        <TaskList />
+      </Suspense>
+    </main>
+  );
+}
+```
+
+Pick per page: marketing pages are SSG, a dashboard behind login can stay CSR, and a personalized landing page might be SSR with streaming.
+
+## 96.2 Why frameworks
+
+You *can* assemble SSR yourself, but the pieces interlock: a router that knows which data each route needs, a bundler that splits code per route and builds separate server and client bundles, a server runtime, caching rules, and deployment targets. A **React framework** (Next.js, React Router in framework mode, TanStack Start, and others) packages those into one model.
+
+What you typically get:
+
+- **File- or config-based routing** with nested layouts and typed params.
+- **Data loading tied to routes**, so data fetching starts before the component renders and avoids waterfalls.
+- **Server and client builds** from one codebase, with code splitting.
+- **Server integration**: API endpoints, form handling, middleware, and image or font optimization.
+
+```tsx
+// A route with its own server-side data loader (React Router framework style)
+import type { Route } from "./+types/project";
+
+export async function loader({ params }: Route.LoaderArgs) {
+  const project = await db.projects.find(params.projectId);
+  if (!project) throw new Response("Not found", { status: 404 });
+  return { project };
+}
+
+export default function ProjectRoute({ loaderData }: Route.ComponentProps) {
+  return <h1>{loaderData.project.name}</h1>; // loaderData.project is typed from the loader
+}
+```
+
+The price is a runtime to operate, more concepts to learn, and a tighter coupling to the framework's conventions. We'll weigh it in 96.8.
+
+## 96.3 Server Components
+
+A **Server Component** is a component that runs *only on the server*, once per request (or at build time), and never ships its code to the browser. Because it runs on the server, it can do things a client component can't: read a database directly, use secrets, call internal services, and be `async`.
+
+```tsx
+// app/projects/[id]/page.tsx  (a Server Component by default in a Server Components framework)
+import { db } from "@/server/db";
+
+export default async function ProjectPage({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const tasks = await db.tasks.findMany({ where: { projectId: id } }); // direct data access, no API layer
+  return (
+    <ul>
+      {tasks.map((t) => (
+        <li key={t.id}>{t.title}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+Notice what's missing: no `useEffect`, no loading state for the fetch, no API route, and no database client in the browser bundle. The output is a description of UI streamed to the browser.
+
+The limits follow from the model. A Server Component has no state, no effects, and no event handlers, because it renders once and never re-renders in the browser. Anything interactive must be a **client component**.
+
+> 🧠 **Mental model.** Think of the tree as two worlds. The *server world* produces UI and fetches data; the *client world* handles interaction. Server Components can render client components, passing them props, but not the other way around (a client component can only receive server-rendered UI as `children`).
+
+> 🚫 **When not to.** Server Components are not "SSR but better". SSR renders client components to HTML *and* still ships their code to hydrate. Server Components ship *no* component code for the parts that stay on the server. They're about bundle size and data access, not just first paint.
+
+## 96.4 Client components and the boundary
+
+A file that starts with the `"use client"` directive marks a **boundary**: that module, and everything it imports, becomes part of the client bundle. Components inside can use state, effects, and events.
+
+```tsx
+// components/TaskToggle.tsx
+"use client";
+
+import { useState } from "react";
+
+export function TaskToggle({ id, initialDone }: { id: string; initialDone: boolean }) {
+  const [done, setDone] = useState(initialDone);
+  return (
+    <button aria-pressed={done} onClick={() => setDone((d) => !d)}>
+      {done ? "Done" : "Mark done"}
+    </button>
+  );
+}
+```
+
+```tsx
+// app/projects/[id]/page.tsx  (server)
+import { TaskToggle } from "@/components/TaskToggle";
+
+export default async function Page() {
+  const tasks = await loadTasks();
+  return tasks.map((t) => <TaskToggle key={t.id} id={t.id} initialDone={t.status === "done"} />);
+}
+```
+
+Put `"use client"` as **deep in the tree as possible**: a small interactive "island" (the toggle) inside a mostly server-rendered page keeps the client bundle small. The directive is on the *module*, not on each component, and it infects its imports, so a single `"use client"` at the top of a layout would turn the whole subtree into client code.
+
+```tsx
+// ❌ Server-only code reaching the client: this module's import graph is bundled for the browser
+"use client";
+import { db } from "@/server/db"; // ❌ Build error: "server-only" module imported into a client component
+```
+
+Mark modules that must never reach the browser with `import "server-only"`; the bundler then fails the build if a client component imports them transitively.
+
+## 96.5 The serialization boundary
+
+When a server component renders a client component, the props must travel over the network. React serializes them, so they must be **serializable**: strings, numbers, booleans, `null`, `undefined`, plain objects and arrays, `Date`, `Map`, `Set`, `bigint`, Promises, and JSX. Not serializable: functions (except Server Functions), class instances with methods, `Symbol`s, and DOM nodes.
+
+```tsx
+// server component
+<TaskToggle
+  id={task.id}
+  onToggle={() => save(task.id)} // ❌ Props must be serializable for Client Components: functions cannot be passed directly
+/>
+```
+
+TypeScript doesn't know about this boundary by default, so the error surfaces at runtime. You can encode the rule in types for your own client components:
+
+```ts
+type Serializable =
+  | string | number | boolean | null | undefined | bigint | Date
+  | readonly Serializable[]
+  | { readonly [key: string]: Serializable };
+
+// A helper: a props type that rejects functions at compile time
+type ClientProps<P extends Record<string, Serializable>> = P;
+
+type TaskToggleProps = ClientProps<{ id: string; initialDone: boolean }>; // ✅
+type BadProps = ClientProps<{ id: string; onToggle: () => void }>;
+// ❌ Type '{ id: string; onToggle: () => void; }' does not satisfy the constraint 'Record<string, Serializable>'.
+```
+
+The boundary is also a **trust boundary** and a **leak boundary**. Anything you pass becomes visible in the page payload, so never pass a whole `user` row that includes `passwordHash`. Pick the fields you need, and map database models to small **DTOs** ([Chapter 31](/chapter/31)) before they cross.
+
+```tsx
+const dto = { id: user.id, name: user.name }; // ✅ explicit pick, not <Profile user={user} />
+return <Profile user={dto} />;
+```
+
+## 96.6 Server Functions and Actions
+
+A **Server Function** is an async function marked with the `"use server"` directive that a client can call as if it were local. The framework turns the call into an HTTP request. A Server **Action** is the same thing used for mutations, typically wired to a form's `action` prop.
+
+It's wonderfully convenient, and dangerous for exactly that reason: it *feels* like calling a function, but it's a **public endpoint**. Anyone can send a request to it with any payload, bypassing your form. So the TypeScript types on its parameters are a promise nobody has kept. This is [Chapter 32](/chapter/32) once more: nothing from outside is trusted, so validate input and check authorization inside every action.
+
+```ts
+// app/actions.ts
+"use server";
+
+import { z } from "zod";
+import { getSessionUser } from "@/server/auth";
+
+const CreateTask = z.object({
+  title: z.string().trim().min(1, "Title is required").max(120),
+  projectId: z.string().min(1),
+});
+
+export type CreateTaskState =
+  | { ok: true }
+  | { ok: false; fieldErrors: Partial<Record<"title" | "projectId", string[]>> };
+
+export async function createTask(_prev: CreateTaskState | null, formData: FormData): Promise<CreateTaskState> {
+  const user = await getSessionUser();                    // 1. authenticate
+  if (!user) throw new Error("Unauthorized");
+
+  const parsed = CreateTask.safeParse(Object.fromEntries(formData)); // 2. validate unknown input
+  if (!parsed.success) {
+    return { ok: false, fieldErrors: z.flattenError(parsed.error).fieldErrors };
+  }
+  await assertCanEdit(user, parsed.data.projectId);       // 3. authorize this specific resource
+  await db.tasks.create({ data: { ...parsed.data, createdBy: user.id } });
+  return { ok: true };
+}
+```
+
+The client wires it to a form with React 19's `useActionState`, receiving typed errors:
+
+```tsx
+"use client";
+import { useActionState } from "react";
+import { createTask } from "./actions";
+
+export function NewTaskForm({ projectId }: { projectId: string }) {
+  const [state, action, pending] = useActionState(createTask, null);
+  return (
+    <form action={action}>
+      <input type="hidden" name="projectId" value={projectId} />
+      <input name="title" aria-invalid={state?.ok === false && !!state.fieldErrors.title} />
+      {state?.ok === false && <p role="alert">{state.fieldErrors.title?.[0]}</p>}
+      <button disabled={pending}>Add task</button>
+    </form>
+  );
+}
+```
+
+> ⚠️ **Common mistake.** Trusting the hidden `projectId` field because "my form only sends valid ones". The check on the server in step 3 is the only one that counts.
+
+## 96.7 Data fetching on the server
+
+When fetching moves to the server, the questions become about **caching and freshness**. Where a client app uses a library like TanStack Query ([Chapter 62](/chapter/62)) to cache in the browser, a server framework caches on the server and at the edge.
+
+Three concepts cover most of it:
+
+- **Static vs dynamic.** Data that rarely changes can be fetched at build time and served as static HTML. Data that depends on the request (cookies, the logged-in user) must be fetched per request.
+- **Time-based revalidation.** Serve cached content, and regenerate it in the background after N seconds.
+- **On-demand revalidation.** When a mutation happens, explicitly invalidate the affected cache entries.
+
+Fetch in parallel to avoid server-side **waterfalls**, where each `await` waits for the previous one:
+
+```tsx
+// ❌ Waterfall: the second request starts only after the first finishes
+const project = await getProject(id);
+const members = await getMembers(id);
+
+// ✅ Parallel: independent requests start together
+const [project2, members2] = await Promise.all([getProject(id), getMembers(id)]);
+```
+
+```ts
+// A mutation invalidates the cache it made stale (Next.js-style API)
+"use server";
+import { revalidatePath } from "next/cache";
+
+export async function completeTask(id: string): Promise<void> {
+  await db.tasks.update({ where: { id }, data: { status: "done" } });
+  revalidatePath("/projects"); // pages showing this data will be regenerated
+}
+```
+
+The API names differ by framework, but the vocabulary (static, dynamic, revalidate) carries over. Whatever you do, be able to answer: *how stale can this page be, and what makes it fresh again?*
+
+## 96.8 Choosing SPA or framework
+
+Return to the meeting from the start. A framework is a trade: you gain server rendering, route-level data loading, and smaller client bundles, and you pay with operational complexity and coupling. Decide by *requirements*, not fashion.
+
+| Requirement | SPA | Framework |
+|---|---|---|
+| SEO and link previews on public pages | Weak | Strong |
+| First paint on slow devices | Depends on bundle | Strong |
+| Heavily interactive app behind login | Strong | Fine, adds complexity |
+| Hosting simplicity (static files + API) | Strong | Needs a server runtime (or static export) |
+| Large teams with many routes and data needs | Fine | Strong conventions |
+| Offline or installable app | Strong | Possible, more work |
+
+For TaskFlow, a sensible answer is **not a rewrite**. The authenticated app is interactive and behind login, where SEO is irrelevant, and the SPA is fine. The *marketing and public pages* are where a framework pays off, so build those as a small separate site (or a route group) with SSG, and keep the app. Record the decision, because the question will return.
+
+```md
+## ADR-014: Public pages use a framework; the app stays an SPA
+
+Status: accepted
+Context: Marketing and public boards need SEO and fast first paint. The app is interactive and authenticated.
+Decision: Build `apps/site` with a Server Components framework (SSG + streaming). Keep `apps/web` as an SPA.
+Consequences: Two deploy targets; shared `@taskflow/contracts` and `@taskflow/ui`. Revisit if public boards need real-time editing.
+```
+
+## Common mistakes
+
+> ⚠️ **`"use client"` too high.** Marking a layout as a client component makes its whole subtree client-side and erases the benefit. Push it down to small interactive leaves.
+
+> ⚠️ **Assuming Server Component props are private.** Everything passed to a client component is in the page payload. Never pass secrets or whole database rows.
+
+> ⚠️ **Treating Server Functions as internal.** They're public endpoints. Validate input and authorize every call; a type annotation on a parameter proves nothing.
+
+> ⚠️ **Awaiting in sequence.** Serial `await`s on independent data create slow, server-side waterfalls. Use `Promise.all`.
+
+> ⚠️ **Browser APIs in Server Components.** `window`, `localStorage`, and `useState` don't exist on the server.
+
+```tsx
+export default function Page() {
+  const theme = localStorage.getItem("theme"); // 💥 ReferenceError: localStorage is not defined (server)
+  return <p>{theme}</p>;
+}
+```
+
+## When to use it, and when not to
+
+> ✅ **Use it when** you need SEO, fast first paint, or large amounts of mostly-static content; when data fetching is the bulk of your page and you'd like it close to the database; or when client bundle size is a problem.
+
+> 🚫 **When not to.** A highly interactive tool behind login, built by a small team, often gains little and pays for a server runtime, a more complex mental model, and framework lock-in. "Everyone uses a framework" is not a requirement.
+
+## How it connects
+
+> 🔗 **Connection.** Server Functions revisit [Chapter 32](/chapter/32) (trust nothing at the boundary) and [Chapter 65](/chapter/65) (authorization on the server). Typed forms and action state build on [Chapter 63](/chapter/63) and [Chapter 64](/chapter/64). Suspense and streaming extend [Chapter 71](/chapter/71), and bundle trade-offs extend [Chapter 70](/chapter/70).
+
+> 🌍 **Real world.** Next.js, React Router (framework mode), TanStack Start, and Remix-style frameworks all offer route-level loading and some form of server-side rendering. The React 19 primitives (`useActionState`, `use`, Server Components) are shared across them.
+
+## Exercises
+
+### Level 1 — Recall
+
+Classify each as **server**, **client**, or **either**: a static footer, a drag-and-drop board column, a component that reads from the database, a component using `useState`, a `Badge` with props only, a component with `onClick`, a markdown renderer for task descriptions, a search box with debounce, a component using `localStorage`, a formatted-date label.
+
+### Level 2 — Application
+
+Build one TaskFlow project page with a server component that loads tasks and renders a list, plus one client island (a "Mark done" button). Show in the bundle analysis that the list rendering code is not in the client bundle, and that the database client is not either.
+
+### Level 3 — Challenge
+
+Write a Server Action for creating a task, with schema validation, authentication, and authorization. Return typed field errors to the form with `useActionState`, and prove with a `curl` request that skips the form that invalid and unauthorized calls are rejected. *Hint: the return type should be a discriminated union.*
+
+### Level 4 — Real-world
+
+**Ticket ARCH-9: Should TaskFlow Web move to a framework?** Write a decision record.
+
+- Describe current pain with evidence (Lighthouse numbers, SEO needs, bundle size).
+- Compare at least three options: stay SPA, migrate fully, add a framework site for public pages.
+- State costs: hosting, learning curve, testing, rollback.
+- Recommend one, with a revisit trigger.
+
+## Key takeaways
+
+- Rendering is a choice per page: CSR, SSR, SSG, or streaming. Mix them.
+- A framework bundles routing, data loading, bundling, and a server runtime into one model.
+- Server Components run only on the server; they can fetch data directly but have no state or events.
+- `"use client"` marks a module-level boundary. Keep it deep, and keep server-only code out of it.
+- Props crossing the boundary must be serializable, and are visible to the user. Send DTOs, not rows.
+- Server Functions are **public endpoints**: authenticate, validate with a schema, and authorize every call.
+- Choose a framework for a requirement you can name, not for fashion.
+
+## What comes next
+
+You can now design, publish, and structure code at scale. The last skill in this part isn't a tool at all: it's how a team of people keeps a codebase healthy, through code review, conventions, documentation, and the habit of keeping things simple. That's [Chapter 97: Working on a Team](/chapter/97).

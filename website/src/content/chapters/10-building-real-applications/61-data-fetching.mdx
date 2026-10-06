@@ -1,0 +1,444 @@
+> 📖 **The problem.** TaskFlow's board loads its tasks with a small, confident hook: `useState<Task[]>([])`, a `fetch("/api/tasks")`, and `const data = (await res.json()) as Task[]`. It has worked for months. Then the backend team ships pagination and the endpoint starts returning `{ "items": [...], "nextCursor": "abc" }`. Nothing fails at the fetch. Nothing fails at the `as`. The first failure is in `tasks.map(...)`, inside a child component three files away, and the user sees a white screen. The error message says `tasks.map is not a function`, which tells you nothing about the API.
+
+Every React app has a place where data crosses from "outside the program" to "inside the program". Types do not exist outside the program, so that crossing is where TypeScript is most likely to be wrong while sounding most sure. This chapter is about that crossing: how to make it checked, how to keep the wire format from leaking into your components, how to model every state a request can be in, and how to feel the pain of doing it all by hand, which is what motivates [Chapter 62](/chapter/62).
+
+> 🧠 **Mental model.** **"What TypeScript believes" is your types. "What the server actually returned" is `unknown`.** The only bridge between them is a parser at the boundary. Anything that crosses without being parsed is a hope, not a fact.
+
+```text
+             what TypeScript believes          what the server actually returned
+  const tasks: Task[] = await res.json();     { "items": [...], "nextCursor": "abc" }
+                         ▲                                   │
+                         └──── any → Task[]  (no check!) ────┘     ✗ crash later, far away
+
+  const tasks = TaskListSchema.parse(await res.json());          ✓ fails here, loudly, with details
+```
+
+## 61.1 What TypeScript believes vs what the server returned
+
+Here is the whole bug, reproduced. The component says the state is `Task[]`, and the fetch helper says it returns `Task[]`, so every line type-checks:
+
+```tsx
+async function loadTasks(): Promise<Task[]> {
+  const res = await fetch("/api/tasks");
+  return (await res.json()) as Task[]; // ✅ compiles. Nothing is checked.
+}
+
+function Board() {
+  const [tasks, setTasks] = useState<Task[]>([]);
+
+  useEffect(() => {
+    loadTasks().then(setTasks); // at runtime, setTasks receives { items, nextCursor }
+  }, []);
+
+  return (
+    <ul>
+      {tasks.map((t) => ( // 💥 TypeError: tasks.map is not a function
+        <li key={t.id}>{t.title}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+`res.json()` returns `Promise<any>`. `any` is assignable to everything, so `as Task[]` and even a plain return annotation both pass. The compiler is not wrong; it was told to stop checking. The *crash* happens in `Board`, but the *mistake* happened in `loadTasks`, and the further apart those two are, the longer the bug hunt.
+
+The honest type of freshly parsed JSON is `unknown`: a value that exists but that you know nothing about yet.
+
+```ts
+const body: unknown = await res.json();
+body.items;
+// ❌ 'body' is of type 'unknown'.
+```
+
+That error is the compiler doing its job. The rest of this chapter is about turning `unknown` into `Task[]` *with evidence*.
+
+> ⚠️ **Common mistake.** Treating `as Task[]` as a conversion. A type assertion changes what the compiler believes and nothing else. It does not inspect, convert, or validate a single byte.
+
+## 61.2 DTOs vs domain models on the client
+
+The JSON the server sends is a **DTO** (data transfer object): a shape designed for the wire. It has to be strings, numbers, booleans, arrays, and objects, because that is all JSON has. Your UI wants something nicer: real `Date` objects, status values it can switch on, and names that read well in components. That nicer shape is the **domain model**.
+
+```ts
+// DTO: exactly what travels over the wire
+type TaskDto = {
+  id: string;
+  title: string;
+  status: "todo" | "doing" | "done";
+  due_at: string | null;      // ISO 8601 text, because JSON has no Date
+  assignee_id: string | null; // snake_case, because the backend is Python
+  estimate_cents?: number;    // optional: older rows don't have it
+};
+
+// Domain model: what components want to work with
+type Task = {
+  id: string;
+  title: string;
+  status: "todo" | "doing" | "done";
+  dueAt: Date | null;
+  assigneeId: string | null;
+  isOverdue: boolean;
+};
+```
+
+Why keep two types? Because the wire format is owned by someone else and changes on their schedule. If `TaskDto` is used directly in 40 components, renaming `due_at` to `dueDate` is a 40-file change. If only one **mapper** function knows about `TaskDto`, it is a one-line change. Components depend on `Task`, the mapper depends on `TaskDto`, and the boundary is a single file.
+
+> 🔗 **Connection.** This is the dependency rule from [Chapter 58](/chapter/58) in miniature: features depend on stable inward types, and volatile outside shapes are translated at the edge.
+
+> 🚫 **When not to.** A tiny internal tool whose API you also own, with fields that are already UI-friendly, can use one type for both. Add the second type the first time the wire format and the UI disagree.
+
+## 61.3 Reusing the typed API client
+
+You do not need a new fetch helper for React. The typed client you built in [P08](/projects/p08) already knows how to build URLs, set headers, and turn failures into values. Inside a React app it should live in one module, return `unknown` (or a parsed value), and be the *only* code that calls `fetch`:
+
+```ts
+// shared/api/client.ts
+export type ApiClient = {
+  get(path: string, init?: { signal?: AbortSignal }): Promise<unknown>;
+  post(path: string, body: unknown, init?: { signal?: AbortSignal }): Promise<unknown>;
+};
+
+export function createApiClient(baseUrl: string): ApiClient {
+  async function request(path: string, init: RequestInit): Promise<unknown> {
+    const res = await fetch(`${baseUrl}${path}`, {
+      ...init,
+      headers: { "Content-Type": "application/json", ...init.headers },
+      credentials: "include",
+    });
+    if (!res.ok) throw await toApiError(res); // defined in 61.6
+    return res.status === 204 ? null : res.json();
+  }
+  return {
+    get: (path, init) => request(path, { method: "GET", signal: init?.signal }),
+    post: (path, body, init) =>
+      request(path, { method: "POST", body: JSON.stringify(body), signal: init?.signal }),
+  };
+}
+
+export const api = createApiClient(import.meta.env.VITE_API_URL);
+```
+
+Two details matter. First, the return type is `Promise<unknown>`, never `Promise<T>` with a free `T`; that is the lying generic from [Chapter 16](/chapter/16). Second, every method accepts an `AbortSignal`, which you will need in 61.8 to cancel stale requests. Feature code calls `api.get`, then parses the result with a schema, then maps it.
+
+## 61.4 Validating responses
+
+A **schema** is a runtime description of a shape that can also produce a TypeScript type. We will use Zod v4. You describe the DTO once; Zod checks real data against it, and `z.infer` gives you the matching type, so the description and the type cannot drift apart.
+
+```ts
+import { z } from "zod";
+
+export const TaskDtoSchema = z.object({
+  id: z.string(),
+  title: z.string().min(1),
+  status: z.enum(["todo", "doing", "done"]),
+  due_at: z.iso.datetime().nullable(),
+  assignee_id: z.string().nullable(),
+  estimate_cents: z.number().int().optional(),
+});
+export type TaskDto = z.infer<typeof TaskDtoSchema>; // the type is derived, not hand-written
+
+export const TaskListDtoSchema = z.object({
+  items: z.array(TaskDtoSchema),
+  nextCursor: z.string().nullable(),
+});
+```
+
+At the boundary you have two choices. `schema.parse(x)` returns the typed value or **throws** a `ZodError`. `schema.safeParse(x)` returns a result you branch on, which is better when failure is something the UI should render:
+
+```ts
+const result = TaskListDtoSchema.safeParse(await api.get("/tasks"));
+
+if (!result.success) {
+  console.error(z.prettifyError(result.error));
+  // ✖ Invalid input: expected array, received undefined
+  //   → at items
+  return;
+}
+result.data; // { items: TaskDto[]; nextCursor: string | null }
+```
+
+What should happen when validation fails? Not a white screen, and not silent acceptance. Treat it as a **contract violation**: log the details for developers (and your error tracker), and show the user a calm "something went wrong on our side" state with a retry button. The *details* belong in logs; the *message* belongs to the user.
+
+> 💡 **Tip.** Zod objects strip unknown keys by default, so extra fields the server adds later do not break you. Missing or wrongly typed fields do, which is exactly the failure you want to hear about immediately.
+
+## 61.5 Transforming API responses
+
+Validation proves the data is a `TaskDto`. A **mapper** turns it into a `Task`. Mappers are plain, pure functions, which makes them the easiest code in the app to test.
+
+```ts
+export function toTask(dto: TaskDto, now: Date = new Date()): Task {
+  const dueAt = dto.due_at === null ? null : new Date(dto.due_at);
+  return {
+    id: dto.id,
+    title: dto.title,
+    status: dto.status,
+    dueAt,
+    assigneeId: dto.assignee_id,
+    isOverdue: dueAt !== null && dueAt < now && dto.status !== "done",
+  };
+}
+```
+
+Typical jobs for a mapper: string dates into `Date`, integer cents into a money value, `snake_case` into `camelCase`, and nested shapes into flat ones.
+
+```ts
+type Money = { amount: number; currency: "USD" };
+
+const toMoney = (cents: number): Money => ({ amount: cents / 100, currency: "USD" });
+
+// Nested → flat: the API nests the assignee, the UI only needs a name
+type TaskRowDto = TaskDto & { assignee: { id: string; name: string } | null };
+const toAssigneeName = (dto: TaskRowDto): string => dto.assignee?.name ?? "Unassigned";
+```
+
+Zod can also do the mapping with `.transform(...)`, so the schema's *output* type is the domain model. That is convenient for small cases; for larger apps many teams keep the schema as a pure description of the wire and write the mapper separately, so each piece does one job. Whichever you choose, put the whole pipeline in one function per endpoint:
+
+```ts
+export async function fetchTasks(projectId: string, signal?: AbortSignal): Promise<Task[]> {
+  const raw = await api.get(`/projects/${projectId}/tasks`, { signal }); // unknown
+  const dto = TaskListDtoSchema.parse(raw);        // TaskListDto (validated)
+  return dto.items.map((item) => toTask(item));    // Task[] (domain)
+}
+```
+
+Read the comments top to bottom: `unknown`, then validated DTO, then domain. Every arrow in that pipeline is a function the compiler checks.
+
+## 61.6 Typing API errors
+
+`fetch` only rejects when the *network* fails. A `404` or a `500` still resolves, so a naive client treats them as success. Decide up front what failures exist, and model them as a closed union:
+
+```ts
+export type ApiError =
+  | { kind: "network" }                                         // offline, DNS, CORS
+  | { kind: "unauthorized" }                                    // 401
+  | { kind: "forbidden" }                                       // 403
+  | { kind: "not-found" }                                       // 404
+  | { kind: "validation"; fields: Record<string, string[]> }    // 400 with field errors
+  | { kind: "server"; status: number }                          // 5xx
+  | { kind: "contract"; details: string };                      // response failed our schema
+
+export async function toApiError(res: Response): Promise<ApiError> {
+  switch (res.status) {
+    case 401: return { kind: "unauthorized" };
+    case 403: return { kind: "forbidden" };
+    case 404: return { kind: "not-found" };
+    case 400: {
+      const body: unknown = await res.json().catch(() => null);
+      const parsed = ValidationBodySchema.safeParse(body);
+      return parsed.success
+        ? { kind: "validation", fields: parsed.data.errors }
+        : { kind: "server", status: 400 };
+    }
+    default: return { kind: "server", status: res.status };
+  }
+}
+```
+
+Now the UI can translate the union into user-facing words in one exhaustive function:
+
+```ts
+export function describeError(error: ApiError): string {
+  switch (error.kind) {
+    case "network":      return "You appear to be offline. Check your connection.";
+    case "unauthorized": return "Your session has expired. Please sign in again.";
+    case "forbidden":    return "You don't have access to this project.";
+    case "not-found":    return "We couldn't find that.";
+    case "validation":   return "Some fields need attention.";
+    case "server":       return "Something went wrong on our side. Try again.";
+    case "contract":     return "We received an unexpected response. We've been notified.";
+  }
+}
+```
+
+Add an eighth kind to `ApiError` and this function stops compiling until you handle it. That is the payoff of a union over a bare `Error` with a message string.
+
+> 🌍 **Real world.** Thrown values are untyped in JavaScript (`catch (e)` gives `unknown`). Wrapping failures in a class such as `class ApiRequestError extends Error` that carries an `ApiError` lets one `instanceof` check recover the typed value in a `catch`.
+
+## 61.7 Loading, error, empty, and success states
+
+A request is not "data or no data". It is in one of several states, and booleans (`isLoading`, `isError`, `data`) let you represent combinations that cannot exist, such as loading *and* failed. Model the states as a discriminated union instead:
+
+```ts
+export type RemoteData<T, E = ApiError> =
+  | { status: "loading" }
+  | { status: "error"; error: E }
+  | { status: "success"; data: T };
+```
+
+"Empty" is not an error and not a separate request state; it is a *successful* response whose data happens to have nothing in it. Decide that in the component, where the wording lives:
+
+```tsx
+function TaskList({ state }: { state: RemoteData<Task[]> }) {
+  switch (state.status) {
+    case "loading":
+      return <TaskListSkeleton />;
+    case "error":
+      return <ErrorPanel message={describeError(state.error)} />;
+    case "success":
+      return state.data.length === 0 ? (
+        <EmptyState title="No tasks yet" action="Create your first task" />
+      ) : (
+        <ul>
+          {state.data.map((t) => (
+            <li key={t.id}>{t.title}</li>
+          ))}
+        </ul>
+      );
+  }
+}
+```
+
+The `switch` has no `default`. If you add `{ status: "idle" }` to the union, TypeScript reports that the function no longer returns on every path, which points you at every component that needs a new branch. You can make that check explicit with a `never` helper from [Chapter 14](/chapter/14).
+
+**Skeletons** are the loading branch done well: gray placeholders with the same layout as the real content, so the page does not jump when data arrives. Give them `aria-busy="true"` on the container so assistive technology knows content is coming.
+
+> ⚠️ **Common mistake.** Showing "No tasks yet" while a request is still in flight, or after it failed. A user who sees an empty state believes their data is gone. Loading and error must be checked *before* empty.
+
+## 61.8 A hand-rolled useQuery
+
+Put the pieces together into a reusable hook. It takes a function that produces a promise, runs it, and returns a `RemoteData`:
+
+```tsx
+export function useQuery<T>(fetcher: (signal: AbortSignal) => Promise<T>): RemoteData<T> {
+  const [state, setState] = useState<RemoteData<T>>({ status: "loading" });
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setState({ status: "loading" });
+
+    fetcher(controller.signal)
+      .then((data) => setState({ status: "success", data }))
+      .catch((e: unknown) => {
+        if (controller.signal.aborted) return; // a newer request replaced this one
+        setState({ status: "error", error: normalizeError(e) });
+      });
+
+    return () => controller.abort(); // runs on unmount and before the next effect
+  }, [fetcher]);
+
+  return state;
+}
+```
+
+Here the generic `T` is *earned*: it appears in the parameter and the return, and the fetcher is expected to produce a validated value, so the guarantee comes from the `fetchTasks` pipeline above rather than from a cast. The `AbortController` fixes the classic race: type "ab", then "abc" into a search box, and the slow response for "ab" can arrive *after* the one for "abc" and overwrite it.
+
+Use it like this, with a stable fetcher:
+
+```tsx
+function BoardPage({ projectId }: { projectId: string }) {
+  const fetcher = useCallback((s: AbortSignal) => fetchTasks(projectId, s), [projectId]);
+  const state = useQuery(fetcher);
+  return <TaskList state={state} />;
+}
+```
+
+Now list what this hook does **not** do. Two components that call `useQuery(fetchTasks)` fire two identical requests (no **deduplication**). Navigate away and back, and you see a spinner again and refetch everything (no **cache**). Data from five minutes ago is shown as if it were fresh (no **staleness** rules). Returning to the tab does not refresh (no **refetch on focus**). A failed request is never retried. If `fetcher` is an inline arrow, the effect re-runs every render and you get an infinite loop. And after you create a task, nothing tells this list to reload (no **invalidation**).
+
+You can fix each of these, and by the time you have fixed six of them you have written a worse version of a library that already exists. [Chapter 62](/chapter/62) swaps this hook for TanStack Query without changing `TaskList`.
+
+> 🧠 **Mental model.** Fetching data in an effect looks like a *synchronization* problem but is really a *caching* problem: "which server data do I already have, how old is it, and who else is using it?" Effects cannot answer that. A cache can.
+
+## 61.9 Request types and mutations
+
+Reads are half the boundary. Writes need types too, and they are *different* types: the shape you send to create a task is not the shape you get back. The client does not know the `id` yet.
+
+```ts
+export const CreateTaskInputSchema = z.object({
+  title: z.string().min(1).max(120),
+  projectId: z.string(),
+  status: z.enum(["todo", "doing", "done"]).default("todo"),
+  dueAt: z.date().nullable(),
+});
+export type CreateTaskInput = z.input<typeof CreateTaskInputSchema>;
+
+// Domain input → wire body (the mapper in reverse)
+const toCreateBody = (input: CreateTaskInput) => ({
+  title: input.title,
+  project_id: input.projectId,
+  status: input.status ?? "todo",
+  due_at: input.dueAt?.toISOString() ?? null,
+});
+
+export async function createTask(input: CreateTaskInput): Promise<Task> {
+  const raw = await api.post("/tasks", toCreateBody(input)); // unknown
+  return toTask(TaskDtoSchema.parse(raw));                   // the server's response is validated too
+}
+```
+
+Notice that the *response* of a mutation is validated exactly like a read: the server is just as capable of surprising you on `POST`. A mutation also has its own life cycle: idle, **pending**, then success or failure. Track the pending state so the button can be disabled and a double-click cannot create two tasks.
+
+```tsx
+function NewTaskButton({ projectId }: { projectId: string }) {
+  const [pending, setPending] = useState(false);
+
+  async function handleClick() {
+    setPending(true);
+    try {
+      await createTask({ title: "Untitled", projectId, dueAt: null });
+    } finally {
+      setPending(false);
+    }
+  }
+  return <button disabled={pending} onClick={handleClick}>{pending ? "Adding…" : "Add task"}</button>;
+}
+```
+
+A first look at **optimistic UI**: instead of waiting for the server, add the new task to the list immediately, and undo it if the request fails. It makes the app feel instant, and it needs a cache you can read and roll back, which is one more thing a hand-rolled hook lacks. [Chapter 62](/chapter/62) does it properly.
+
+## Common mistakes
+
+> ⚠️ **`as` on responses.** `(await res.json()) as Task[]` silences the compiler at the one spot where it should be loudest. Parse into `unknown`, validate, then map.
+
+> ⚠️ **DTO types leaking into components.** If a component imports `TaskDto` and reads `task.due_at`, the wire format is now part of your UI. Components should only see domain types.
+
+> ⚠️ **Treating "empty" as "error" (or the reverse).** An empty list is a valid success; a failed request that shows an empty list hides the failure. Keep the states distinct, and check loading and error first.
+
+> ⚠️ **Forgetting that `fetch` resolves on `404` and `500`.** Always check `res.ok` (or `res.status`) in the client and convert failures into `ApiError`.
+
+> ⚠️ **Unstable fetchers.** Passing an inline arrow function to a `useEffect`-based hook re-runs the effect on every render. Memoize, or move the fetcher to module scope.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** data crosses a trust boundary: HTTP responses, `localStorage`, `postMessage`, URL search params, anything parsed from text. Validate at the edge, then trust the types inside.
+
+> 🚫 **When not to.** Do not validate the same data twice as it moves between your own functions, and do not wrap every internal value in a schema. Also, do not ship a hand-rolled `useQuery` to production because it "only needs a few more features". Use it to learn the problem; use a library to solve it.
+
+## How it connects
+
+> 🔗 **Connection.** The `unknown` and narrowing story is [Chapter 9](/chapter/9) and [Chapter 14](/chapter/14); the lying generic is [Chapter 16](/chapter/16); runtime validation with schemas was introduced in [Chapter 32](/chapter/32). The discriminated union for states reuses [Chapter 13](/chapter/13). The five kinds of state from [Chapter 60](/chapter/60) put this data in the "server cache" bucket, which [Chapter 62](/chapter/62) fills in.
+
+> 🌍 **Real world.** Production apps often generate the DTO types and schemas from an OpenAPI document or a shared package, so the contract is machine-checked on both sides. The boundary pattern (unknown, validate, map) stays the same.
+
+## Exercises
+
+### Level 1 — Recall
+
+Here is a data-flow diagram of the board, from the database to a pixel on screen: `Postgres row → API handler → JSON over HTTP → fetch → res.json() → state setter → TaskCard props → DOM`. Mark every **boundary** where TypeScript's knowledge ends, and say which of them needs a runtime check on the client.
+
+### Level 2 — Application
+
+Pick one TaskFlow endpoint, for example `GET /projects/:id`. Write a Zod schema for its DTO, derive the DTO type with `z.infer`, write a `toProject` mapper that converts dates and renames fields, and update the one call site so no component imports the DTO type.
+
+### Level 3 — Challenge
+
+Extend the `useQuery` above into `useQuery`-lite with **abort-on-change** (already sketched) and a tiny module-level cache keyed by a string, so a second component with the same key renders cached data immediately. Then write down, in a list, every behavior that is still missing (staleness, retries, deduplication of in-flight requests, and so on). *Hint: store the in-flight promise, not just the finished data.*
+
+### Level 4 — Real-world
+
+**Ticket TF-310: Survive the field rename.** The backend renames `due_at` to `due_date` without warning, and today the board shows a blank page for every user.
+
+- A response that fails validation shows an error panel with a retry button, not a white screen.
+- The validation details (path and expected type) are logged for developers but never shown to the user.
+- A test feeds the old and new payloads to `fetchTasks` and asserts the `ApiError` of kind `"contract"` for the bad one.
+- Updating the schema and mapper is the only change needed to support the new field name.
+
+## Key takeaways
+
+- `res.json()` is `any`; the honest type is `unknown`. `as Task[]` is a hope, not a check.
+- Keep DTO (wire) and domain (UI) types separate, and translate between them in one mapper per endpoint.
+- Validate at the boundary with a schema; derive the type from the schema so they cannot drift.
+- Model failures as a closed `ApiError` union, and model request state as `loading | error | success`, rendered exhaustively. Empty is a kind of success.
+- A hand-rolled `useQuery` is a good teacher: the list of what it lacks is the list of what a server-state library provides.
+
+## What comes next
+
+You have a validated, mapped, well-typed fetch, and you still cannot make two components share one request, keep the list fresh after a mutation, or roll back an optimistic update. Those are cache problems. [Chapter 62: Server State with TanStack Query](/chapter/62) replaces the hook with a cache that has rules.

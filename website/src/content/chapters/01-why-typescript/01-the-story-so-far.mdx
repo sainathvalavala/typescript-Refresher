@@ -1,0 +1,306 @@
+> 📖 **The problem.** Picture two web pages side by side. On the left, a 1996 contact form with a twelve-line script that checks whether the email field contains an `@`. On the right, TaskFlow in 2026: a task manager with 400,000 lines of code, sixty engineers, a thousand npm packages, and a release every afternoon. Both pages run JavaScript, the same language in a completely different universe. How did a language built for the first job end up running the second, and what had to be invented along the way?
+
+This chapter tells that story. It isn't a history lesson for its own sake. Every tool you'll learn in this book, from TypeScript's type checker to React's components, exists because a specific pain became unbearable for a lot of people at once. If you know the pain, the tool stops being a list of features to memorize and becomes an obvious answer to a question you already have.
+
+By the end, you'll be able to explain where JavaScript came from, why its original design started to hurt as programs grew, why TypeScript and React appeared when they did, and how this book is organized to take you from "I write JavaScript" to "I ship professional TypeScript + React".
+
+> 🧠 **Mental model.** **Tools are fossils of problems.** Every technology in this book is the hardened shape of a pain someone once felt. When a tool seems strange, ask "what problem was so bad that someone built *this*?" The answer usually explains the design.
+
+## 1.1 A language for small jobs
+
+In May 1995, Brendan Eich at Netscape was given about ten days to build a scripting language for the browser. It was called Mocha, then LiveScript, and finally JavaScript (a marketing nod to Java, which was fashionable at the time). The goal was modest: let web designers add a little interactivity to a page. Check a form field before submitting it, swap an image when the mouse hovers over it, pop up an alert.
+
+That small job shaped the whole language. A typical script looked like this:
+
+```js
+// contact.html, circa 1996. This was the entire "application".
+function validateForm() {
+  var email = document.forms[0].email.value;
+  if (email.indexOf("@") == -1) {
+    alert("Please enter a valid email address.");
+    return false;
+  }
+  return true;
+}
+// The form called it with: onsubmit="return validateForm()"
+```
+
+Three design choices follow from that job. JavaScript is **forgiving**: a mistake shouldn't take down a page, so the language tries hard to keep going. It is **dynamic**: variables have no declared types, and any value can go anywhere. And it assumes **small programs with a single author**: a few dozen lines, written and read by one person, often in one sitting.
+
+```js
+"5" * 2;        // 10    the string is quietly converted to a number
+"5" + 2;        // "52"  …or the number is quietly converted to a string
+var total;      // no type, no value yet
+total = "ten";  // any value can go anywhere
+total = 10;     // and change its mind later
+```
+
+For that job, dynamic typing is a *feature*, not a flaw. When the whole program fits on one screen, the author *is* the type checker: you can see every place a variable is used, so you don't need a tool to tell you.
+
+## 1.2 JavaScript escapes the browser page
+
+Then the web changed, and JavaScript was asked to do far more than it was designed for. Here are the milestones that turned a scripting language into an application platform:
+
+```text
+1995  JavaScript ships in Netscape Navigator: form checks, hover effects
+1997  Standardized as ECMAScript
+2004  Gmail: a full email application living in a browser tab
+2005  "Ajax" gets a name; Google Maps makes the web feel like a desktop app
+2006  jQuery tames inconsistent browser APIs
+2008  Chrome ships with V8, and JavaScript suddenly becomes fast
+2009  Node.js: JavaScript on the server, one language everywhere
+2010  npm: an explosion of shared packages
+2015  ES2015: modules, classes, arrow functions, promises
+```
+
+The turning point was **Ajax** (Asynchronous JavaScript and XML): the page could talk to the server *without reloading*. That one capability made web pages behave like desktop software, and the amount of JavaScript per page exploded.
+
+```js
+// 2005-style Ajax: fetch new mail without reloading the page
+var xhr = new XMLHttpRequest();
+xhr.open("GET", "/inbox?folder=starred");
+xhr.onreadystatechange = function () {
+  if (xhr.readyState === 4 && xhr.status === 200) {
+    document.getElementById("inbox").innerHTML = xhr.responseText;
+  }
+};
+xhr.send();
+```
+
+Fast engines like V8 made big programs practical. **Node.js** (2009) took V8 out of the browser and put it on servers, and **npm** (2010) let anyone publish and reuse packages. A single developer could now write the front end, the back end, and the build tools in one language:
+
+```js
+// 2009: the same language, now running a web server (an early Node.js style)
+const http = require("http");
+
+http
+  .createServer((req, res) => res.end("Hello from JavaScript on the server"))
+  .listen(3000);
+```
+
+> 🕰 **Legacy note.** `require` is the older CommonJS module system. Modern code uses `import`/`export` (ES modules), which you'll review in [Chapter 4](/chapter/4) and study in [Chapter 25](/chapter/25).
+
+## 1.3 The cost of growth
+
+By the 2010s, codebases had grown from 50 lines to 500,000. Three things grew at once, and each one broke an assumption the language had been built on:
+
+- **More code.** No one can see every use of a variable anymore, so the author can no longer act as the type checker.
+- **More people.** The person who wrote a function and the person calling it may never meet.
+- **Longer lifetimes.** A 1996 script lived for weeks. A modern app lives for a decade, outlasting the memory of whoever wrote each piece.
+
+Here's the kind of bug that *only* exists because of growth. Each file is reasonable on its own:
+
+```js
+// utils/format-due.js, written in 2021 by Priya
+function formatDue(task) {
+  return task.dueDate.toLocaleDateString();
+}
+
+// pages/board.js, written in 2025 by Sam, who has never met Priya
+formatDue({ title: "Ship v2", due: "2025-06-01" });
+// 💥 TypeError: Cannot read properties of undefined (reading 'toLocaleDateString')
+```
+
+Sam had no way to know the function expects a property called `dueDate` holding a `Date` object, not a property called `due` holding a string. The "contract" lived in Priya's head. JavaScript only discovers the mismatch when the line runs, possibly in front of a user.
+
+This is a preview of the problems [Chapter 2](/chapter/2) examines one by one: errors that arrive late, wrong values that flow silently, refactors that break distant code, APIs nobody can discover, and contracts between people that are invisible.
+
+## 1.4 Static analysis arrives
+
+The industry's answer was **static analysis**: tools that read your code *without running it* and report what could go wrong. "Static" means "before execution", as opposed to "dynamic" checks that happen while the program runs. Large companies tried several approaches:
+
+- **Google's Closure Compiler** (open-sourced in 2009) read type annotations written inside JavaScript comments.
+- **CoffeeScript** (2009) offered a nicer syntax that compiled to JavaScript, but added no types.
+- **Dart** (2011) was a whole new language with its own virtual machine, which meant leaving JavaScript behind.
+- **TypeScript** (2012, Microsoft) and **Flow** (2014, Facebook) added type syntax *on top of* JavaScript, checked it, and then removed it.
+
+Compare how the same function looks with types in comments and with types in the code:
+
+```js
+// Google Closure Compiler style: the types live in comments
+/**
+ * @param {number} price
+ * @param {number} rate
+ * @return {number}
+ */
+function addTax(price, rate) {
+  return price + price * rate;
+}
+```
+
+```ts
+// TypeScript: the types live in the code, and the compiler erases them on output
+function addTax(price: number, rate: number): number {
+  return price + price * rate;
+}
+
+addTax("100", 0.2); // ❌ Argument of type 'string' is not assignable to parameter of type 'number'.
+```
+
+Why did TypeScript's approach win? Because it **didn't ask anyone to leave JavaScript**. Every JavaScript program is already valid TypeScript syntax, so a team could rename one file and keep going. The output is plain JavaScript, so it runs everywhere JavaScript runs. New language features come from the JavaScript standard, not from TypeScript. And if a team ever wants out, they delete the types. Add a strong editor story (Visual Studio Code, itself written in TypeScript) and a community-maintained library of type definitions, and the low-risk choice became the default choice. TypeScript 1.0 shipped in 2014, Angular 2 was written in it in 2016, and `strictNullChecks` (TypeScript 2.0, 2016) attacked the `null` problem head-on.
+
+## 1.5 The UI crisis and React
+
+While TypeScript tackled the *language* problem, front-end developers had a different crisis: **keeping the screen in sync with the data**. The jQuery-era approach was *imperative*: when something changes, find the right DOM nodes and patch each one by hand. With *n* pieces of state and *m* places that display them, you maintain up to *n × m* manual updates, and forgetting one means the UI lies.
+
+```js
+// Imperative: mark a task done, then remember EVERY place that shows tasks
+checkbox.addEventListener("change", () => {
+  task.done = checkbox.checked;
+  row.classList.toggle("done", task.done);
+  counter.textContent = `${tasks.filter((t) => !t.done).length} left`;
+  emptyState.hidden = tasks.length > 0;
+  // …and the filter tabs, the page title, the sidebar badge. Forget one, and the UI is wrong.
+});
+```
+
+In 2013, Facebook open-sourced **React**, created by Jordan Walke, with a radical idea: *don't update the UI, describe it.* You write a function from data to UI (often summarized as **UI = f(state)**). When the data changes, React calls the function again and works out which DOM changes are needed.
+
+```jsx
+// Declarative: describe what the screen should look like for this data
+function TaskSummary({ tasks }) {
+  const left = tasks.filter((t) => !t.done).length;
+  return tasks.length === 0 ? <EmptyState /> : <p>{left} left</p>;
+}
+```
+
+There's one description and no forgotten update paths. That's the whole teaser for now. [Chapter 35](/chapter/35) makes you *feel* the imperative pain by building TaskFlow with the raw DOM, and [Chapter 36](/chapter/36) tells React's story properly.
+
+## 1.6 Why TypeScript + React today
+
+React made UIs **composable functions of data**. TypeScript made **functions and data describable and checkable**. Put them together and every component gets a checked contract: its props. Pass the wrong thing and you get an editor error instead of a blank screen.
+
+```tsx
+type TaskCardProps = {
+  title: string;
+  status: "todo" | "doing" | "done";
+};
+
+function TaskCard({ title, status }: TaskCardProps) {
+  return <li className={status}>{title}</li>;
+}
+
+const ok = <TaskCard title="Write docs" status="doing" />;    // ✅
+const typo = <TaskCard title="Write docs" status="finished" />; // ❌ Type '"finished"' is not assignable to type '"todo" | "doing" | "done"'.
+```
+
+This combination is now the default, not an upgrade path. The common React starters, such as Vite's `react-ts` template, Next.js, and React Router, all begin in TypeScript, and GitHub's 2025 Octoverse report named TypeScript the most-used language on the platform by contributors.
+
+```sh
+npm create vite@latest taskflow -- --template react-ts
+```
+
+So what does **professional** mean in this book? Not "knows the most syntax". A professional writes code that *other people can change safely*: strict type checking from the first line, data from the outside world validated rather than trusted, tests at the right level, abstractions built only when they pay for themselves, and decisions they can explain in a code review. Every chapter is aimed at that standard.
+
+## 1.7 The map of this book
+
+The book is one continuous journey published as **three Books**. Each ends at a natural stopping point where you have a coherent, usable skill set:
+
+| Book | Parts | You'll be able to say |
+|---|---|---|
+| **Book One: The TypeScript Language** | I–VI | "I can think in types." |
+| **Book Two: Building Interfaces with React + TypeScript** | VII–XII | "I can ship a real app." |
+| **Book Three: Mastery** | XIII–XVI | "I can lead, design, and scale." |
+
+Books One and Two are the essential core. Book Three is valuable, and much of it matters for senior roles, but none of it is required to be productive.
+
+Five **threads** run through all three Books. You'll meet each idea early in a simple form and see it mature:
+
+| Thread | First appears | Grows up in |
+|---|---|---|
+| Compile time vs runtime | [Chapter 3](/chapter/3): type erasure | [Chapter 32](/chapter/32), [Chapter 61](/chapter/61) |
+| Make illegal states unrepresentable | [Chapter 13](/chapter/13): discriminated unions | [Chapter 55](/chapter/55), [Chapter 90](/chapter/90) |
+| Single source of truth for types | [Chapter 20](/chapter/20): `typeof`, `as const` | [Chapter 32](/chapter/32), [Chapter 94](/chapter/94) |
+| Annotate boundaries, infer the rest | [Chapter 6](/chapter/6): inference | [Chapter 50](/chapter/50), [Chapter 91](/chapter/91) |
+| Abstraction has a cost | [Chapter 19](/chapter/19): over-generic code | [Chapter 89](/chapter/89), [Chapter 97](/chapter/97) |
+
+The running project is **TaskFlow**, a task manager with tasks, projects, and users. It starts as a handful of types in Part II and keeps returning, each time more capable:
+
+```ts
+// Part II: TaskFlow begins as a few lines of vocabulary
+type TaskStatus = "todo" | "doing" | "done";
+
+type Task = {
+  id: string;
+  title: string;
+  status: TaskStatus;
+  dueDate?: string;
+};
+```
+
+```text
+P02 domain model → P07 Node API → P08 typed client → P09 vanilla DOM app
+    → P11 React app → P14 full React + API app → P15 auth → P16 test suite
+```
+
+Not everyone needs to read every chapter in order. Pick the **reading path** that fits you; the checkpoint at the end of each part tells you whether it's safe to skip ahead.
+
+| Path | For | Route |
+|---|---|---|
+| **A. The full journey** | Most readers | Chapter 1 to 99 in order |
+| **B. Fast track to productive** | Job-seekers on a deadline | All Essential chapters in Parts I–XII |
+| **C. TypeScript-first** | Backend and library developers | Parts I–VI, then Part XIII and selected Part XV chapters |
+| **D. React developer adding TypeScript** | Already ship React in JavaScript | Parts I–VI, skim VII–VIII, then Part IX onward |
+| **E. Returning specialist** | Senior engineers | Checkpoints of Parts I–XII as tests, then Parts XIII–XV |
+
+## Common mistakes
+
+> ⚠️ **"TypeScript is a different language."** It's JavaScript with a layer of type syntax that gets removed before your code runs. Everything you know about JavaScript still applies, which is exactly why [Chapter 4](/chapter/4) checks your JavaScript first.
+
+> ⚠️ **"TypeScript makes my code faster."** The types are erased, so the JavaScript that runs is essentially the code you wrote. TypeScript makes *you* faster at changing code safely; it does nothing for runtime speed.
+
+> ⚠️ **"React needs TypeScript" (or the reverse).** They solve different problems and work fine apart. They're taught together because their strengths multiply: React makes the UI a set of functions, and TypeScript checks the contracts between those functions.
+
+> ⚠️ **Learning tools as features instead of answers.** If you memorize `useEffect` or generics without the problem behind them, you'll reach for them in the wrong places. Keep asking what pain each tool removes.
+
+## How it connects
+
+> 🔗 **Connection.** [Chapter 2](/chapter/2) zooms into the "cost of growth" from 1.3 and shows each problem in code. [Chapter 3](/chapter/3) explains the mechanism behind TypeScript's design from 1.4: types are checked, then erased. The React side of the story resumes in [Chapter 35](/chapter/35) and [Chapter 36](/chapter/36), after you've lived through the imperative DOM yourself.
+
+> 🌍 **Real world.** Many companies have published their migrations to TypeScript, including Slack, Airbnb, and Stripe. The reasons repeat: fewer production bugs, safer refactoring in huge codebases, and new engineers becoming productive faster because the editor can explain the code.
+
+## Exercises
+
+### Level 1 — Recall
+
+Put these milestones in chronological order. Next to each, write one sentence naming the problem it addressed:
+
+- React is open-sourced
+- Node.js is released
+- TypeScript 1.0 ships
+- Gmail launches
+- Chrome ships the V8 engine
+- npm appears
+- jQuery is released
+- ES2015 adds modules, classes, and promises
+
+### Level 2 — Application
+
+Find a JavaScript bug you have personally written (search old commits, issues, or your memory). Write down what happened, then classify it as one of: **typo**, **wrong type**, **null or undefined**, **refactor miss**, or **API misuse**. Note how long it took to discover and who discovered it (you, a test, a teammate, or a user).
+
+### Level 3 — Challenge
+
+Write a one-page memo titled "Why we're adopting TypeScript" for a fictional five-person team that maintains a three-year-old JavaScript app. It must name at least three concrete problems the team has today, the costs of adopting TypeScript (learning time, build changes, migration effort), and a gradual adoption plan.
+
+*Hint: a memo that only lists benefits won't convince a skeptical senior engineer. Address the costs head-on.*
+
+### Level 4 — Real-world
+
+**Ticket TF-001: Research report on a TypeScript migration.** Before TaskFlow commits to TypeScript, leadership wants evidence from a company that has done it.
+
+- Read a published engineering blog post about a large TypeScript migration (or interview an engineer whose team migrated).
+- Summarize their stated reasons, the approach they used (big bang or gradual), and the costs they reported.
+- List one lesson TaskFlow should copy and one mistake it should avoid.
+- Keep it under 500 words, with a link to your source.
+
+## Key takeaways
+
+- JavaScript was designed in 1995 for **small, single-author scripts**, where dynamic typing and forgiveness are genuine strengths.
+- Ajax, fast engines, Node.js, and npm turned it into an application platform, and **code, teams, and lifetimes grew** past what the original design assumed.
+- **Static analysis** reads code without running it. TypeScript won by being a **superset** that adds checkable types and then erases them.
+- React solved a different crisis, **keeping the UI in sync with data**, by describing UI as a function of state.
+- TypeScript + React is today's default stack, and this book aims at **professional** use: code that others can change safely.
+
+## What comes next
+
+You've seen the story from a distance. Now it's time to get specific: what exactly goes wrong when a JavaScript codebase gets big, and how much of it can a type checker catch? [Chapter 2: Why TypeScript? The Problems of Large JavaScript](/chapter/2) opens with a 40-line module hiding five bugs, and challenges you to find them before TypeScript does.

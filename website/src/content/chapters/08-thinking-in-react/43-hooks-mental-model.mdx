@@ -1,0 +1,376 @@
+> 📖 **The problem.** TaskFlow's task editor has two modes. With no task selected, it shows a picker with a search box. Once you pick a task, it shows that task's title in an input. You write it with an early `if`, and each branch calls its own `useState`. You type "docs" into the search box, click **Write docs**, and the title input says… "docs". Not the task's title: your search text. There's no error and no warning. One state variable is showing another one's value.
+
+You've already used one hook, `useState`, in [Chapter 41](/chapter/41). The next five chapters introduce more: `useEffect`, `useRef`, `useContext`, `useMemo`, `useCallback`, and hooks you write yourself. Learned as a list of APIs, they feel arbitrary, and their rules ("never call a hook inside an `if`") feel like superstition. Learned from a single picture of *how React remembers things*, the rules become obvious, the bug above becomes easy to explain, and choosing a hook becomes a matter of asking the right question.
+
+By the end of this chapter you'll be able to explain the rules of hooks from first principles, pick the right hook for a job, read the linter's hook errors as useful feedback, and say what the React Compiler does and doesn't do for you.
+
+> 🧠 **Mental model.** React gives each component instance a **list of memory slots**, and hooks claim those slots **in call order** on every render. The first hook call gets slot 0, the second gets slot 1, and so on. React never sees your variable names; it only sees the order. That is why the rules exist.
+
+## 43.1 What a hook is
+
+A component is a function, and React calls it again on every render. Local variables inside it are created fresh each time and thrown away when the function returns. So how does `useState` remember a count between renders? The value can't live inside your function. It lives inside React.
+
+For every component **instance** (every place a component appears on screen), React keeps a small private memory. A **hook** is a function that lets your component reach into that memory: to remember a value, to read something React is tracking, or to ask React to run code at a particular moment. "Hook" is the right word: the function *hooks into* React's machinery for this component. By convention, every hook's name starts with `use`.
+
+```tsx
+import { useState } from "react";
+
+function OpenTaskCounter() {
+  let clicks = 0;                        // plain variable: reset to 0 on every render
+  const [count, setCount] = useState(0); // hook: React stores this value for us
+
+  return (
+    <button
+      onClick={() => {
+        clicks++;              // changes a variable that is about to be thrown away
+        setCount(count + 1);   // changes React's stored value and schedules a render
+      }}
+    >
+      Open tasks: {count}
+    </button>
+  );
+}
+```
+
+Memory belongs to the **instance**, not to the component function. Render the same component twice and each copy gets its own slots:
+
+```tsx
+function Sidebar() {
+  return (
+    <>
+      <OpenTaskCounter /> {/* its own memory: count starts at 0 */}
+      <OpenTaskCounter /> {/* separate memory: clicking one doesn't change the other */}
+    </>
+  );
+}
+```
+
+## 43.2 The rules of hooks, and why
+
+Here is a toy model of React's memory for **one** component instance. It isn't React's real code, but it behaves the same way in the way that matters:
+
+```ts
+// A toy model, not React's source. One instance's memory:
+const slots: unknown[] = [];
+let cursor = 0;
+
+function toyUseState<T>(initial: T): [T, (next: T) => void] {
+  const i = cursor++;                     // claim the next slot, by position only
+  if (!(i in slots)) slots[i] = initial;  // first time: store the initial value
+  return [slots[i] as T, (next) => { slots[i] = next; render(); }];
+}
+
+function render() {
+  cursor = 0;   // every render starts again at slot 0
+  TaskEditor(); // ...and the component claims slots 0, 1, 2... in call order
+}
+```
+
+Notice what's missing: names. `toyUseState` has no idea whether you called the result `query` or `title`. It hands out slot 0 to the first call, slot 1 to the second. Now look at the editor from the opening:
+
+```tsx
+function TaskEditor({ task }: { task: Task | null }) {
+  if (task === null) {
+    const [query, setQuery] = useState("");          // ❌ hook inside a condition
+    return <TaskPicker query={query} onQueryChange={setQuery} />;
+  }
+  const [title, setTitle] = useState(task.title);    // ❌ also claims slot 0!
+  return <input value={title} onChange={(e) => setTitle(e.target.value)} />;
+}
+```
+
+| Render | Branch taken | Slot 0 holds | What you see |
+|---|---|---|---|
+| 1 | no task | `""` (the query) | empty search box |
+| 2 | no task | `"docs"` | you typed "docs" |
+| 3 | task picked | still `"docs"` | `title` reads slot 0: the input shows "docs" |
+
+On render 3, `useState(task.title)` is the first hook call, so it gets slot 0. Slot 0 already exists, so the initial value is ignored and you get the search text. Both branches call exactly one `useState`, so React can't even detect the mix-up. (When the *number* of hooks changes between renders, React does notice and throws errors such as "Rendered more hooks than during the previous render.")
+
+That explains both rules:
+
+1. **Only call hooks at the top level** of your component: not inside conditions, loops, nested functions, or after an early `return`. Then every render makes the same calls in the same order, and slot N always means the same thing.
+2. **Only call hooks from React function components or custom hooks.** Slots belong to a component instance; a plain helper function or an event handler has no instance to claim slots in.
+
+The fix is to give each piece of memory a stable position. Here the cleanest way is to split the modes into two components, each with its own slots:
+
+```tsx
+function TaskEditor({ task }: { task: Task | null }) {
+  if (task === null) return <TaskPicker />;          // ✅ TaskPicker owns the query
+  return <TitleEditor key={task.id} task={task} />;  // ✅ TitleEditor owns the title
+}
+
+function TitleEditor({ task }: { task: Task }) {
+  const [title, setTitle] = useState(task.title);    // ✅ always slot 0 of THIS component
+  return <input value={title} onChange={(e) => setTitle(e.target.value)} />;
+}
+```
+
+The `key={task.id}` is the reset tool from [Chapter 42](/chapter/42): picking a different task gives you a fresh `TitleEditor` with fresh slots.
+
+> 🆕 **Modern note.** React 19's `use` API (for reading a promise or a context) is the one exception: it may be called inside an `if` or a loop, because it doesn't claim a slot the way hooks do. It still must be called from a component or a hook.
+
+## 43.3 The question → hook map
+
+Instead of memorizing hooks, start from the question you're actually asking. Each hook answers exactly one kind of question:
+
+| Question you're asking | Hook that answers it | Chapter |
+|---|---|---|
+| "I need to remember something that affects what's shown." | `useState` | [41](/chapter/41) |
+| "I need to remember something that *doesn't* affect what's shown." | `useRef` | [45](/chapter/45) |
+| "I need to synchronize with something outside React." | `useEffect` | [44](/chapter/44) |
+| "I need data from far up the tree." | `useContext` | [46](/chapter/46) |
+| "My state changes follow complex rules." | `useReducer` | [55](/chapter/55) |
+| "I need to skip expensive work or keep identity stable." | `useMemo` / `useCallback` | [47](/chapter/47) |
+| "I want to reuse a combination of the above." | A custom hook | [48](/chapter/48) |
+
+Here is each one in a single line, inside a TaskFlow component. Don't worry about the details yet; each gets its own chapter.
+
+```tsx
+function TaskBoard({ projectId }: { projectId: string }) {
+  // Remember something shown on screen: the active filter tab.
+  const [filter, setFilter] = useState<"all" | "todo" | "done">("all");
+
+  // Remember something NOT shown: the id of a pending autosave timer.
+  const autosaveTimer = useRef<number | null>(null);
+
+  // Sync with the outside world: keep the browser tab title up to date.
+  useEffect(() => { document.title = `TaskFlow: ${projectId}`; }, [projectId]);
+
+  // Read data from far up the tree: the signed-in user.
+  const currentUser = useContext(CurrentUserContext);
+
+  // Complex state rules: every change to the task list goes through one reducer.
+  const [tasks, dispatch] = useReducer(tasksReducer, []);
+
+  // Skip expensive work: only re-filter when tasks or filter change.
+  const visible = useMemo(() => applyFilter(tasks, filter), [tasks, filter]);
+
+  // Reuse a combination of hooks: a custom hook built from the ones above.
+  const isOnline = useOnlineStatus();
+
+  return <TaskList tasks={visible} canEdit={isOnline && currentUser !== null} />;
+}
+```
+
+> 💡 **Tip.** When you're unsure which hook you need, say the question out loud. If none of the questions fit, you probably don't need a hook at all: a value computed from props and state is just a `const`.
+
+## 43.4 Hooks compose
+
+A hook is just a function, so you can write your own function that calls hooks. That is a **custom hook**, and it's how React code shares logic. There's nothing special about it in React's eyes: when a component calls your custom hook, the hooks *inside* it claim slots in the **calling component's** list, in order, exactly as if you'd written them inline.
+
+```tsx
+function useTaskDraft(initialTitle: string) {
+  const [draft, setDraft] = useState(initialTitle);  // claims the caller's next slot
+  const [dirty, setDirty] = useState(false);         // ...and the one after that
+
+  function update(next: string) {
+    setDraft(next);
+    setDirty(next !== initialTitle);
+  }
+  return { draft, dirty, update };
+}
+
+function TaskTitleField({ task }: { task: Task }) {
+  const [focused, setFocused] = useState(false);     // slot 0
+  const { draft, dirty, update } = useTaskDraft(task.title); // slots 1 and 2
+  // React sees: useState, useState, useState. The custom hook is invisible to it.
+  return (
+    <input
+      value={draft}
+      onChange={(e) => update(e.target.value)}
+      onFocus={() => setFocused(true)}
+      className={dirty && !focused ? "unsaved" : undefined}
+    />
+  );
+}
+```
+
+Two consequences follow from the slot model. First, the rules of hooks apply *inside* custom hooks too, because their calls are part of the component's call order. Second, two components calling `useTaskDraft` get two independent drafts: hooks share **logic**, never **state**. [Chapter 48](/chapter/48) builds on this.
+
+## 43.5 Hooks and the render cycle
+
+Hooks don't all do their work at the same moment. Recall the update cycle from [Chapter 37](/chapter/37): React **renders** (calls your component to get a description), then **commits** (applies the changes to the DOM). Some hooks do their work *during render*, so they must be pure. Others schedule work for *after commit*, when the screen is up to date.
+
+```tsx
+function TaskBadge({ count }: { count: number }) {
+  console.log("1. render: describing the badge for", count);
+
+  useEffect(() => {
+    console.log("3. effect: the DOM is updated; now sync the outside world");
+  });
+
+  // 2. commit happens between these: React updates the DOM. You write no code for it.
+  return (
+    <span onClick={() => console.log("4. event: runs later, when the user clicks")}>
+      {count}
+    </span>
+  );
+}
+```
+
+| Phase | What runs | Hooks doing work here |
+|---|---|---|
+| Render | Your component body, top to bottom | `useState` / `useReducer` return the current snapshot; `useContext` reads; `useMemo` computes; `useRef` returns the box |
+| Commit | React updates the DOM | (none of your code) |
+| After commit | Effect setups and cleanups | `useEffect` (usually after the browser paints), `useLayoutEffect` (before paint) |
+| Later | Event handlers | No hooks: handlers *call setters*, they don't call hooks |
+
+This table is a preview of the next three chapters. Render-time hooks must be pure, because React may call your component more than once (Strict Mode does so deliberately in development, so you'll see the render log twice). Anything that touches the outside world belongs either in an event handler or in an effect.
+
+## 43.6 Linting the rules
+
+You don't have to police the rules by eye. The official `eslint-plugin-react-hooks` checks them on every save. The Vite `react-ts` template from [Chapter 37](/chapter/37) already enables it; in a hand-written config, the two core rules look like this:
+
+```js
+// eslint.config.js (excerpt)
+import reactHooks from "eslint-plugin-react-hooks";
+
+export default [
+  {
+    plugins: { "react-hooks": reactHooks },
+    rules: {
+      "react-hooks/rules-of-hooks": "error",  // call order: top level, React functions only
+      "react-hooks/exhaustive-deps": "warn",  // effect and memo dependencies (Chapter 44)
+    },
+  },
+];
+```
+
+Each error message tells you which rule you broke and why, which makes the linter a surprisingly good teacher:
+
+```tsx
+function TaskEditor({ task }: { task: Task | null }) {
+  if (task === null) return <TaskPicker />;
+  const [title, setTitle] = useState(""); // ❌ React Hook "useState" is called conditionally. React Hooks must be called in the exact same order in every component render. Did you accidentally call a React Hook after an early return?
+  // ...
+}
+
+function formatTasks(tasks: Task[]) {
+  const [sort] = useState("due"); // ❌ React Hook "useState" is called in function "formatTasks" that is neither a React function component nor a custom React Hook function.
+  // ...
+}
+
+function Subtasks({ items }: { items: string[] }) {
+  return items.map((item) => {
+    const [done] = useState(false); // ❌ React Hook "useState" cannot be called inside a callback.
+    return <li key={item}>{item}</li>;
+  });
+}
+```
+
+Notice that the second message hints at the naming rule: the linter decides what counts as a component (capitalized name) or a hook (`use` prefix) **by name alone**. Recent versions of the plugin also include rules powered by the React Compiler's analysis, such as flagging refs read during render ([Chapter 45](/chapter/45)).
+
+> ⚠️ **Common mistake.** Silencing the rule with `// eslint-disable-next-line react-hooks/rules-of-hooks`. The rule is never wrong about call order; if it fires, restructure the code (split a component, move the hook up, or move the condition inside the hook).
+
+## 43.7 The React Compiler, briefly
+
+The **React Compiler** (stable since its 1.0 release in late 2025) is a build-time tool. It reads your components and hooks, works out which values depend on which inputs, and automatically adds the caching you would otherwise write by hand with `useMemo`, `useCallback`, and `memo`. You write plain code; the compiled output skips recomputing values and re-creating functions whose inputs haven't changed.
+
+```tsx
+// What you write:
+function TaskList({ tasks, filter }: { tasks: Task[]; filter: string }) {
+  const visible = tasks.filter((t) => t.status === filter);
+  return <List items={visible} onSelect={(id) => console.log(id)} />;
+}
+
+// Roughly what the compiled version does (conceptual, not the real output):
+// - keep `visible` from last render if `tasks` and `filter` are unchanged
+// - keep the same `onSelect` function across renders
+// - reuse the previous <List> element if none of its inputs changed
+```
+
+What it does **not** change is everything in this chapter. The compiler relies on your code following the rules of hooks and keeping render pure; when it finds code it can't prove safe, it leaves that component uncompiled rather than guess. It doesn't write effects for you, choose dependencies for you, or decide what should be state. It changes *how often* work is repeated, not *what your code means*. [Chapter 47](/chapter/47) returns to it once you know what manual memoization looks like.
+
+> 💡 **Tip.** Think of the compiler as an optimizer that assumes you know the mental model. It makes correct code faster; it doesn't make incorrect code correct.
+
+## Common mistakes
+
+> ⚠️ **Hooks after an early return.** `if (!task) return null;` followed by `useState` means some renders make fewer hook calls. Put every hook call above the first `return`, or split the component.
+
+> ⚠️ **Hooks inside loops or callbacks.** One `useState` per list item inside `items.map(...)` ties state to *position*, not to the item. Give each item its own component (`<SubtaskRow key={id} />`) so each instance owns its slots.
+
+> ⚠️ **A hook-using helper without the `use` prefix.** `function getDraft()` that calls `useState` works until someone calls it conditionally, and the linter can't warn because it doesn't know it's a hook. Name it `useDraft`.
+
+> ⚠️ **Assuming hooks share state.** Two components calling the same custom hook get separate slots. To *share* state, lift it up ([Chapter 42](/chapter/42)) or use context ([Chapter 46](/chapter/46)).
+
+## When to use it, and when not to
+
+> ✅ **Use it when** you're choosing between hooks or debugging one: ask "which question am I answering?" and "is this call made in the same order on every render?". Most hook bugs disappear under those two questions.
+
+> 🚫 **When not to.** Not everything needs a hook. A value computed from props and state is a `const` ([Chapter 42](/chapter/42)). A function that doesn't call hooks is a plain function: don't name it `useSomething`, and don't wrap it in a custom hook "just in case".
+
+## How it connects
+
+> 🔗 **Connection.** The slot model explains `useState` from [Chapter 41](/chapter/41) and why `key` resets state in [Chapter 42](/chapter/42) (a new instance means new slots). Render vs commit comes from [Chapter 37](/chapter/37). The next five chapters take one row of the question map each. In [Part IX](/part/ix), the same hooks get precise types: `useState<T>` in [Chapter 52](/chapter/52), refs in [Chapter 53](/chapter/53), context in [Chapter 54](/chapter/54), and custom hooks in [Chapter 56](/chapter/56).
+
+> 🌍 **Real world.** React's implementation stores hooks as a linked list on each component's internal "fiber", walked in call order on every render. That's the real-life version of the toy `slots` array, and it's why the rule is about *order* and not about names.
+
+## Exercises
+
+### Level 1 — Recall
+
+Match each scenario to the hook that answers it (`useState`, `useRef`, `useEffect`, `useContext`, `useReducer`, `useMemo`/`useCallback`, or a custom hook). Some scenarios need no hook at all; say so.
+
+1. The text currently typed into a "new task" input.
+2. The id returned by `setTimeout` for a "saved!" toast.
+3. Keeping `document.title` equal to the number of open tasks.
+4. The signed-in user, needed by a deeply nested avatar.
+5. The number of done tasks, computed from the task list.
+6. A task list that supports add, edit, delete, reorder, and undo.
+7. Subscribing to a WebSocket for live task updates.
+8. Sorting 10,000 tasks, which a profiler shows is slow.
+9. The same "debounce a value" logic needed in three search boxes.
+10. Whether a dropdown menu is open.
+
+### Level 2 — Application
+
+Each component below breaks a rule of hooks. Identify the rule, explain what would go wrong in terms of slots, and fix it without changing the behavior:
+
+```tsx
+function ProjectHeader({ project }: { project: Project | null }) {
+  if (!project) return <p>No project</p>;
+  const [editing, setEditing] = useState(false);
+  return <h1 onDoubleClick={() => setEditing(true)}>{project.name}</h1>;
+}
+
+function TaskFilters({ showAdvanced }: { showAdvanced: boolean }) {
+  const [query, setQuery] = useState("");
+  if (showAdvanced) {
+    const [assignee, setAssignee] = useState("anyone");
+  }
+  return <input value={query} onChange={(e) => setQuery(e.target.value)} />;
+}
+
+function handleArchive() {
+  const [archived, setArchived] = useState(false);
+  setArchived(true);
+}
+```
+
+### Level 3 — Challenge
+
+Using the `TaskEditor` bug from 43.2, draw the memory slots of one `TaskEditor` instance across four renders: no task, typing "do", typing "docs", task picked. For each render, show which `useState` call claims which slot and what value it reads. Then explain, using the same diagram, why React *does* throw an error if the "task picked" branch calls **two** hooks instead of one.
+
+*Hint: React compares each render's hook calls with the previous render's list, position by position.*
+
+### Level 4 — Real-world
+
+**Ticket TF-301: Document the hooks in the task board.** New team members find `TaskBoard.tsx` (or the largest component in your P11 work so far) hard to follow. Add a short comment above each hook call explaining the question it answers.
+
+- Every hook call has a one-line comment in the form "Question: …", using the question map from 43.3.
+- Any hook whose question doesn't match its use (for example, `useEffect` used to compute a derived value) is flagged with a `TODO` explaining the better tool.
+- The component has zero `react-hooks` lint errors or warnings, with no disable comments.
+
+## Key takeaways
+
+- A hook is a function that reaches into React's per-instance memory. Names starting with `use` mark them.
+- React stores hook data in **slots claimed by call order**. It never sees your variable names.
+- The rules of hooks (top level only; components and custom hooks only) exist so that slot N means the same thing on every render.
+- Pick a hook by the **question** you're asking. If no question fits, you probably need a plain `const` or function.
+- Some hooks work during render (and must be pure); effects run after commit; handlers run later and call setters, not hooks.
+- The React Compiler automates memoization, but it relies on these rules rather than replacing them.
+
+## What comes next
+
+The question map's third row, "I need to synchronize with something outside React", is where most React bugs live: connections that never close, requests that race, effects that run forever. [Chapter 44: useEffect: Synchronizing with the Outside World](/chapter/44) replaces the "lifecycle" intuition with a sturdier one: setup, cleanup, and dependencies.

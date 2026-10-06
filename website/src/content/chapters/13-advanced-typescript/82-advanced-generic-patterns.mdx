@@ -1,0 +1,376 @@
+> 📖 **The problem.** TaskFlow's API package ships a small query builder: `tasks.where("status", "dun")`. It compiles. The signature is `where(field: string, value: unknown)`, so nothing connects the value to the field, and the typo reaches the database layer, which returns zero rows and no error. The team's first fix was adding casts at call sites. The second fix, which actually worked, was changing the *signature*, so the compiler could check what callers wrote.
+
+You already know generics ([Chapter 16](/chapter/16) to [Chapter 18](/chapter/18)) and the type-level tools in [Chapter 79](/chapter/79) and [Chapter 80](/chapter/80). This chapter is about **API design with generics**: choosing signatures so inference produces exactly the types your callers need. You'll learn `const` type parameters, `NoInfer`, builders that accumulate types, higher-order generics, typed containers, the overloads-versus-conditional-return decision, and how to design for good error messages. Then we assemble a typed filter DSL.
+
+> 🧠 **Mental model.** **The call site is the specification.** Write the code you *want* callers to write first, then make inference produce exactly the types that call site needs, and no more.
+
+## 82.1 const type parameters
+
+When you pass an object literal to a generic function, TypeScript widens its property values: `"GET"` becomes `string`, unless the constraint says otherwise. The old fix was making every caller write `as const`. A **`const` type parameter** puts that instruction inside the function, so callers get literal types for free.
+
+```ts
+type RouteDef = { path: string; method: "GET" | "POST" };
+
+function defineRoutes0<T extends Record<string, RouteDef>>(config: T): T { return config; }
+function defineRoutes<const T extends Record<string, RouteDef>>(config: T): T { return config; }
+
+const a = defineRoutes0({ list: { path: "/tasks", method: "GET" } });
+// a: { list: { path: string; method: "GET" } }   path widened to string
+
+const b = defineRoutes({ list: { path: "/tasks", method: "GET" } });
+// b: { readonly list: { readonly path: "/tasks"; readonly method: "GET" } }
+
+const p: "/tasks" = b.list.path; // ✅ literal preserved
+b.list.path = "/x";              // ❌ Cannot assign to 'path' because it is a read-only property.
+```
+
+Notice `readonly`: `const` inference behaves like `as const`, so the result is deeply readonly. The same trick turns arrays into tuples:
+
+```ts
+function tupleOf<const T extends readonly string[]>(items: T): T { return items; }
+
+const t = tupleOf(["a", "b"]); // t: readonly ["a", "b"]
+```
+
+> ⚠️ **Common mistake.** `const` only affects *literals written at the call site*. A variable you declared earlier without `as const` is already widened, and passing it won't recover the literals.
+
+> 🔗 **Connection.** `const` type parameters are what make the `ExtractParams` route table of [Chapter 81](/chapter/81) usable without `as const` at every call.
+
+## 82.2 NoInfer and inference control
+
+Inference collects **candidates** from every argument that mentions a type parameter, then picks a type that fits them all. Usually that's what you want. Sometimes one argument should *define* the type and another should merely be *checked* against it. Here the second argument is supposed to be one of the declared states, but it also acts as an inference candidate, so it quietly widens the type:
+
+```ts
+function createFSM<S extends string>(states: S[], initial: S): S { return initial; }
+
+const m = createFSM(["todo", "doing", "done"], "dnoe");
+// m: "dnoe" | "doing" | "done" | "todo"   ❌ no error: the typo became a state!
+```
+
+`NoInfer<S>` (TypeScript 5.4) tells the compiler: "don't use this position as an inference source, just check it."
+
+```ts
+function createFSM2<S extends string>(states: S[], initial: NoInfer<S>): S { return initial; }
+
+createFSM2(["todo", "doing", "done"], "doing"); // ✅ S inferred from states only
+createFSM2(["todo", "doing", "done"], "dnoe");
+// ❌ Argument of type '"dnoe"' is not assignable to parameter of type '"doing" | "done" | "todo"'.
+```
+
+The rule of thumb: **one parameter should be the teacher** (the list of states, the array of options, the config) and the rest are students. Mark every student `NoInfer`. You'll want it for default values, `initialValue` parameters, and "selected item" parameters, anywhere a value must belong to a set defined elsewhere in the same call.
+
+## 82.3 Builder patterns
+
+A builder collects information across several method calls. To type it, each method returns **a new type** that remembers what was added: the type "accumulates" through the chain.
+
+```ts
+type Kinds = { string: string; number: number; boolean: boolean };
+
+class SchemaBuilder<Shape extends object = {}> {
+  field<K extends string, T extends keyof Kinds>(
+    name: K,
+    kind: T,
+  ): SchemaBuilder<Shape & { [P in K]: Kinds[T] }> {
+    return this as never; // runtime would record the field; here we only care about the types
+  }
+  build(): { [K in keyof Shape]: Shape[K] } {
+    return {} as never;
+  }
+}
+
+const row = new SchemaBuilder().field("title", "string").field("done", "boolean").build();
+// row: { title: string; done: boolean }
+
+const bad: typeof row = { title: "a", done: 1 }; // ❌ Type 'number' is not assignable to type 'boolean'.
+```
+
+Each `field` call intersects one more property onto `Shape`, and `build` flattens the intersection into a readable object type. That mapped type in `build` is for **hover quality**: without it, hovering shows `{} & { title: string } & { done: boolean }`.
+
+> 🚫 **When not to.** Builders are the right tool when the *order or number* of calls is the data: schemas, queries, request configs. If a plain object literal with `satisfies` could express it, it's usually clearer. A builder with five type-accumulating methods is already hard to debug.
+
+In a real runtime the class would keep an array of field descriptors; the types are an overlay on that.
+
+## 82.4 Higher-order generics
+
+A **higher-order generic** is a function that returns another generic function. The outer call fixes some information (a key, a prefix); the inner function stays generic for its own input. This is currying with types.
+
+```ts
+const pluck =
+  <K extends string>(key: K) =>
+  <T extends Record<K, unknown>>(obj: T): T[K] =>
+    obj[key];
+
+const getTitle = pluck("title");
+// getTitle: <T extends Record<"title", unknown>>(obj: T) => T["title"]
+
+const t = getTitle({ title: "Write docs", id: 1 }); // t: string
+```
+
+Two separate type parameters, each with its own job: `K` is learned from the *first* call, and `T` from the *second*, constrained by `K`. This is also why you can pass the result straight into `map`:
+
+```ts
+declare const tasks: Task[];
+
+const titles = tasks.map(pluck("title")); // titles: string[]
+const bad = tasks.map(pluck("nope"));
+// ❌ Argument of type '<T extends Record<"nope", unknown>>(obj: T) => T["nope"]' is not assignable to parameter of type '(value: Task, index: number, array: Task[]) => unknown'.
+//      Property 'nope' is missing in type 'Task' but required in type 'Record<"nope", unknown>'.
+```
+
+TypeScript instantiates the returned generic function against `map`'s callback parameter: `T` becomes `Task`. When this works it feels like magic; when it doesn't (a generic passed through two layers of other generics), the fix is usually to give the outer function an explicit return type annotation, or to write the inner function out.
+
+> 💡 **Tip.** Currying pays off when you want to *name a partially applied function*: `const byStatus = by("status")`. If you'd only ever call it fully applied (`by("status", task)`), take both arguments in one call.
+
+## 82.5 Typed factories and dependency injection
+
+A dependency-injection container is a typed registry. The usual untyped version, `container.get("clock")`, returns `any`. The typed version learns what's registered as you register it, using the builder pattern from 82.3:
+
+```ts
+class Container<Services extends object = {}> {
+  private items = new Map<string, unknown>();
+
+  register<K extends string, V>(
+    key: K,
+    factory: (c: Container<Services>) => V,
+  ): Container<Services & { [P in K]: V }> {
+    this.items.set(key, factory(this));
+    return this as never;
+  }
+
+  get<K extends keyof Services>(key: K): Services[K] {
+    return this.items.get(key as string) as Services[K];
+  }
+}
+
+const c = new Container()
+  .register("clock", () => ({ now: () => new Date() }))
+  .register("tasks", (c) => ({ today: () => c.get("clock").now() }));
+
+const d = c.get("tasks").today(); // d: Date
+c.get("mail");                    // ❌ Argument of type '"mail"' is not assignable to parameter of type '"clock" | "tasks"'.
+```
+
+The factory for `"tasks"` receives a container that *already knows about `"clock"`*, so `c.get("clock")` is typed. Registering in the wrong order is a compile error, not a runtime `undefined`:
+
+```ts
+new Container().register("a", (c) => c.get("b")); // ❌ Argument of type '"b"' is not assignable to parameter of type 'never'.
+```
+
+The error message mentions `never` because the container has no services yet, which is accurate but cryptic. Messages like this are a cost of the pattern.
+
+> 🚫 **When not to.** In a React app, **context and props** are your dependency injection ([Chapter 54](/chapter/54)). A type-accumulating container is for non-React code, such as a server's composition root, and even there a plain `createServices()` function returning one object is often enough.
+
+## 82.6 Overloads vs conditional return types
+
+When the return type depends on the argument type, you have two tools. **Overloads** list the allowed signatures. A **conditional return type** computes the result.
+
+```ts
+// Overloads
+declare function getTask(id: string): Task;
+declare function getTask(ids: string[]): Task[];
+
+// Conditional return type
+declare function getTask2<T extends string | string[]>(
+  input: T,
+): T extends string ? Task : Task[];
+```
+
+They behave the same for plain arguments. They differ when the argument is a **union**:
+
+```ts
+declare const either: string | string[];
+
+getTask(either);
+// ❌ No overload matches this call.
+//      Argument of type 'string | string[]' is not assignable to parameter of type 'string[]'.
+
+const r = getTask2(either); // ✅ r: Task | Task[]  (the conditional distributes)
+```
+
+Overloads can't see through a union argument, because each overload is tried separately. Conditional return types can. But conditionals have a cost inside the function:
+
+```ts
+function getTask3<T extends string | string[]>(input: T): T extends string ? Task : Task[] {
+  return typeof input === "string" ? ({} as Task) : [];
+  // ❌ Type 'Task' is not assignable to type 'T extends string ? Task : Task[]'.
+  // ❌ Type 'never[]' is not assignable to type 'T extends string ? Task : Task[]'.
+}
+```
+
+TypeScript can't narrow the *unresolved* conditional for a generic `T`. You'll need a cast, or an overload signature on top of a plain implementation.
+
+| | Overloads | Conditional return |
+|---|---|---|
+| Union arguments | Fail unless you add a union overload | Distribute naturally |
+| Implementation body | Checked against a loose union signature | Needs a cast |
+| Hover / error messages | List each signature | Show the computed conditional |
+| Best for | A few distinct, stable shapes | A relationship that is a *function* of the input type |
+
+> 💡 **Tip.** The best of both: write overloads for the public signatures, and add one extra overload for the union case when callers need it.
+
+## 82.7 Designing for inference
+
+Good generic APIs share a few habits. Most come from one question: *what will a caller see when they get it wrong?*
+
+**Infer from parameters, not from return types.** A type parameter that appears only in a return position can't be inferred, so callers must write it (and the compiler can't check it). We saw this in [Chapter 16](/chapter/16).
+
+**Connect the pieces with `keyof`.** This is the fix for our opening problem:
+
+```ts
+class Q0<T> {
+  where(field: string, value: unknown): this { return this; }
+}
+new Q0<Task>().where("status", "dun"); // ✅ compiles. 🐛 no rows, no error.
+
+class Q1<T> {
+  where<K extends keyof T>(field: K, value: T[K]): this { return this; }
+}
+new Q1<Task>().where("status", "dun");  // ❌ Argument of type '"dun"' is not assignable to parameter of type 'Status'.
+new Q1<Task>().where("stauts", "done"); // ❌ Argument of type '"stauts"' is not assignable to parameter of type 'keyof Task'.
+```
+
+**Make errors point at the argument the caller got wrong.** The first error above names `Status`, the exact type the caller needs. Compare a design that constrains the *whole object* in a single parameter: the error lands on the entire object and the caller has to hunt for the broken property.
+
+**Keep type parameters few and named.** Prefer `<Item, Key extends keyof Item>` to `<T, U, V>` in public APIs, since names show up in hovers and error messages.
+
+**Test your types.** Add a file of "should compile" and "should not compile" checks (with `// @ts-expect-error`) next to the API. Type tests (assertions about types, checked at compile time) are where they earn their keep, because inference regressions are silent.
+
+```ts
+// @ts-expect-error "dun" is not a Status
+new Q1<Task>().where("status", "dun");
+
+new Q1<Task>().where("status", "done"); // must compile
+```
+
+> 🌍 **Real world.** TanStack Query, Zod, and tRPC all spend more effort on what a *wrong* call looks like than on what a right call looks like. Their `.d.ts` files are an education in this.
+
+## 82.8 Case study: a typed filter/query API
+
+Let's put it together: the API we wished for in the opening, with **field-aware operators and values**. The call site we want:
+
+```ts
+createQuery<Task>()
+  .where("status", "in", ["todo", "doing"])  // "in" takes an array of Status
+  .where("priority", "between", [1, 3])      // "between" takes a number pair
+  .where("title", "contains", "bug")         // "contains" only exists for strings
+  .where("done", "eq", false);               // booleans only support "eq"
+```
+
+First, a table of which operators each *kind* of field supports, and what operand each operator wants:
+
+```ts
+type OpsFor<V> =
+  [V] extends [boolean] ? "eq"
+  : [V] extends [string] ? "eq" | "neq" | "contains" | "in"
+  : [V] extends [number | Date] ? "eq" | "gt" | "lt" | "between"
+  : "eq";
+
+type OperandFor<Op extends string, V> =
+  Op extends "in" ? V[]
+  : Op extends "between" ? [V, V]
+  : Op extends "contains" ? string
+  : V;
+```
+
+The `[V] extends [...]` wrappers stop distribution, so `Status` (a union of literals) is treated as one string type rather than three separate cases. Now the builder method connects field, operator, and value:
+
+```ts
+type Condition<T> = {
+  [K in keyof T]: {
+    [O in OpsFor<T[K]>]: { field: K; op: O; value: OperandFor<O, T[K]> };
+  }[OpsFor<T[K]>];
+}[keyof T];
+
+class Query<T> {
+  private conditions: Condition<T>[] = [];
+
+  where<K extends keyof T, O extends OpsFor<T[K]>>(
+    field: K,
+    op: O,
+    value: OperandFor<O, T[K]>,
+  ): this {
+    this.conditions.push({ field, op, value } as Condition<T>);
+    return this;
+  }
+  toJSON(): Condition<T>[] { return this.conditions; }
+}
+const createQuery = <T,>() => new Query<T>();
+```
+
+`Condition<T>` is a discriminated union of every legal `{ field, op, value }` triple, and it is the *serializable* form. The client builds it, and the server validates and consumes it. Now the errors:
+
+```ts
+createQuery<Task>().where("status", "eq", "dun");        // ❌ Argument of type '"dun"' is not assignable to parameter of type 'Status'.
+createQuery<Task>().where("title", "gt", "a");           // ❌ Argument of type '"gt"' is not assignable to parameter of type '"contains" | "eq" | "in" | "neq"'.
+createQuery<Task>().where("priority", "contains", "a");  // ❌ Argument of type '"contains"' is not assignable to parameter of type '"between" | "eq" | "gt" | "lt"'.
+createQuery<Task>().where("priority", "between", [1]);   // ❌ Argument of type '[number]' is not assignable to parameter of type '[number, number]'.
+```
+
+Each message names the thing the caller can fix. The cast inside `where` is the one place we trust ourselves: the signature guarantees only legal triples enter, so the cast is sound.
+
+> 🚫 **When not to.** The filter DSL earns its cost because it is *shared and growing*: client, server, and several screens all use it. For one screen's one filter, `tasks.filter((t) => t.status === "done")` has no types to design.
+
+## Common mistakes
+
+> ⚠️ **Making every parameter an inference source.** Without `NoInfer`, a "default" or "selected" argument can widen a type parameter and silently accept a typo.
+
+> ⚠️ **Forgetting `const` is deep.** A `const` type parameter makes the *whole literal* readonly. If your function expects a mutable array or object, widen the constraint to `readonly`.
+
+> ⚠️ **Overloads in the wrong order.** TypeScript picks the first matching overload, so put the most specific first, and the implementation signature is *not* visible to callers.
+
+> ⚠️ **Type-parameter creep.** A signature like `<A, B, C, D extends keyof A>` is a smell. If you can't name the parameters meaningfully, or callers have to specify them explicitly, redesign the call site.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** many callers use the API (shared libraries, client/server contracts, internal SDKs), because a one-time design cost is repaid in every call site's autocomplete and error messages.
+
+> 🚫 **When not to.** A one-off helper, or an API that will change next week. Also when callers need to read the *implementation* to understand an error. If your generic signature needs a paragraph of documentation to explain, simplify the call site first.
+
+## How it connects
+
+> 🔗 **Connection.** The mapped and conditional types used here come from [Chapter 22](/chapter/22), [Chapter 23](/chapter/23), and [Chapter 79](/chapter/79). The generic components in [Chapter 84](/chapter/84) apply the same inference ideas to props. [Chapter 91](/chapter/91) is about designing *public* type APIs like these, and [Chapter 83](/chapter/83) shows how far the same ideas stretch.
+
+> 🌍 **Real world.** Prisma's `where` input, Drizzle's operators, Kysely's `.where("col", "=", value)`, and TanStack Table's column helpers are all variations on 82.8.
+
+## Exercises
+
+### Level 1 — Recall
+
+The function below has an inference bug: a typo in `current` silently becomes a valid option. Fix it with `NoInfer`, then explain in one sentence why the original compiled.
+
+```ts
+function pick<T extends string>(options: T[], current: T): T { return current; }
+pick(["todo", "doing", "done"], "dnoe");
+```
+
+### Level 2 — Application
+
+Write `defineRoutes(config)` using a `const` type parameter so that `defineRoutes({ list: { path: "/tasks", method: "GET" } })` keeps the literal `path` and `method`. Then write a type `RouteName<typeof routes>` that yields `"list"`.
+
+### Level 3 — Challenge
+
+Build a typed `createQuery<T>().where(field, op, value)` where `value`'s type depends on **both** `field` and `op`, and `orderBy(field, "asc" | "desc")` only accepts fields whose type is a number, string, or Date.
+
+*Hint: a type parameter for the field, a second for the operator constrained by the field's type, and an indexed access for the value.*
+
+### Level 4 — Real-world
+
+**Ticket TF-512: Shared typed filter DSL.** The TaskFlow API and web app both need a filter format (`/tasks?filter=...`). Design and implement it as a shared package.
+
+- The client builds filters with the typed `where` API; the server receives the serializable `Condition<T>[]` form.
+- Operators and operand types depend on the field's type, and invalid combinations are compile errors on the client.
+- The server **also** validates incoming filters at runtime (the types are not trusted across the network), reusing one list of operators.
+- Include a type-test file with at least six `@ts-expect-error` cases.
+
+## Key takeaways
+
+- The call site is the specification: design what callers write, then make inference produce it.
+- `const` type parameters preserve literals without `as const` at every call, and make the result readonly.
+- `NoInfer` marks a parameter as "check only", so one argument defines the type and the others are validated against it.
+- Builders and DI containers accumulate types by returning a new generic type from each method.
+- Overloads handle fixed shapes; conditional return types handle unions and relationships, but need a cast inside.
+- Connect values to fields with `keyof` and indexed access, and judge a design by its error messages.
+
+## What comes next
+
+Everything so far used the type system for *checking*. The next step is using it as a *language*: tuples as lists, recursion as loops, and how libraries like Zod and tRPC turn runtime values into precise static types. That is [Chapter 83: Type-Level Programming & Type-Safe DSLs](/chapter/83), and it's labeled **Specialist** for good reason.

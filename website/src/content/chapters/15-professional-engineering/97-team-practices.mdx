@@ -1,0 +1,302 @@
+> 📖 **The problem.** A pull request lands: 1,200 lines, a brand-new generic "abstraction layer" for data access, three `as unknown as` casts, and a description that says "trust me, it's cleaner". The CI is green. Two reviewers skim the first file, leave "LGTM", and merge. Four months later nobody can change anything in that layer without breaking something else, and the author has moved teams.
+
+Everything in this book so far has been about what the compiler can verify. This chapter is about what it can't: whether the code is *understandable*, whether the abstraction was needed, whether a teammate can change it safely at 4 p.m. on a Friday. Code is read by people far more than by compilers. You'll learn a review checklist for TypeScript and React, the type smells to watch for, how to challenge complexity kindly, how to turn team opinions into lint rules, what to document, and how to keep a large codebase improving instead of decaying.
+
+> 🧠 **Mental model.** Code is read by people more than by compilers. **Conventions remove decisions, reviews spread knowledge, and simplicity is a feature you defend.**
+
+## 97.1 Reviewing TypeScript + React code
+
+A good review has an order. Start with *what the change is for*, then correctness, then design, and only last style, which tools should handle. A checklist stops you from only commenting on whatever you happen to notice first.
+
+```md
+## TypeScript + React review checklist
+
+**Intent**
+- [ ] Does the PR description say *why*, and does the diff match it?
+- [ ] Is the change small enough to review properly?
+
+**Types**
+- [ ] Is every boundary (network, storage, URL, env, forms) parsed, not asserted?
+- [ ] Are states modeled so illegal combinations can't exist (unions, not boolean flags)?
+- [ ] Are public functions annotated, with inputs wide and outputs precise?
+
+**React**
+- [ ] Does each piece of state live in the right place, and is derived data computed, not stored?
+- [ ] Is every `useEffect` a real synchronization, with correct dependencies?
+- [ ] Are loading, empty, error, and success states all handled?
+- [ ] Keyboard and screen-reader behavior for any new interactive element?
+
+**Tests and safety**
+- [ ] Do tests check behavior, and would they fail if the feature broke?
+- [ ] Any new `any`, `as`, `!`, or `@ts-ignore`, and is each justified in a comment?
+```
+
+The aim isn't a ritual. It's to make the questions *cheap to remember*, so reviewers spend attention on the hard parts. Keep the list short enough that people actually use it, and edit it when an incident teaches you a new question.
+
+> 💡 **Tip.** Review the *tests* first. They tell you what the author believes the code does, and gaps there predict bugs in the implementation.
+
+## 97.2 Type smells in review
+
+A **smell** isn't automatically a bug; it's a spot worth asking about. Some patterns in TypeScript are reliable signals that the types are lying or the model is wrong.
+
+```ts
+// Smell 1: `any` / double assertion. What is being hidden?
+const user = JSON.parse(raw) as unknown as User;       // trust me
+
+// Smell 2: non-null assertion on something that really can be absent
+const title = document.getElementById("title")!.textContent!;
+
+// Smell 3: non-exhaustive switch with a silent default
+function label(status: Task["status"]): string {
+  switch (status) {
+    case "todo": return "To do";
+    default: return "Other";               // a new status will silently become "Other"
+  }
+}
+
+// Smell 4: lying generic (T appears only in the return type)
+async function get<T>(url: string): Promise<T> { return (await fetch(url)).json(); }
+
+// Smell 5: fake context default, so forgetting the provider never fails loudly
+const AuthContext = createContext<AuthState>({} as AuthState);
+
+// Smell 6: boolean soup instead of a union
+type State = { isLoading: boolean; isError: boolean; data?: Task[]; error?: Error };
+```
+
+For each, the review question is the same: *what is the compiler no longer protecting me from?* The fixes are in the chapters you already read: parse with a schema ([Chapter 32](/chapter/32)), narrow instead of assert ([Chapter 14](/chapter/14)), exhaustive checks with `never` ([Chapter 14](/chapter/14)), a validated generic ([Chapter 16](/chapter/16)), a context hook that throws ([Chapter 54](/chapter/54)), and a discriminated union ([Chapter 52](/chapter/52)).
+
+A good habit: search the diff for `any`, `as `, `!.`, `@ts-`, and `default:`, and make each one explain itself.
+
+## 97.3 Reviewing for simplicity
+
+The most expensive review comment to write is "do we need this?" because it feels like criticism of the author's effort. It's also often the most valuable. Premature abstraction (a generic layer built for flexibility nobody asked for) costs every future reader.
+
+Ask questions instead of issuing verdicts, point at the concrete code, and offer an alternative:
+
+```text
+❌ "This is over-engineered."
+
+✅ "I'm trying to understand what `Repository<T, K, Q>` buys us over calling the three
+    query functions directly. Today there's one implementation. What's the second
+    use we're preparing for? If it's not planned, I'd lean towards the plain
+    functions and extract this when the second case shows up. Happy to pair on it."
+```
+
+Useful questions for simplicity:
+
+- *What's the second use?* (The "rule of three" says wait for the third.)
+- *What would the plain version look like?* Have the author write it side by side.
+- *Who has to understand this to change the product?* If only its author, it's too clever.
+- *Can this be deleted instead of generalized?*
+
+```tsx
+// Over-abstracted: a configuration object driving a generic renderer for three fields
+<FormEngine schema={taskFormSchema} renderers={{ text: TextRenderer, select: SelectRenderer }} />
+
+// Plain: three fields you can read, search for, and change
+<form>
+  <TextField label="Title" name="title" />
+  <Select label="Status" name="status" options={statuses} />
+</form>
+```
+
+> 🚫 **When not to.** Don't turn simplicity into dogma. A real second consumer, a boundary that must be enforced, or a proven repeated pattern earns an abstraction. The question is "is it earned yet?", not "is it abstract?".
+
+## 97.4 Team conventions
+
+A convention is a decision made once so nobody has to make it again. Naming (`useX` for hooks, `XProps` for props, `isX` for booleans), file structure (feature folders, one component per file, `index.ts` as the public entry), import style, and error handling patterns all fit here. The test of a good convention: new people can follow it without asking.
+
+The best conventions are **executable**. A rule written in a wiki is a suggestion; the same rule in the linter is a fact, applied the same way every time with no human awkwardness. When you catch yourself leaving the same review comment twice, write the rule.
+
+```js
+// eslint.config.js
+import tseslint from "typescript-eslint";
+
+export default tseslint.config(
+  ...tseslint.configs.strictTypeChecked,
+  {
+    rules: {
+      "@typescript-eslint/no-explicit-any": "error",
+      "@typescript-eslint/no-non-null-assertion": "error",
+      "@typescript-eslint/switch-exhaustiveness-check": "error",
+      "@typescript-eslint/consistent-type-imports": "error",
+      "@typescript-eslint/ban-ts-comment": ["error", { "ts-expect-error": "allow-with-description" }],
+      "no-restricted-imports": ["error", { patterns: [{ group: ["@taskflow/*/src/*"], message: "Import from the package entry point." }] }],
+    },
+  },
+);
+```
+
+Naming and structure can be checked too, for example with a filename rule or the boundary tools from [Chapter 94](/chapter/94). For the rules lint can't express, there are small custom rules, or a script in CI.
+
+> 💡 **Tip.** Adopt a new rule in **warn** mode first, count the violations, fix them in a dedicated PR, then raise it to **error**. Switching on a hundred new errors in a PR about something else teaches people to hate the rule.
+
+## 97.5 Documentation
+
+Different documents answer different questions, and each has a place:
+
+- **README:** what is this, how do I run it, where do I go next? The first ten minutes of a new person's day.
+- **ADRs (architecture decision records):** *why* did we choose this? Short, dated, and never edited after acceptance except for status. Code shows what; ADRs preserve why.
+- **TSDoc:** what does this function promise? Next to the code, shown in the editor ([Chapter 91](/chapter/91)).
+- **Onboarding guide:** the path from `git clone` to first merged PR, including the traps.
+
+```md
+# ADR-007: Use schemas as the single source of truth for API types
+
+- Status: accepted (2026-03-14)
+- Context: The web app and API each defined `Task`; they drifted and a rename shipped to one side only.
+- Decision: Define Zod schemas in `packages/contracts`; infer all request/response types from them.
+- Consequences: One extra package to maintain. Both sides validate at the boundary. Hand-written API types are banned by a lint rule.
+- Alternatives considered: OpenAPI codegen (heavier toolchain); manual interfaces (what drifted).
+```
+
+Keep documents close to what they describe, small, and **dated**, so readers know how far to trust them. A stale doc is worse than none, which is why the best documentation is generated or enforced (types, stories, API reports) and the rest is short.
+
+## 97.6 Trade-offs as team decisions
+
+Many engineering arguments are really trade-offs wearing the clothes of opinions. Performance versus complexity, safety versus speed, consistency versus local optimum. Naming the trade-off turns a fight into a decision.
+
+```md
+## Decision: Strict null checks for legacy `reports/` module
+
+Option A: enable now. Cost: ~340 errors, 3 days. Benefit: finds the null bugs behind 4 of last quarter's incidents.
+Option B: ratchet per folder over 6 weeks. Cost: slower, two modes coexist. Benefit: no big-bang PR.
+Option C: don't. Cost: continuing incidents.
+
+Chosen: B. Reason: the team cannot absorb a 3-day freeze this quarter. Revisit: end of Q3.
+```
+
+A decision made well has: the options considered, the cost of each, who's affected, who decides, and a revisit date. "We chose B for now" is honest and reversible; "B is the right way" invites a re-run of the argument every month.
+
+> ⚠️ **Common mistake.** Optimizing for the 5% case. If a pattern is used in one place, don't add a framework for it, and don't add a review gate that slows the other 95%.
+
+## 97.7 Maintaining large codebases
+
+A big codebase doesn't stay healthy by being healthy once. It needs mechanisms that make improvement continuous and regression hard.
+
+**Strictness ratchets.** Don't flip everything at once. Turn on a stricter flag per package, or count violations and fail CI if the number goes *up*. The count only ever drops.
+
+```json
+// tsconfig.strict.json: new and migrated folders opt in; the list only grows
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "strict": true, "noUncheckedIndexedAccess": true },
+  "include": ["src/features/tasks", "src/features/projects", "src/shared/ui"]
+}
+```
+
+**Codemods** make large mechanical changes safe ([Chapter 93](/chapter/93)). **Deprecations** with `@deprecated` and a lint rule on usage retire APIs gradually. **Upgrade playbooks**, a written checklist for upgrading TypeScript, React, or the build tool, stop each upgrade from being a heroic one-off.
+
+```md
+## Upgrade playbook: TypeScript minor
+
+1. Branch; bump `typescript` in the root and `@taskflow/config`.
+2. Run `tsc -b`; classify new errors as real bugs vs. lib type changes.
+3. Fix bugs; use `// @ts-expect-error TODO(ts-upgrade)` only for lib issues, with a link.
+4. Run the type-budget job; compare check time to main.
+5. Merge on a Tuesday, not a Friday.
+```
+
+## 97.8 Growing as an engineer
+
+Everything above is a skill, and skills are learned in public. Three habits compound.
+
+**Mentor by reviewing.** A review comment that explains *why* ("this union forces callers to handle `cancelled`") teaches more than one that says "fix". Pair on the hard parts, and say "I don't know" out loud.
+
+**Write.** Writing an ADR, a README, or a short post about a bug you found forces you to understand it, and leaves a record that outlasts your memory. If you can't explain a decision in a paragraph, you probably haven't finished deciding.
+
+**Teach what you know.** Answer questions in the team channel. Run a short session on one feature of the type system. Contribute a typed fix or a docs improvement to an open-source project you depend on. Teaching exposes the gaps in your own understanding faster than anything else.
+
+```md
+## My learning log (weekly, 10 minutes)
+- Learned: `satisfies` keeps literals while checking shape.
+- Confused by: why `Pick` on a union collapses it. Plan: read Ch 21 again, write a test.
+- Taught: explained exhaustive switches to Mina in standup.
+```
+
+The goal of seniority isn't knowing the most; it's making the people around you more effective.
+
+## Common mistakes
+
+> ⚠️ **Reviewing style by hand.** Formatting and import order belong to Prettier and the linter. Spend human attention on design, correctness, and clarity.
+
+> ⚠️ **Approving what you didn't read.** A "LGTM" on a 1,200-line PR is a false assurance. Ask for it to be split, or block time for it.
+
+> ⚠️ **Vague or harsh comments.** "This is bad" teaches nothing. Be specific, explain the risk, suggest an alternative, and separate blocking issues from nitpicks.
+
+> ⚠️ **Rules nobody can find.** Conventions that live in people's heads exclude newcomers. Write them down, then enforce what you can.
+
+```text
+❌ "Why did you do it this way??"
+✅ "Nit (non-blocking): `statusFilter` reads clearer than `sf`. Blocking: this casts the response with `as Task[]`. A schema parse here would catch the missing `dueAt`. Want me to pair on it?"
+```
+
+## When to use it, and when not to
+
+> ✅ **Use it when** more than one person will touch the code, or when you'll return to it in six months (which makes you a second person). A checklist, a lint rule, or an ADR cost minutes and save hours.
+
+> 🚫 **When not to.** Process has a cost. A two-person prototype doesn't need ADRs for every choice, and a long checklist on every one-line fix breeds contempt. Scale the ceremony to the risk and the lifetime of the code.
+
+## How it connects
+
+> 🔗 **Connection.** This chapter points back at the techniques that give reviewers something to check: boundaries ([Chapter 32](/chapter/32)), narrowing ([Chapter 14](/chapter/14)), state modeling ([Chapter 52](/chapter/52)), architecture ([Chapter 90](/chapter/90)), public types ([Chapter 91](/chapter/91)), and CI ([Chapter 76](/chapter/76)). The capstone chapters ([Chapter 98](/chapter/98), [Chapter 99](/chapter/99)) use all of it.
+
+> 🌍 **Real world.** Mature teams publish contribution guides, use PR templates with checklists, run lint rules in CI, and keep ADR folders in the repository. Google's public engineering practices on code review are a good, short read.
+
+## Exercises
+
+### Level 1 — Recall
+
+Find every type smell in the following diff and name what protection each one removes.
+
+```ts
+export async function loadTasks(url: string): Promise<any> {
+  const res = await fetch(url);
+  return res.json();
+}
+
+const AppContext = createContext<AppState>({} as AppState);
+
+function badge(status: Task["status"]) {
+  switch (status) {
+    case "todo": return "grey";
+    case "doing": return "amber";
+    default: return "green";
+  }
+}
+
+const el = document.querySelector("#app")!;
+const tasks = (await loadTasks("/api/tasks")) as Task[];
+```
+
+### Level 2 — Application
+
+Write review comments for a PR that adds a generic `Repository<T>` with one implementation and two `as unknown as` casts. Each comment must be specific, kind, and actionable, and you must mark which are blocking and which are nitpicks.
+
+### Level 3 — Challenge
+
+Take three unwritten rules from your team (or invent plausible ones, such as "no default exports", "no `enum`", "API calls only in `services/`") and turn each into a lint rule or config. Show a failing example for each and the error message a developer would see. *Hint: `no-restricted-syntax` and `no-restricted-imports` cover many rules without writing a plugin.*
+
+### Level 4 — Real-world
+
+**Ticket DOC-5: Contributor docs for the capstone repository.**
+
+- `CONTRIBUTING.md` explains setup, branch and commit conventions, and how to run every check.
+- A pull request template includes the review checklist from 97.1.
+- An onboarding guide takes a new developer from `git clone` to a merged first PR, tested by someone who hasn't seen the repository.
+- Three ADRs are linked from the README.
+
+## Key takeaways
+
+- Review in order: intent, correctness, design, and last style (which tools should handle).
+- Know the smells: `any`, `as`, `!`, silent `default`, lying generics, fake context defaults, and boolean soup.
+- Challenge complexity with questions and alternatives, not verdicts. Abstractions must be earned.
+- Turn repeated review comments into lint rules, adopting them in warn mode first.
+- ADRs record *why*; READMEs get people started; types and tooling are the best documentation.
+- Name the trade-off, list the options, pick one, and set a revisit date.
+- Healthy codebases use ratchets, codemods, deprecations, and upgrade playbooks.
+
+## What comes next
+
+You now have the engineering toolkit: domain modeling, public types, packages, design systems, monorepos, performance, server rendering, and team habits. Part XVI asks you to use all of it, with no step-by-step guidance, on a system of your own. It begins with a vague product brief and a blank page: [Chapter 98: Capstone Planning](/chapter/98).

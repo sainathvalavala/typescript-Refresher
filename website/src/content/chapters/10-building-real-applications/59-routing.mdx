@@ -1,0 +1,488 @@
+> 📖 **The problem.** TaskFlow Web is a "single-page app" in the most literal sense. You open a project, filter the board to "In progress", click a task, and press refresh: you're back on the projects list with no filter. You press the browser's back button, and it leaves TaskFlow entirely. A teammate asks "which task?", and you can't send a link, because every screen has the same address.
+
+The app is tracking *where you are* in a `useState` that dies with the page. The browser already has a place for that state, one that survives refresh, works with back and forward, and can be copied into a chat message: the **URL**. This chapter puts TaskFlow's navigation into the URL with React Router v7, and treats every piece of the URL with the suspicion it deserves.
+
+By the end, you'll be able to define nested routes and layouts, read and validate route params and search params, navigate in code, handle unknown URLs and crashes, split routes into lazy chunks, and build a typed `href()` helper that rejects routes that don't exist.
+
+> 🧠 **Mental model.** **The URL is state, and it's the most shareable state you have.** Routes map URL *patterns* to UI. Everything you read out of a URL (params and search params) is **untrusted input**: a string the user can edit by hand, so parse it before you use it.
+
+## 59.1 Why routing
+
+Here's how TaskFlow Web tracks the current screen today:
+
+```tsx
+type Screen =
+  | { name: "projects" }
+  | { name: "board"; projectId: string }
+  | { name: "task"; projectId: string; taskId: string };
+
+function App() {
+  const [screen, setScreen] = useState<Screen>({ name: "projects" });
+  // Nicely typed, and completely invisible to the browser.
+  // Refresh → back to "projects". Back button → leaves the site. No links.
+}
+```
+
+The type is excellent; the *home* is wrong. That same state can live in the address bar instead:
+
+```text
+/projects                                  → the projects list
+/projects/p_42                             → the board for project p_42
+/projects/p_42/tasks/t_9?status=doing      → task t_9, with the board filtered to "doing"
+```
+
+A **router** is the library that keeps the screen in sync with the URL. In a single-page app (SPA), it intercepts link clicks, updates the address with the browser's History API instead of requesting a new HTML page, and renders the matching components. You get instant, app-like navigation *and* everything the web gives you for free: refresh, back and forward, bookmarks, opening in a new tab, and sharing.
+
+```ts
+// What a router does under the hood when you click a link (simplified)
+window.history.pushState(null, "", "/projects/p_42"); // change the URL, no page load
+renderRouteFor(window.location.pathname);             // show the matching UI
+window.addEventListener("popstate", () => renderRouteFor(window.location.pathname)); // back/forward
+```
+
+## 59.2 Routes, nested routes, and layouts
+
+React Router v7 can be used as a framework or as a library. This book uses it as a **library in SPA mode**: you create a router object from an array of route definitions and render it with `RouterProvider`. Each route pairs a `path` pattern with a `Component`.
+
+```tsx
+// app/router.tsx
+import { createBrowserRouter } from "react-router";
+import { RouterProvider } from "react-router/dom";
+
+const router = createBrowserRouter([
+  {
+    path: "/",
+    Component: RootLayout,              // header + sidebar, renders on every page
+    children: [
+      { index: true, Component: HomeRedirect },          // exactly "/"
+      { path: "projects", Component: ProjectsPage },     // "/projects"
+      {
+        path: "projects/:projectId",
+        Component: ProjectLayout,       // project header + tabs
+        children: [
+          { index: true, Component: ProjectBoardPage },              // "/projects/p_42"
+          { path: "tasks/:taskId", Component: TaskDetailPage },      // "/projects/p_42/tasks/t_9"
+          { path: "settings", Component: ProjectSettingsPage },      // "/projects/p_42/settings"
+        ],
+      },
+      { path: "settings", Component: AccountSettingsPage },
+    ],
+  },
+]);
+
+export function AppRouter() {
+  return <RouterProvider router={router} />;
+}
+```
+
+**Nested routes** mirror nested UI. When the URL is `/projects/p_42/tasks/t_9`, React Router renders `RootLayout`, inside it `ProjectLayout`, and inside that `TaskDetailPage`. A parent decides *where* its matched child appears by rendering an `Outlet`:
+
+```tsx
+import { NavLink, Outlet } from "react-router";
+
+export function RootLayout() {
+  return (
+    <div className="app-shell">
+      <Sidebar />
+      <main>
+        <Outlet /> {/* the matched child route renders here */}
+      </main>
+    </div>
+  );
+}
+```
+
+An **index route** (`index: true`) is the child shown when the parent's path matches exactly. A route with children but *no* `path` is a **layout route**: it wraps its children in shared UI without adding a URL segment, which is handy for "the sign-in pages share a centered card layout":
+
+```tsx
+{
+  Component: CenteredCardLayout, // no path: adds UI, not a URL segment
+  children: [
+    { path: "login", Component: LoginPage },     // "/login"
+    { path: "signup", Component: SignUpPage },   // "/signup"
+  ],
+}
+```
+
+## 59.3 Route params and their types
+
+A **route param** is a dynamic segment of a path, written with a colon: `:projectId`. Components read params with `useParams`, and the type it returns surprises everyone the first time:
+
+```tsx
+import { useParams } from "react-router";
+
+function TaskDetailPage() {
+  const { projectId, taskId } = useParams();
+  // projectId: string | undefined
+  // taskId: string | undefined
+}
+```
+
+Both parts of that type are honest. The values are **`string`** because a URL is text: `/projects/42` gives you `"42"`, not `42`. They're **`| undefined`** because `useParams` can't know which route the component is rendered under; the same component could be mounted somewhere without a `:taskId`. Even the generic form doesn't remove `undefined`, because React Router deliberately won't let you assert it away:
+
+```tsx
+const params = useParams<{ taskId: string }>(); // params: Readonly<Partial<{ taskId: string }>>
+params.taskId.trim(); // ❌ 'params.taskId' is possibly 'undefined'.
+
+const taskId = useParams().taskId!; // compiles, and lies: "!" doesn't check anything
+```
+
+And `undefined` isn't even the worst case. A user can type `/projects/p_42/tasks/<script>` or `/projects/p_42/tasks/%20` into the address bar. A param is **untrusted input**, so treat it like a request body on the server ([Chapter 32](/chapter/32)): parse it with a schema at the edge, and hand the rest of the app a trusted value.
+
+```tsx
+// shared/lib/useParsedParams.ts
+import { useParams } from "react-router";
+import { z } from "zod";
+
+export function useParsedParams<S extends z.ZodType>(schema: S): z.infer<S> | null {
+  const result = schema.safeParse(useParams());
+  return result.success ? result.data : null;
+}
+```
+
+```tsx
+// features/tasks/pages/TaskDetailPage.tsx
+const TaskRouteParams = z.object({
+  projectId: z.string().regex(/^p_[a-z0-9]+$/),
+  taskId: z.string().regex(/^t_[a-z0-9]+$/),
+});
+
+export function TaskDetailPage() {
+  const params = useParsedParams(TaskRouteParams); // { projectId: string; taskId: string } | null
+  if (!params) return <NotFoundState what="task" />;
+  return <TaskDetail projectId={params.projectId} taskId={params.taskId} />;
+}
+```
+
+`TaskDetail` now receives a plain `string`, already checked, with no `undefined` to handle. A garbage URL becomes a friendly "task not found" screen instead of a request for `/api/tasks/undefined`. If your IDs were numbers, `z.coerce.number().int().positive()` would turn `"42"` into `42` in the same step.
+
+## 59.4 Search params as state
+
+The part of a URL after `?` is the **query string**, made of **search params**: `?status=doing&sort=dueDate&page=2`. It's the right home for state that is shareable but not structural: filters, sorting, pagination, the active tab. If a teammate should see the same filtered board when you send them the link, the filter belongs here.
+
+React Router's `useSearchParams` returns the current params as a standard `URLSearchParams` object, plus a setter. Its `get` method returns `string | null`, and every value is, again, untrusted text:
+
+```tsx
+const [searchParams, setSearchParams] = useSearchParams();
+const status = searchParams.get("status"); // status: string | null, maybe "doing", maybe "banana"
+const page = searchParams.get("page");     // page: string | null, maybe "2", maybe "-7"
+```
+
+Instead of sprinkling `get` calls and checks around components, describe the whole query string with one schema. The trick is `.catch(...)`: when a value is missing *or* invalid, it falls back to a default instead of failing, so a hand-edited URL degrades gracefully rather than crashing the board.
+
+```ts
+// features/tasks/filters.ts
+import { z } from "zod";
+
+export const TaskFiltersSchema = z.object({
+  status: z.enum(["todo", "doing", "done"]).optional().catch(undefined),
+  sort: z.enum(["dueDate", "priority", "createdAt"]).catch("dueDate"),
+  page: z.coerce.number().int().min(1).catch(1),
+  q: z.string().catch(""),
+});
+
+export type TaskFilters = z.infer<typeof TaskFiltersSchema>;
+// { status?: "todo" | "doing" | "done" | undefined; sort: "dueDate" | "priority" | "createdAt"; page: number; q: string }
+```
+
+A small hook then gives components a typed value and a typed setter, and hides the string plumbing:
+
+```tsx
+// features/tasks/hooks/useTaskFilters.ts
+export function useTaskFilters() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const filters = TaskFiltersSchema.parse(Object.fromEntries(searchParams)); // can't throw: every field has a .catch
+
+  function setFilters(patch: Partial<TaskFilters>, options?: { replace?: boolean }) {
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      for (const [key, value] of Object.entries(patch)) {
+        if (value === undefined || value === "") next.delete(key);
+        else next.set(key, String(value));
+      }
+      if (!("page" in patch)) next.delete("page"); // a new filter starts again at page 1
+      return next;
+    }, options);
+  }
+
+  return [filters, setFilters] as const;
+}
+
+// In a component:
+const [filters, setFilters] = useTaskFilters();
+setFilters({ status: "done" });                    // ✅
+setFilters({ status: "finished" });                // ❌ Type '"finished"' is not assignable to type '"todo" | "doing" | "done" | undefined'.
+setFilters({ q: event.currentTarget.value }, { replace: true }); // typing doesn't flood the history
+```
+
+> 💡 **Tip.** Use `replace: true` for high-frequency updates like a search box. Otherwise every keystroke adds a history entry, and the back button walks backward one letter at a time.
+
+## 59.5 Navigation
+
+Users move around the app in three ways, and React Router has a tool for each.
+
+**Links** are for navigation the user initiates by clicking. `Link` renders a real `a` element (so middle-click, "open in new tab", and screen readers all work) but navigates without reloading. `NavLink` is a `Link` that knows whether it's active, which is exactly what a sidebar needs:
+
+```tsx
+import { Link, NavLink } from "react-router";
+
+function Sidebar({ projects }: { projects: Project[] }) {
+  return (
+    <nav aria-label="Projects">
+      {projects.map((project) => (
+        <NavLink
+          key={project.id}
+          to={`/projects/${project.id}`}
+          className={({ isActive }) => (isActive ? "nav-item nav-item--active" : "nav-item")}
+        >
+          {project.name}
+        </NavLink>
+      ))}
+      <Link to="/settings">Settings</Link>
+    </nav>
+  );
+}
+```
+
+**Programmatic navigation** is for moving the user as the *result* of something, such as after a form saves. `useNavigate` returns a function you call from an event handler or an effect:
+
+```tsx
+function CreateTaskForm({ projectId }: { projectId: string }) {
+  const navigate = useNavigate();
+
+  async function handleCreated(task: Task) {
+    navigate(`/projects/${projectId}/tasks/${task.id}`);            // push a new entry
+    // navigate(-1);                                                // go back one entry
+    // navigate("/projects", { replace: true });                    // replace the current entry
+  }
+  // …
+}
+```
+
+**Redirects** send the user elsewhere *instead of* rendering the current page, for example when `/` should show the projects list. Calling `navigate` during render is a side effect in the middle of rendering; the `Navigate` component expresses the same thing declaratively:
+
+```tsx
+import { Navigate } from "react-router";
+
+function HomeRedirect() {
+  return <Navigate to="/projects" replace />; // replace: "/" shouldn't stay in history
+}
+```
+
+> ⚠️ **Common mistake.** Writing `<a href="/projects">` inside the app. It works, but it triggers a full page reload: all in-memory state and cache are thrown away, and the app boots from scratch. Use `Link` for internal routes and keep plain `a` for external sites.
+
+## 59.6 Not-found and error routes
+
+Two things will eventually go wrong: someone visits a URL that matches no route, and some component throws while rendering. A good app handles both with a real page, never a white screen.
+
+A route whose path is `*` matches anything its siblings didn't, which makes it the **not-found route**. Put it last among the children of your root layout so the 404 page still shows the app's header and sidebar:
+
+```tsx
+const router = createBrowserRouter([
+  {
+    path: "/",
+    Component: RootLayout,
+    ErrorBoundary: RootErrorBoundary,  // renders if anything below throws
+    children: [
+      { path: "projects", Component: ProjectsPage },
+      // …other routes…
+      { path: "*", Component: NotFoundPage }, // "/projetcs", "/anything/else"
+    ],
+  },
+]);
+```
+
+The `ErrorBoundary` property is React Router's per-route error boundary. When a component in that route's subtree throws, the router renders the boundary instead. It reads what went wrong with `useRouteError`, which returns **`unknown`**, because anything can be thrown in JavaScript. Narrow it before you use it:
+
+```tsx
+import { isRouteErrorResponse, useRouteError } from "react-router";
+
+function RootErrorBoundary() {
+  const error = useRouteError(); // error: unknown
+
+  if (isRouteErrorResponse(error)) {
+    // A response thrown on purpose, e.g. a 404 or 403 from a route loader
+    return <ErrorPage title={`${error.status} ${error.statusText}`} />;
+  }
+  const detail = error instanceof Error ? error.message : "Unknown error";
+  return <ErrorPage title="Something went wrong" detail={detail} />;
+}
+```
+
+Put boundaries at more than one level. A boundary on the `projects/:projectId` route means a crash in the task detail panel replaces only the project area, while the sidebar keeps working and the user can navigate away.
+
+> 🔗 **Connection.** "Not found" has two flavors: a URL with no route (handled here by `*`) and a valid route whose resource doesn't exist, like a deleted task (handled by the param parsing in 59.3 and the error states of [Chapter 61](/chapter/61)). Error boundaries in general get a full chapter in [Chapter 71](/chapter/71).
+
+## 59.7 Lazy routes
+
+By default, everything imported by `router.tsx` lands in one JavaScript bundle, so a visitor who only opens the task board still downloads the code for account settings, the admin area, and every chart library they use. A **lazy route** loads its code only when someone navigates to it. React Router's `lazy` property takes a function that dynamically imports the route's module and returns its route properties:
+
+```tsx
+const router = createBrowserRouter([
+  {
+    path: "/",
+    Component: RootLayout,
+    children: [
+      { path: "projects", Component: ProjectsPage }, // in the main bundle: the landing page
+      {
+        path: "settings",
+        lazy: async () => {
+          const { AccountSettingsPage } = await import("@/features/settings");
+          return { Component: AccountSettingsPage }; // a separate chunk, fetched on first visit
+        },
+      },
+      {
+        path: "admin",
+        lazy: async () => {
+          const { AdminLayout } = await import("@/features/admin");
+          return { Component: AdminLayout };
+        },
+      },
+    ],
+  },
+]);
+```
+
+The bundler (Vite) sees the dynamic `import()` and splits that feature into its own file. While the chunk downloads, the router keeps showing the *current* page and reports the pending navigation, which you can use for a slim progress bar:
+
+```tsx
+import { useNavigation } from "react-router";
+
+function GlobalProgressBar() {
+  const navigation = useNavigation();
+  return navigation.state === "loading" ? <div className="progress-bar" role="progressbar" /> : null;
+}
+```
+
+> ⚠️ **Common mistake.** Lazily importing `@/features/settings` while *also* importing it statically somewhere else, such as a sidebar badge. A module that's imported normally anywhere ends up in the main bundle, and the "lazy" route splits nothing. [Chapter 70](/chapter/70) shows how to inspect your bundle and verify the split.
+
+## 59.8 Type-safe routing
+
+Look at all the string paths so far: `` `/projects/${project.id}` ``, `` `/projects/${projectId}/tasks/${task.id}` ``, `"/settings"`. Every one of them is a string the compiler can't check. Rename `tasks` to `items` in the router and every link silently becomes a 404. The fix is to keep route patterns in **one object**, frozen with `as const` ([Chapter 20](/chapter/20)), and derive a typed helper from it with template literal types ([Chapter 24](/chapter/24)):
+
+```ts
+// app/routes.ts
+export const routes = {
+  projects: "/projects",
+  projectBoard: "/projects/:projectId",
+  taskDetail: "/projects/:projectId/tasks/:taskId",
+  settings: "/settings",
+} as const;
+
+type RouteName = keyof typeof routes;
+
+// "/projects/:projectId/tasks/:taskId" → "projectId" | "taskId"
+type ParamNames<Path extends string> =
+  Path extends `${string}:${infer Param}/${infer Rest}`
+    ? Param | ParamNames<`/${Rest}`>
+    : Path extends `${string}:${infer Param}`
+      ? Param
+      : never;
+
+type ParamsOf<Name extends RouteName> = ParamNames<(typeof routes)[Name]>;
+```
+
+```ts
+export function href<Name extends RouteName>(
+  name: Name,
+  ...args: [ParamsOf<Name>] extends [never] ? [] : [params: Record<ParamsOf<Name>, string>]
+): string {
+  const params: Record<string, string> = args[0] ?? {};
+  return routes[name].replace(/:(\w+)/g, (_, key: string) => encodeURIComponent(params[key] ?? ""));
+}
+
+href("taskDetail", { projectId: "p_42", taskId: "t_9" }); // ✅ "/projects/p_42/tasks/t_9"
+href("settings");                                          // ✅ no params needed, none allowed
+href("taskDetial", { projectId: "p_42", taskId: "t_9" }); // ❌ Argument of type '"taskDetial"' is not assignable to parameter of type '"projects" | "projectBoard" | "taskDetail" | "settings"'.
+href("taskDetail", { projectId: "p_42" });                 // ❌ Property 'taskId' is missing in type '{ projectId: string; }' but required in type 'Record<"projectId" | "taskId", string>'.
+```
+
+Now links read `<Link to={href("taskDetail", { projectId, taskId })}>`, and a renamed or removed route is a compile error at every call site. The cost is discipline: the `routes` map and the router definition must agree, so many teams build the router's paths *from* the map.
+
+A hand-rolled helper is not the only option. Two alternatives move the type safety into the router itself:
+
+```tsx
+// TanStack Router: params and search params are inferred from the route definition
+export const Route = createFileRoute("/projects/$projectId")({
+  validateSearch: TaskFiltersSchema,  // the same schema from 59.4
+  component: ProjectBoardPage,
+});
+
+function ProjectBoardPage() {
+  const { projectId } = Route.useParams(); // projectId: string (no undefined)
+  const filters = Route.useSearch();       // filters: TaskFilters, already validated
+  return <Link to="/projects/$projectId" params={{ projectId }}>Board</Link>; // checked at compile time
+}
+```
+
+**TanStack Router** is designed around inference: paths, params, and validated search params are all typed end to end. **React Router's framework mode** takes the other road, generating route types from your route files with a build step and offering its own typed `href`. Both remove the hand-written helper; both ask you to adopt more of the tool.
+
+> ⏭ **Safe to skip.** The `ParamNames` type uses recursive conditional types with `infer`. If [Chapter 23](/chapter/23) is still fresh, enjoy it; if not, the behavior (a typo in a route name or a missing param is an error) is what matters.
+
+## Common mistakes
+
+> ⚠️ **Non-null assertions on params.** `useParams().taskId!` compiles and checks nothing. Parse params with a schema and render a not-found state on failure.
+
+> ⚠️ **Shareable state in `useState`.** Filters, sorting, pagination, and the selected tab vanish on refresh when they live in component state. If a link should reproduce it, put it in the URL.
+
+> ⚠️ **Trusting search params.** `Number(searchParams.get("page"))` can be `NaN`, `0`, or `-7`. Validate with defaults so a hand-edited URL still renders.
+
+> ⚠️ **Navigating during render.** Calling `navigate()` in a component's body is a side effect during rendering. Use `Navigate` to redirect, and `navigate()` in handlers or effects.
+
+```tsx
+function OldTaskUrl() {
+  const navigate = useNavigate();
+  navigate("/projects"); // ❌ side effect during render: React warns, and it can loop
+  return <Navigate to="/projects" replace />; // ✅ declarative redirect
+}
+```
+
+## When to use it, and when not to
+
+> ✅ **Use it when** the app has more than one screen, or any state that a user might want to bookmark, share, refresh, or navigate back to: the current project, the open task, filters, sort order, page number, the active tab.
+
+> 🚫 **When not to.** Not everything belongs in the URL. Ephemeral UI (a hovered card, an open dropdown), half-typed text, and large or private data (tokens, personal details) should stay in component or form state. A URL is visible, logged by servers and analytics, and limited in length. And a tiny widget embedded in another page usually shouldn't own the page's URL at all.
+
+## How it connects
+
+> 🔗 **Connection.** Parsing params and search params is runtime validation at a boundary ([Chapter 32](/chapter/32)); the typed `href` helper combines `as const` ([Chapter 20](/chapter/20)) with template literal types ([Chapter 24](/chapter/24)). [Chapter 60](/chapter/60) names the URL as one of the five homes for state. [Chapter 65](/chapter/65) adds protected routes and "return to where you were", and [Chapter 70](/chapter/70) measures what lazy routes actually save.
+
+> 🌍 **Real world.** Production apps like Linear, GitHub, and Jira put nearly all navigational state in the URL: the open issue, the view, the filters, the grouping. It's why their links are so useful to paste into a chat.
+
+## Exercises
+
+### Level 1 — Recall
+
+Define the route tree for a six-page app with nested layouts: a public landing page, `/login`, and an authenticated area with `/projects`, `/projects/:projectId` (a board, with an index route), `/projects/:projectId/tasks/:taskId`, and `/settings`. Mark which routes are layout routes, which are index routes, and where each `Outlet` renders.
+
+### Level 2 — Application
+
+Parse the params of `/projects/:projectId/tasks/:taskId` with a schema. Render a not-found state (inside the project layout, not a blank page) when either ID is missing or malformed, and verify it by typing three different bad URLs into the address bar.
+
+### Level 3 — Challenge
+
+Keep a task table's filters (status, priority, assignee, sort, page) in search params with validation and defaults. Changing any filter must reset the page to 1, the search box must not create a history entry per keystroke, and a URL with invalid values must still render with sensible defaults.
+
+*Hint: one schema with `.catch()` on every field, and one hook that owns both reading and writing.*
+
+### Level 4 — Real-world
+
+**Ticket TF-318: TaskFlow Web routing.** Build the router for [P14](/projects/p14).
+
+- Routes exist for the projects list, project board, task detail, and settings, with a shared root layout and a project layout.
+- Every internal link uses a typed `href()` helper; a misspelled route name or a missing param is a compile error.
+- Unknown URLs show a 404 page inside the app shell, and a component crash shows an error page with a way back.
+- The settings feature is lazy-loaded and appears as a separate chunk in the production build.
+
+## Key takeaways
+
+- The URL is state, and the most shareable kind: it survives refresh and works with back, forward, bookmarks, and links.
+- React Router maps URL patterns to nested UI; parents render children through `Outlet`, and layout routes add UI without adding a path segment.
+- `useParams` values are `string | undefined`, and search params are `string | null`. Both are **untrusted input**: parse them with schemas at the edge.
+- Use `Link`/`NavLink` for user navigation, `useNavigate` for navigation after events, and `Navigate` for render-time redirects.
+- Give every app a `*` not-found route and route-level error boundaries; narrow `useRouteError()` from `unknown`.
+- Lazy routes split code by page; a typed `href()` (or a type-safe router) turns broken links into compile errors.
+
+## What comes next
+
+The URL now holds the current project, the open task, and the filters. But TaskFlow has a lot of *other* state: the logged-in user, the tasks from the server, an open modal, a half-typed comment. Right now, most of it sits in one giant global store, and every keystroke re-renders the whole board. Each kind of state has a natural home, and the URL was just one of them. That's [Chapter 60: Where State Lives](/chapter/60).

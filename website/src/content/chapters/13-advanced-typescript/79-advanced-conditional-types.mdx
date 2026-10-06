@@ -1,0 +1,375 @@
+> 📖 **The problem.** You open the type definitions of a popular library to find out why autocomplete behaves the way it does, and you find this: twelve lines of nested `extends`, three `infer`s, a recursive call to itself, and a `never` at the bottom. You close the tab. The type clearly *works*, since your editor shows exactly the right thing, but you can't read it, so you can't debug it, adapt it, or write one like it.
+
+[Chapter 23](/chapter/23) introduced conditional types as "an `if` for types". This chapter takes that idea to full precision. You'll learn why `IsString<"a" | 1>` returns `boolean`, how to turn that behavior off when you don't want it, how `infer` can capture a piece of almost any type, how to loop with recursion (and where the loop breaks), and why TypeScript refuses to let you return `x.split("")` from a function whose return type is a conditional on `T`. By the end you can read library-grade types and write your own. You'll also know when you shouldn't.
+
+> 🧠 **Mental model.** Conditional types are **type-level pattern matching**. `extends` asks "does this type fit this pattern?", `infer` captures the parts that matched, **distribution** maps the test over each member of a union, and **recursion** loops. Together they form a small functional language that runs inside the compiler.
+
+> ⏭ **Safe to skip.** Sections 79.5 and 79.8 are specialist material. If you only write application code, skim them and return when you build a library or a very generic helper.
+
+## 79.1 Conditional types through the set model
+
+A conditional type `A extends B ? X : Y` asks one question: **is every value of type `A` also a value of type `B`?** In set terms, "is the set `A` a subset of the set `B`?" If yes, the result is `X`; otherwise `Y`. Thinking of types as sets makes the surprising cases predictable.
+
+```ts
+type IsString<T> = T extends string ? true : false;
+
+type A = IsString<"todo">;   // true:  the set {"todo"} is inside the set of all strings
+type B = IsString<number>;   // false: numbers are not strings
+type C = IsString<unknown>;  // false: unknown includes values that aren't strings
+type D = IsString<never>;    // never  (see 79.2)
+```
+
+Two special types need care. `unknown` is the **biggest** set (everything), so it only fits patterns that accept everything. `never` is the **empty** set, which is a subset of every set, so `never extends anything` is "true". Except that, as the next section explains, conditionals over `never` don't get evaluated at all.
+
+`any` is the odd one out: it opts out of the set model. `IsString<any>` is `boolean`, the union of both branches, because TypeScript can't decide.
+
+```ts
+type E = IsString<any>; // boolean (both branches, so the result is true | false)
+
+// A reliable "is this any?" test: only any survives `1 & T` as something 0 fits
+type IsAny<T> = 0 extends 1 & T ? true : false;
+type F = IsAny<any>;     // true
+type G = IsAny<unknown>; // false
+```
+
+The checking question is always about **assignability**, not equality. `{ id: string; title: string }` extends `{ id: string }`, because every such object is also a valid `{ id: string }`. Keep this in mind whenever a conditional "matches more than you expected".
+
+```ts
+type HasId<T> = T extends { id: string } ? true : false;
+type H = HasId<{ id: string; title: string }>; // true: extra properties are fine
+type I = HasId<{ title: string }>;             // false
+```
+
+## 79.2 Controlling distribution
+
+Here's the behavior that surprises almost everyone. When the checked type is a **naked type parameter** (just `T`, not wrapped in anything) and you pass a union, TypeScript runs the conditional on **each member separately** and unions the results. This is called **distribution**.
+
+```ts
+type ToArray<T> = T extends unknown ? T[] : never;
+
+type X = ToArray<string | number>; // string[] | number[]   (not (string | number)[])
+```
+
+Distribution is exactly what makes `Exclude` and `Extract` work: `Exclude<"a" | "b" | "c", "a">` checks each member and drops the ones that match. It also explains why `IsString<never>` is `never`: `never` is the empty union, so there are zero members to evaluate, and the union of zero results is `never`.
+
+Sometimes you want the opposite: test the union as a whole. **Wrap both sides in a one-element tuple** so the checked type is no longer naked:
+
+```ts
+type IsStringStrict<T> = [T] extends [string] ? true : false;
+
+type A = IsStringStrict<"a" | 1>;     // false: the whole union isn't inside string
+type B = IsStringStrict<"a" | "b">;   // true
+type C = IsStringStrict<never>;       // true:  [never] is assignable to [string]
+type IsNever<T> = [T] extends [never] ? true : false;
+type D = IsNever<never>;              // true: the standard "is never" test
+```
+
+The pairing is the rule of thumb: **naked `T` when you want to map over a union; `[T]` when you want a single yes/no about the whole union.** Distribution is only triggered when `T` is a type parameter that appears naked on the left of `extends`.
+
+```ts
+type Status = "todo" | "doing" | "done";
+
+type Label<S extends Status> = S extends "done" ? "Finished" : "In progress";
+type L1 = Label<Status>;      // "Finished" | "In progress", one result per member
+type Combined<S extends Status> = [S] extends ["done"] ? "Finished" : "In progress";
+type L2 = Combined<Status>;   // "In progress", the union as a whole is not "done"
+```
+
+> ⚠️ **Common mistake.** Writing `T extends never ? … : …` to test for `never`. When `T` is `never`, distribution produces `never` without evaluating either branch, so the test always "fails" silently. Use `[T] extends [never]`.
+
+## 79.3 infer in every position
+
+`infer` declares a **type variable inside a pattern**. If the checked type matches, TypeScript fills in the variable with whatever sat in that position, and you can use it in the true branch. Anywhere you can write a type inside the `extends` clause, you can put an `infer`.
+
+```ts
+type FirstParam<F> = F extends (first: infer P, ...rest: any[]) => any ? P : never;
+type ReturnOf<F> = F extends (...args: any[]) => infer R ? R : never;
+type Unwrapped<T> = T extends Promise<infer U> ? U : T;
+
+type P = FirstParam<(id: string, force: boolean) => void>; // string
+type R = ReturnOf<() => Task[]>;                           // Task[]
+type U = Unwrapped<Promise<Task>>;                         // Task
+```
+
+A function with **no parameters** still matches the first pattern: `FirstParam<() => void>` is `unknown`, not `never`, because a function with fewer parameters is assignable to one with more, and an unconstrained `infer` with nothing to capture falls back to `unknown`. This is a classic edge case in the Level 1 exercise.
+
+Here are the other common positions. Constructors, tuple elements, and template strings:
+
+```ts
+class Task { constructor(public title: string, public due?: Date) {} }
+
+type CtorArgs<C> = C extends new (...args: infer A) => unknown ? A : never;
+type Instance<C> = C extends abstract new (...args: any) => infer I ? I : never;
+
+type A = CtorArgs<typeof Task>; // [title: string, due?: Date | undefined]
+type I = Instance<typeof Task>; // Task
+
+type Head<T extends unknown[]> = T extends [infer H, ...unknown[]] ? H : never;
+type Tail<T extends unknown[]> = T extends [unknown, ...infer R] ? R : [];
+type H = Head<[1, 2, 3]>;  // 1
+type T = Tail<[1, 2, 3]>;  // [2, 3]
+
+type Split<S> = S extends `${infer A}-${infer B}` ? [A, B] : never;
+type S1 = Split<"task-123">; // ["task", "123"]
+```
+
+When the **same** `infer` name appears in several positions, the result depends on *variance*: in covariant (output) positions you get a **union** of the candidates; in contravariant (parameter) positions you get an **intersection**.
+
+```ts
+type Co<T> = T extends { a: infer U; b: infer U } ? U : never;
+type Contra<T> = T extends { a: (x: infer U) => void; b: (x: infer U) => void } ? U : never;
+
+type X = Co<{ a: string; b: number }>;                                // string | number
+type Y = Contra<{ a: (x: string) => void; b: (x: number) => void }>;  // string & number (which is never in practice)
+```
+
+You met the reason in [Chapter 77](/chapter/77). It is also the trick behind `UnionToIntersection`, a famous 4-line utility.
+
+## 79.4 infer with constraints
+
+Sometimes you capture a piece of a type and want to be sure it's the right *kind* of piece. Before TypeScript 4.7 you needed a second, nested conditional. Now you can write the constraint directly on the `infer`: `infer U extends string`. If the captured type doesn't satisfy the constraint, the whole pattern fails to match and you take the false branch.
+
+```ts
+type FirstString<T> = T extends [infer H extends string, ...unknown[]] ? H : never;
+
+type A = FirstString<["todo", 1]>; // "todo"
+type B = FirstString<[1, "todo"]>; // never: the head is a number, so no match
+```
+
+The most useful special case is a constraint on a **template literal** capture. A template literal alone infers pieces as `string`. Add `extends number` and TypeScript parses the text as a number literal:
+
+```ts
+type ParseNumber<S> = S extends `${infer N extends number}` ? N : never;
+
+type N1 = ParseNumber<"42">;   // 42       (a number literal, not "42")
+type N2 = ParseNumber<"abc">;  // never    (not a numeric string)
+```
+
+You can also narrow to a **union of literals**, which is perfect for validating strings against TaskFlow's statuses:
+
+```ts
+type Status = "todo" | "doing" | "done";
+type StatusFromKey<K> = K extends `task:${infer S extends Status}` ? S : never;
+
+type S1 = StatusFromKey<"task:todo">;   // "todo"
+type S2 = StatusFromKey<"task:later">;  // never
+```
+
+Without `extends Status`, `S1` would be the wider `string`, and you'd need another conditional to check it. The constraint makes the pattern both **capture** and **validate** in one step.
+
+> 💡 **Tip.** A constraint on `infer` makes a *pattern* stricter, so a failed match falls to the false branch. It does not produce a compile error. If you want an error message for the caller, that is the job of 79.8.
+
+## 79.5 Recursive conditional types
+
+A conditional type can refer to itself, which gives the language a loop. The standard shape is: match the head, process it, recurse on the tail, and stop at an empty case. Here `Trim` strips leading and trailing spaces from a string literal, and `Reverse` flips a tuple:
+
+```ts
+type Trim<S extends string> = S extends ` ${infer R}` | `${infer R} ` ? Trim<R> : S;
+type Reverse<T extends unknown[]> = T extends [infer H, ...infer R] ? [...Reverse<R>, H] : [];
+
+type T1 = Trim<"  hi  ">;       // "hi"
+type T2 = Reverse<[1, 2, 3]>;   // [3, 2, 1]
+```
+
+> ⏭ **Safe to skip.** The rest of this section is about how deep the loop can go. Most application code never needs it.
+
+Recursion has limits. TypeScript gives up when instantiation gets too deep, with `Type instantiation is excessively deep and possibly infinite`. The limit depends on the *shape* of the recursion. If the recursive call is in **tail position**, meaning it is the entire result of the branch with nothing wrapped around it, the compiler turns it into a loop and allows about a thousand iterations. If you wrap the recursive call in something (`[...Recur<…>]`), each level stacks on the previous one and the limit is far lower, around fifty in current compilers.
+
+```ts
+// Tail position: the recursive call IS the result. Carries its answer in an accumulator.
+type Count<N extends number, Acc extends unknown[] = []> =
+  Acc["length"] extends N ? Acc : Count<N, [...Acc, unknown]>;
+
+type Ok = Count<900>["length"];     // 900
+type Boom = Count<1000>["length"];  // ❌ Type instantiation is excessively deep and possibly infinite.
+
+// Not tail position: the recursive call is wrapped in a spread
+type Wrapped<N extends number, Acc extends unknown[] = []> =
+  Acc["length"] extends N ? Acc : [...Wrapped<N, [...Acc, unknown]>];
+
+type Small = Wrapped<40>["length"];  // 40
+type Big = Wrapped<60>["length"];    // ❌ Type instantiation is excessively deep and possibly infinite.
+```
+
+The practical lesson is to write recursive types in **accumulator style** (pass the partial answer along as a parameter) whenever the input could be long, and to treat long inputs (string literals of hundreds of characters, tuples of hundreds of elements) as a design smell. The exact numbers can change between compiler versions; the shape of the rule does not.
+
+> 🚫 **When not to.** If a runtime function computes the same answer from a value in microseconds, don't compute it with types. A recursive type that counts to 900 buys nothing but slow editors.
+
+## 79.6 Generics in implementations
+
+Writing a conditional type for a **signature** is the easy half. The hard half hits when you implement the function. Consider a function whose return type depends on its input:
+
+```ts
+function describe<T extends string | number>(
+  value: T,
+): T extends string ? string[] : number {
+  if (typeof value === "string") {
+    return value.split("");   // ❌ Type 'string[]' is not assignable to type 'T extends string ? string[] : number'.
+  }
+  return String(value).length; // ❌ Type 'number' is not assignable to type 'T extends string ? string[] : number'.
+}
+```
+
+Inside the body, `typeof value === "string"` narrows `value`, but it does **not** narrow `T`. `T` is an unknown type chosen by the caller; TypeScript does not know whether a `string[]` is the right answer for *that* `T`. The return type is a conditional that stays **deferred** (unresolved) until `T` is known, and a concrete `string[]` isn't assignable to something unresolved.
+
+You have two honest ways out. The first, and usually best, is **overloads**: publish the precise signatures to callers, and write an implementation signature that is loose. The implementation is checked only against its own loose signature:
+
+```ts
+function describe(value: string): string[];
+function describe(value: number): number;
+function describe(value: string | number): string[] | number {
+  return typeof value === "string" ? value.split("") : String(value).length;
+}
+
+const a = describe("abc"); // a: string[]
+const b = describe(21);    // b: number
+```
+
+The second is a **single, contained assertion** inside the generic version, justified by a comment. Use it when overloads can't express the relationship (for example, when `T` is a union you want to distribute):
+
+```ts
+type Described<T> = T extends string ? string[] : number;
+
+function describeGeneric<T extends string | number>(value: T): Described<T> {
+  const result = typeof value === "string" ? value.split("") : String(value).length;
+  return result as Described<T>; // we know this matches, but the compiler can't prove it
+}
+```
+
+Note the trade-off. Overloads are *checked* at the implementation level only loosely, and the assertion is *unchecked*. Either way the compiler is trusting you at one spot, so keep that spot tiny, tested, and commented. Overloads have a second weakness: they can't accept a union argument (`describe(x)` where `x` is `string | number`) unless you add a third overload for it.
+
+## 79.7 Reading library-grade types
+
+Now the opening problem. Here is the real definition of `Awaited` from TypeScript's own standard library. It's what `await` uses to figure out what a promise produces, and it looks intimidating until you read it as a decision list, top to bottom:
+
+```ts
+type Awaited<T> =
+  T extends null | undefined ? T :                          // (1)
+    T extends object & { then(onfulfilled: infer F, ...args: infer _): any } ?  // (2)
+      F extends ((value: infer V, ...args: infer _) => any) ? // (3)
+        Awaited<V> :                                          // (4)
+        never :                                               // (5)
+    T;                                                        // (6)
+```
+
+Read it in six moves:
+
+1. **Is `T` `null` or `undefined`?** Return it unchanged. These have no `then`, and the check must come first because later patterns assume an object.
+2. **Is `T` an object with a `then` method?** That is the definition of a "thenable" (anything `await` can unwrap). `infer F` captures the type of the first parameter of `then`, which is the *callback* you pass for the success case. (The `infer _` for the rest parameters is a throwaway name.)
+3. **Is that callback a function that takes a value?** `infer V` captures the value the promise resolves with.
+4. **Recurse on `V`.** A promise of a promise of a number unwraps all the way down.
+5. **A thenable with a weird `then` signature gives `never`.**
+6. **Anything else is not a promise**, so `T` comes back as is.
+
+Because `T` is naked, the whole thing **distributes**: `Awaited<string | Promise<boolean>>` is `string | boolean`. Check it against the model: step 2 is pattern matching, step 3 is a second pattern on the captured piece, and step 4 is recursion.
+
+```ts
+type A = Awaited<Promise<Promise<number>>>;   // number
+type B = Awaited<string | Promise<boolean>>;  // string | boolean
+type C = Awaited<{ then(cb: (v: Task) => void): void }>; // Task
+```
+
+When you meet an unfamiliar type, use the same procedure: (a) find the checked type, (b) note whether it is naked, so it distributes, (c) list each `infer` and say what it captures, (d) find the recursive call, and (e) find the base case. A twelve-line type is rarely more than two or three patterns stacked.
+
+> 🌍 **Real world.** The same technique decodes `ReturnType`, `Parameters`, `InstanceType`, `Extract`, the `Inputs` types in tRPC and TanStack libraries, and most of the `.d.ts` files you'll open when debugging a type error.
+
+## 79.8 Friendlier type errors
+
+> ⏭ **Safe to skip.** This is for library authors whose users will see the error messages.
+
+When a conditional type rejects an argument, TypeScript's default message is often a wall of text about assignability to `never`. You can improve it by making the *failing* branch a type that **spells out the problem**: an intersection with a string literal that tells the caller what to fix.
+
+```ts
+type Requires<T, Shape, Message extends string> = [T] extends [Shape] ? unknown : Message;
+
+function save<T>(
+  entity: T & Requires<T, { id: string }, "Error: the entity needs a string id">,
+): void { /* … */ }
+
+save({ id: "t1", title: "Ship" }); // ✅
+save({ title: "Ship" });
+// ❌ Argument of type '{ title: string; }' is not assignable to parameter of type
+//    '{ title: string; } & "Error: the entity needs a string id"'.
+```
+
+When the check passes, `Requires` is `unknown`, and `T & unknown` is just `T`, so valid calls cost nothing. When it fails, the parameter type becomes `T & "Error: …"`, which no object satisfies, and the message states the reason in plain words at the point of use.
+
+Another version returns an error *object type* instead of a string, which helps in return positions: `{ error: "Expected …"; got: T }`. Both are conventions, not features. TypeScript has no custom-error mechanism. And both can only be as good as the message you write.
+
+> 🚫 **When not to.** Application code rarely needs this. If a type error would be hard for your *teammates* to read, first try a simpler design (an interface, a named type, an overload). Spend this complexity only when the audience is a library's users.
+
+## Common mistakes
+
+> ⚠️ **Testing for `never` with a naked parameter.** `T extends never ? A : B` distributes over zero members and returns `never`. Wrap in a tuple: `[T] extends [never]`.
+
+> ⚠️ **Forgetting distribution.** `Wrap<string | number>` giving `string[] | number[]` instead of `(string | number)[]` is almost always this. Wrap in `[T]` to stop it.
+
+> ⚠️ **Expecting `T` to narrow inside the function body.** Narrowing the *value* does not resolve a deferred conditional return type. Use overloads, or one small commented assertion.
+
+> ⚠️ **Deep recursion in non-tail position.** Wrapping the recursive call (`[...Recur<…>]`) lowers the limit dramatically. Carry an accumulator, and keep inputs short.
+
+> ⚠️ **Mistaking `infer` failure for `unknown`.** A missing capture is `unknown` (as in `FirstParam<() => void>`), while a failed *match* is the false branch. They look similar and mean different things.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** a type must be derived from another in a way that mapped types and utilities can't express: unwrapping promises and arrays, extracting parameters, parsing string literals, or building a reusable helper for many call sites. Write the helper once, test it, and hide it behind a clear name.
+
+> 🚫 **When not to.** Don't write a conditional type when an overload, a union, or a plain generic constraint does the job. Don't write recursive types that a runtime function could compute. And don't expose heavy conditional types in the *public* signature of ordinary application code: the cost is editor lag and error messages nobody can read.
+
+## How it connects
+
+> 🔗 **Connection.** [Chapter 23](/chapter/23) gave you the first view of conditional types and the built-ins (`Exclude`, `ReturnType`). Variance ([Chapter 77](/chapter/77)) explains the union-vs-intersection result of repeated `infer`s. Next comes [Chapter 80](/chapter/80) (recursion applied to mapped types) and [Chapter 81](/chapter/81) (`infer` inside template literals).
+
+> 🌍 **Real world.** Type-level libraries (`type-fest`, `ts-toolbelt`, Zod's `infer`, tRPC's router types) are mostly stacks of conditionals and `infer`. Reading them is a skill that pays off every time a library's error message is unhelpful.
+
+## Exercises
+
+### Level 1 — Recall
+
+Evaluate each type by hand, then confirm in your editor. For each, say whether distribution is involved.
+
+```ts
+type IsString<T> = T extends string ? true : false;
+type IsStringW<T> = [T] extends [string] ? true : false;
+
+type Q1 = IsString<"a" | 1>;
+type Q2 = IsString<never>;
+type Q3 = IsStringW<never>;
+type Q4 = IsStringW<"a" | 1>;
+type Q5 = IsString<any>;
+type Q6 = IsString<unknown>;
+type Q7 = Exclude<"todo" | "doing" | "done", "done">;
+type Q8 = (string | number) extends string ? "yes" : "no";
+```
+
+### Level 2 — Application
+
+Write `FirstParam<F>` that returns `never` (not `unknown`) for a function with no parameters, and `LastElement<T>` for tuples that gives the last element. For `LastElement<[]>` return `never`, and for a non-tuple array `string[]`, return `string | undefined`. Add type-level tests using an `Equal` helper.
+
+### Level 3 — Challenge
+
+Write `IsUnion<T>` that is `true` for `"a" | "b"` and `false` for `"a"`, `string`. Note that `boolean` *is* a union (`true | false`), so it should give `true`. Explain in comments, line by line, why your solution works, including what happens for `never`.
+
+*Hint: you need both distribution and a second copy of the original `T` held in another type parameter.*
+
+### Level 4 — Real-world
+
+**Ticket TF-338: Understand our dependency's types.** The team keeps getting confusing errors from a helper type in a library we use (pick one: TanStack Query's `InferDataFromTag`, tRPC's `inferRouterOutputs`, or one in `type-fest`).
+
+- Copy the definition into a scratch file and annotate every line: which `infer` captures what, which part distributes, where recursion stops.
+- Write at least five type-level tests that show its behavior on tricky inputs (unions, `never`, optional properties).
+- Add a short explanation of the original confusing error to the team wiki, in plain language.
+
+## Key takeaways
+
+- A conditional type asks "is `A` assignable to `B`?" Think of types as sets.
+- Distribution applies to a **naked** type parameter and maps over a union. Wrap in `[T]` to test the union as a whole, and always test `never` that way.
+- `infer` captures any piece of a pattern. Repeated names give unions in output positions and intersections in input positions.
+- `infer U extends string` captures and validates in one step.
+- Recursive conditionals loop. Tail-position recursion with an accumulator goes about a thousand deep, wrapped recursion only about fifty.
+- Narrowing a value doesn't resolve a conditional return type. Use overloads or one contained assertion.
+- To read a hard type, find the checked type, the `infer`s, the recursion, and the base case.
+
+## What comes next
+
+Conditional types transform one type into another. [Chapter 80](/chapter/80) combines them with **mapped types** and recursion to walk entire object shapes. That's how a form library can tell you that `"address.stret"` isn't a valid path.

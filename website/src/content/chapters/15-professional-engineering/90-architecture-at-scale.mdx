@@ -1,0 +1,428 @@
+> 📖 **The problem.** TaskFlow, two years later. Eight teams ship into one repository: Board, Projects, Reporting, Billing, Notifications, Search, Settings, and Platform. There are 400 components, and there is a folder called `src/shared/` that 143 files import. Everyone depends on it, nobody owns it, and its `Task` interface has 31 optional fields because every team added "just one more". Last week the Reporting team changed what `status` could contain, and the Board team's drag-and-drop broke in production. Nobody did anything wrong. The system simply had no boundaries.
+
+Up to now, "architecture" meant organizing one application for one team ([Chapter 58](/chapter/58)). This chapter is about what happens when the code outlives its authors and the number of people touching it grows past what any one person can hold in their head. You'll learn to model a domain so its rules live in types, split a frontend into areas that own their own language, put interfaces between your app and the outside world, decide who owns each piece of state, and write the rules down in a form that a machine can enforce.
+
+> 🧠 **Mental model.** **Architecture is the set of decisions that are expensive to change.** You can't make every decision cheap, but you can make the expensive ones deliberately: make boundaries explicit, make dependencies point one way, and let types describe the contract at each boundary.
+
+## 90.1 What changes at scale
+
+Small codebases survive on shared understanding. When three people work on an app, a "shared" folder is fine because all three know what's in it and why. Scale breaks that in four ways. **Teams multiply**, and each new team adds communication paths, not just people. **Code volume** grows past the point where anyone reads all of it. **Lifetimes** stretch, so the people who wrote a module are often gone by the time it needs to change. And **coordination cost** rises: a change that used to take an afternoon now needs a meeting, because nobody is sure who else depends on it.
+
+Here's the `Task` type from the opening story. Each line made sense to whoever added it:
+
+```ts
+// src/shared/types.ts: imported by 143 files across 8 teams
+export interface Task {
+  id: string;
+  title: string;
+  status: string;            // "todo" | "doing" | "done"… and "archived"? Ask Reporting.
+  assignee?: User;           // Board uses this one
+  assigneeId?: string;       // Notifications uses this one
+  invoiceLineId?: string;    // Billing added this in 2025
+  chartColor?: string;       // Reporting added this for one dashboard
+  isDraggingOver?: boolean;  // UI state that leaked into the model
+  // …24 more optional fields
+}
+```
+
+Nothing here is a syntax problem. The problem is that one type is serving eight masters, so every change to it is a negotiation. Optional fields are a symptom: they mean "this exists for *someone*, in *some* situation", which tells a reader nothing.
+
+The goal of architecture at scale is not elegance. It's to keep the cost of change **local**: a team should be able to change its own code without asking seven other teams for permission. Every technique in this chapter serves that goal.
+
+## 90.2 Domain modeling with types
+
+The **domain** is the part of the world your software is about: tasks, projects, people, deadlines. **Domain modeling** means describing that world in types precisely enough that illegal situations can't be written down. Three building blocks do most of the work.
+
+An **entity** has an identity that persists while its data changes. A task is still the same task after you rename it. A **value object** has no identity; it's defined entirely by its value and is usually immutable, like a due date or an amount of money. Two due dates of `2026-10-06` are interchangeable. **Branded IDs** ([Chapter 78](/chapter/78)) stop you from passing one entity's ID where another's is expected:
+
+```ts
+declare const brand: unique symbol;
+type Brand<T, B extends string> = T & { readonly [brand]: B };
+
+export type TaskId = Brand<string, "TaskId">;
+export type ProjectId = Brand<string, "ProjectId">;
+export type UserId = Brand<string, "UserId">;
+
+// A value object: validated once, at creation, then trusted everywhere.
+export type DueDate = Brand<string, "DueDate">; // "2026-10-06"
+
+export function parseDueDate(input: string): DueDate | null {
+  return /^\d{4}-\d{2}-\d{2}$/.test(input) ? (input as DueDate) : null;
+}
+
+declare function moveTask(taskId: TaskId, to: ProjectId): void;
+moveTask(projectId, taskId); // ❌ Argument of type 'ProjectId' is not assignable to parameter of type 'TaskId'.
+```
+
+The `as DueDate` assertion lives in exactly one place, the function that checks the format. Everywhere else, holding a `DueDate` *proves* the check happened.
+
+The fourth tool is the **state machine** ([Chapter 55](/chapter/55)): model an entity's lifecycle as a discriminated union, with the data each state needs living only in that state. Then write transitions as functions that accept only the states they're valid from:
+
+```ts
+type TaskState =
+  | { status: "todo" }
+  | { status: "doing"; assigneeId: UserId; startedAt: Date }
+  | { status: "done"; assigneeId: UserId; completedAt: Date };
+
+export type Task = {
+  readonly id: TaskId;
+  readonly projectId: ProjectId;
+  title: string;
+  dueDate: DueDate | null;
+} & TaskState;
+
+export function startTask(task: Task & { status: "todo" }, assigneeId: UserId, now: Date): Task {
+  return { ...task, status: "doing", assigneeId, startedAt: now };
+}
+
+declare const finished: Task & { status: "done" };
+startTask(finished, aliceId, new Date());
+// ❌ Types of property 'status' are incompatible. Type '"done"' is not assignable to type '"todo"'.
+```
+
+Compare this with the 31-optional-field interface. A "done" task without a `completedAt` is no longer *possible*, so no code anywhere has to check for it.
+
+> 💡 **Tip.** Put domain types and pure transition functions in a folder (or package) with **no imports from React, the router, or the network**. If your domain code can run in a plain Node test with nothing mocked, you've drawn the line in the right place.
+
+## 90.3 Bounded contexts in a frontend
+
+Ask the Board team what a "task" is and they'll describe a card in a column, with a position and an avatar. Ask Reporting and they'll describe a completed unit of work with a cycle time. Ask Billing and it's a line item with billable hours. They're all right. The word means different things in different parts of the business, and forcing one `Task` type to serve all of them is exactly how `src/shared/types.ts` happened.
+
+A **bounded context** is an area of the system with its own consistent vocabulary and its own model. The term comes from domain-driven design, and it maps naturally onto a frontend: each **feature** is a bounded context. Inside it, words mean one thing. At its edge, data from the outside (usually the API's wire format) gets translated into the feature's own model.
+
+```text
+src/features/
+├── board/        # "task" = a card: column, position, assignee avatar
+│   ├── model.ts      BoardCard, Column, moveCard()
+│   ├── components/
+│   └── index.ts      the feature's public API
+├── reporting/    # "task" = completed work: completedAt, cycle time
+│   ├── model.ts      CompletedWork, throughput()
+│   └── index.ts
+└── billing/      # "task" = a billable line: hours, rate, invoice
+    ├── model.ts      BillableLine
+    └── index.ts
+```
+
+Each context translates from the shared contract (the API's `TaskDto`) into what it actually needs, and nothing more:
+
+```ts
+// features/board/model.ts
+import type { TaskDto } from "@taskflow/contracts";
+
+export type BoardCard = {
+  id: TaskId;
+  title: string;
+  column: TaskDto["status"];
+  position: number;
+  avatarUrl: string | null;
+};
+
+export function toBoardCard(dto: TaskDto, position: number): BoardCard {
+  return { id: dto.id, title: dto.title, column: dto.status, position, avatarUrl: dto.assignee?.avatarUrl ?? null };
+}
+
+// features/reporting/model.ts
+export type CompletedWork = { taskId: TaskId; completedAt: Date; cycleTimeHours: number };
+
+export function toCompletedWork(dto: TaskDto): CompletedWork | null {
+  if (dto.status !== "done" || !dto.startedAt || !dto.completedAt) return null;
+  const hours = (Date.parse(dto.completedAt) - Date.parse(dto.startedAt)) / 3_600_000;
+  return { taskId: dto.id, completedAt: new Date(dto.completedAt), cycleTimeHours: hours };
+}
+```
+
+Now when Reporting needs a new field, it changes `CompletedWork` and its mapper. The Board team never hears about it. The translation function is a small cost that buys a large freedom.
+
+## 90.4 Ports and adapters for UI apps
+
+Your app talks to things it doesn't control: the HTTP API, `localStorage`, an analytics vendor, the clock. When components call those directly, every one of them is welded to a specific technology. Swapping analytics vendors becomes a 60-file change, and testing a component means mocking `fetch`.
+
+**Ports and adapters** (also called hexagonal architecture) fixes this with one move. A **port** is an interface your app defines, in your app's language, describing what it *needs*: "save a task", "track an event". An **adapter** is an implementation of that port for one specific technology: an HTTP adapter, an in-memory adapter for tests, a vendor adapter for production. The app depends on the port; adapters plug in at the edge.
+
+```ts
+// app/ports/analytics.ts: the port, in TaskFlow's own vocabulary
+export type AnalyticsEvent =
+  | { name: "task_created"; projectId: ProjectId }
+  | { name: "task_completed"; taskId: TaskId; cycleTimeHours: number }
+  | { name: "board_filtered"; filter: "mine" | "overdue" | "all" };
+
+export interface Analytics {
+  track(event: AnalyticsEvent): void;
+}
+
+// app/adapters/analytics.ts: one adapter per technology
+export function createHttpAnalytics(endpoint: string): Analytics {
+  return {
+    track(event) {
+      navigator.sendBeacon(endpoint, JSON.stringify({ ...event, at: Date.now() }));
+    },
+  };
+}
+
+export function createRecordingAnalytics(): Analytics & { events: AnalyticsEvent[] } {
+  const events: AnalyticsEvent[] = [];
+  return { events, track: (event) => void events.push(event) };
+}
+```
+
+The adapters meet in one place, the **composition root**: the spot near `main.tsx` where the app is assembled. React context hands the assembled services down the tree ([Chapter 54](/chapter/54)):
+
+```tsx
+export type Services = { tasks: TaskRepository; analytics: Analytics };
+
+const ServicesContext = createContext<Services | null>(null);
+
+export function ServicesProvider({ services, children }: { services: Services; children: React.ReactNode }) {
+  return <ServicesContext value={services}>{children}</ServicesContext>;
+}
+
+export function useServices(): Services {
+  const services = useContext(ServicesContext);
+  if (!services) throw new Error("useServices must be used inside <ServicesProvider>");
+  return services;
+}
+
+// main.tsx (production) vs. a test
+const prod: Services = { tasks: createHttpTaskRepository("/api"), analytics: createHttpAnalytics("/collect") };
+const test: Services = { tasks: createInMemoryTaskRepository(seed), analytics: createRecordingAnalytics() };
+```
+
+A component test can now render with `test` services and assert on `analytics.events` with no network mocking at all.
+
+> 🚫 **When not to.** Not every dependency deserves a port. Create one for things that are **external, slow, nondeterministic, or likely to be replaced**: network, storage, analytics, feature flags, time. Wrapping `Array.prototype.map` or your router in a port is ceremony with no payoff.
+
+## 90.5 State architecture at scale
+
+In a small app, "where does this state live?" has a short answer ([Chapter 60](/chapter/60)). At scale, the harder question is **who owns it**. When eight teams can all write to the same global store or the same query cache, you get the distributed version of the `shared/` folder: state that changes for reasons no single team understands.
+
+The rule that scales is **one owner per piece of state**. The owner is the feature (and team) that defines what the state means. Other features may *read* it through the owner's public hooks, and may *change* it only by calling the owner's commands. They never reach into the store or the cache directly.
+
+| Kind of state | Example | Lives in | Owned by |
+|---|---|---|---|
+| Server state | Projects, tasks | TanStack Query cache | The feature whose API it is |
+| URL state | Board filters, selected task | The router | The page's feature |
+| Global client state | Session, theme | A small store or context | Platform team |
+| Local UI state | Is this menu open? | `useState` in the component | The component |
+
+Here's what ownership looks like in code. The Projects feature owns the project cache, including its query keys, and exports hooks rather than keys:
+
+```ts
+// features/projects/queries.ts (internal to the Projects feature)
+const projectKeys = {
+  all: ["projects"] as const,
+  detail: (id: ProjectId) => ["projects", id] as const,
+};
+
+// features/projects/index.ts (the public API other features may use)
+export function useProject(id: ProjectId) {
+  const { projects } = useServices();
+  return useQuery({ queryKey: projectKeys.detail(id), queryFn: () => projects.get(id) });
+}
+
+export function useRenameProject() {
+  const { projects } = useServices();
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { id: ProjectId; name: string }) => projects.rename(input),
+    onSuccess: (_, { id }) => client.invalidateQueries({ queryKey: projectKeys.detail(id) }),
+  });
+}
+```
+
+```ts
+// features/board/ProjectHeader.tsx
+client.setQueryData(["projects", id], { ...project, name }); // ⚠️ reaching into another feature's cache
+const rename = useRenameProject();                           // ✅ asking the owner to do it
+```
+
+The first line compiles, works, and quietly couples Board to the shape of Projects' cache. When Projects changes its key structure, Board breaks with no type error. The second line goes through a typed public function that Projects is responsible for keeping working.
+
+## 90.6 Shared types vs coupling
+
+"Don't repeat yourself" is good advice inside one module and dangerous advice across boundaries. When two features share a type, they're **coupled**: a change for one is a change for both. That's correct when they really must change together, and a trap when they only *look* alike today.
+
+So the question isn't "are these the same shape?" but "**do they change for the same reasons?**" A good default for what to share:
+
+- ✅ **Wire contracts**: the DTOs and schemas that describe what the API sends ([Chapter 94](/chapter/94) puts them in a contracts package). They genuinely must agree.
+- ✅ **Domain primitives**: `TaskId`, `UserId`, `DueDate`, `Money`. They mean the same thing everywhere.
+- ✅ **Ports**: `Analytics`, `TaskRepository`.
+- 🚫 **View models and props**: `BoardCard`, `ReportRow`, component props. These belong to one feature.
+
+Here's the coupling trap in its most innocent-looking form:
+
+```ts
+// features/reporting/table.ts
+import type { BoardCard } from "@/features/board";
+
+// ❌ Reporting now depends on Board's view model.
+type ReportRow = Pick<BoardCard, "id" | "title" | "column"> & { cycleTimeHours: number };
+```
+
+It's only a `Pick`, but when Board renames `column` to `lane` for its new swimlane design, Reporting's build breaks over a change that has nothing to do with reporting. Derive from the shared contract instead, or simply write the type out:
+
+```ts
+import type { TaskDto } from "@taskflow/contracts";
+
+// ✅ Derived from the contract, which both features legitimately share.
+type ReportRow = Pick<TaskDto, "id" | "title" | "status"> & { cycleTimeHours: number };
+
+// ✅ Or deliberately duplicated. Four lines of "repetition" buy full independence.
+type ReportRow2 = { id: TaskId; title: string; status: TaskStatus; cycleTimeHours: number };
+```
+
+> 💡 **Tip.** Duplication you choose is cheap to remove later: when two copies turn out to change together, merge them. Coupling you didn't choose is expensive to remove: by the time you notice, a dozen files depend on it.
+
+## 90.7 Enforcing architecture
+
+An architecture that lives only in a wiki page lasts until the first deadline. Someone in a hurry imports `@/features/billing/internal/rates` because it's right there, the code review misses it, and the boundary is gone. Rules that matter must be **executable**: checked by a tool on every commit, so breaking them fails CI rather than relying on a reviewer's memory.
+
+You have three layers of enforcement, from lightest to strongest. **Lint rules** catch forbidden imports in the editor, as you type. ESLint's built-in `no-restricted-imports` handles the most common rule, "use a feature only through its public entry":
+
+```js
+// eslint.config.js (excerpt)
+{
+  files: ["src/**/*.{ts,tsx}"],
+  rules: {
+    "no-restricted-imports": ["error", {
+      patterns: [
+        { group: ["@/features/*/*"], message: "Import from the feature's public entry (@/features/<name>) instead." },
+        { group: ["@/app/*"], message: "Features and shared code must not depend on the app shell." },
+      ],
+    }],
+  },
+}
+```
+
+Inside a feature, code uses relative imports, so the rule only bites when one feature reaches into another's internals. For richer rules, `eslint-plugin-boundaries` lets you name element types (app, feature, shared) and declare which may import which.
+
+**Dependency-graph checks** look at the whole graph, which lint rules can't. `dependency-cruiser` can forbid cycles and express "features only talk through index files":
+
+```js
+// .dependency-cruiser.cjs
+module.exports = {
+  forbidden: [
+    { name: "no-circular", severity: "error", from: {}, to: { circular: true } },
+    {
+      name: "feature-isolation",
+      comment: "Another feature may be used only through its index.ts",
+      severity: "error",
+      from: { path: "^src/features/([^/]+)/" },
+      to: { path: "^src/features/", pathNot: ["^src/features/$1/", "^src/features/[^/]+/index\\.ts$"] },
+    },
+    { name: "shared-is-a-leaf", severity: "error", from: { path: "^src/shared/" }, to: { path: "^src/(features|app)/" } },
+  ],
+};
+```
+
+```sh
+$ npx depcruise src --config .dependency-cruiser.cjs
+  error no-circular: src/features/board/useMoveCard.ts →
+      src/features/projects/index.ts →
+      src/features/projects/useArchive.ts →
+      src/features/board/useMoveCard.ts
+
+✘ 1 dependency violations (1 errors, 0 warnings). 412 modules, 1288 dependencies cruised.
+```
+
+The strongest layer is **package boundaries**: turning a feature or shared module into a workspace package with an `exports` map, so a deep import doesn't even resolve. That's the subject of [Chapter 94](/chapter/94).
+
+## 90.8 Architecture decision records
+
+Two years from now, someone will look at your ports-and-adapters setup and ask, "Why on earth is analytics behind an interface?" If the answer lives only in the head of an engineer who left, the next team will either cargo-cult it or tear it out, and neither is a decision. An **architecture decision record (ADR)** is a short document that captures one significant decision: the context, the options, the choice, and its consequences. It records the *why*, which code can never show.
+
+ADRs are numbered, kept in the repository (commonly `docs/adr/`), and **immutable once accepted**. When you change your mind, you write a new ADR that *supersedes* the old one, so the history of your thinking stays intact. The classic format, from Michael Nygard, fits on one screen:
+
+```text
+docs/adr/0007-features-own-their-server-state.md
+
+# 7. Features own their server state; others use public hooks
+
+Status: Accepted (2026-09-14). Supersedes ADR 3.
+
+## Context
+Eight teams write to one TanStack Query cache. Board edits Projects' cache
+entries directly (setQueryData with hand-written keys). Two incidents in Q3
+were caused by key-shape changes that broke other teams without type errors.
+
+## Decision
+Each feature owns its query keys and keeps them private. Other features read
+through exported hooks (useProject) and write through exported mutations
+(useRenameProject). Enforced by no-restricted-imports and dependency-cruiser.
+
+## Options considered
+1. Shared global key registry: rejected; recreates the shared/ folder problem.
+2. One global store for all server data: rejected; ownership even less clear.
+
+## Consequences
++ Cache changes are local to the owning team.
++ Cross-feature writes are visible in code review (they're function calls).
+- Each feature needs a small public hooks module.
+- Existing direct cache writes (14 call sites) must be migrated.
+```
+
+Write an ADR when a decision is **hard to reverse, affects more than one team, or will surprise a future reader**. Don't write one for every library choice. If nobody would ever ask "why?", it doesn't need a record.
+
+## Common mistakes
+
+> ⚠️ **The ownerless shared folder.** `shared/`, `common/`, and `utils/` grow without limit because adding to them is free. Give shared code an owner, keep it free of feature knowledge, and make it a leaf in the dependency graph.
+
+> ⚠️ **Sharing view models across features.** A `Pick<BoardCard, …>` in Reporting couples two teams over a type neither of them thinks of as shared. Share contracts and domain primitives; let each feature own its own view types.
+
+> ⚠️ **Ports for everything.** Interfaces around pure functions, the router, or React itself add indirection and no flexibility. Port the things that are external, slow, nondeterministic, or likely to change.
+
+> ⚠️ **Writing to another feature's state.** `setQueryData` with another team's hand-written key compiles and works until their key shape changes. Go through the owner's exported commands.
+
+> ⚠️ **Rules that live only in a document.** If a boundary isn't checked by lint, a graph tool, or package exports, it will erode. Make the rule executable, then write the ADR that explains it.
+
+> ⚠️ **Editing old ADRs.** Rewriting an accepted ADR destroys the record of *why* you once decided differently. Supersede it with a new one.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** several teams work in one codebase, when the code is expected to live for years, or when you keep having the "who owns this?" conversation. Domain types and state machines pay off at any size; bounded contexts, ports, ownership rules, and enforcement pay off as team count and lifetime grow.
+
+> 🚫 **When not to.** A two-person app with a six-month lifetime doesn't need bounded contexts, a composition root, or a dependency-cruiser config. Use folders by feature ([Chapter 58](/chapter/58)) and good domain types, and add the heavier machinery when the pain from 90.1 actually shows up. Architecture added before the problem exists is just complexity.
+
+## How it connects
+
+> 🔗 **Connection.** This chapter scales up [Chapter 58](/chapter/58) (feature-based app architecture) and [Chapter 60](/chapter/60) (where state lives). The domain toolkit comes from [Chapter 13](/chapter/13) (unions), [Chapter 55](/chapter/55) (state machines), and [Chapter 78](/chapter/78) (branded types). Ports mirror the server-side layers of [Chapter 31](/chapter/31) and [Chapter 33](/chapter/33). Next, [Chapter 91](/chapter/91) designs the types at each boundary as public APIs, and [Chapter 94](/chapter/94) turns boundaries into packages that tools enforce.
+
+> 🌍 **Real world.** Large frontend organizations converge on the same shape: feature folders or packages with public entry points, a thin shared layer with a named owner, lint and graph rules in CI, and a `docs/adr/` folder. Tools like Nx and Turborepo's boundary checks, `eslint-plugin-boundaries`, and `dependency-cruiser` exist because hand-maintained rules didn't survive.
+
+## Exercises
+
+### Level 1 — Recall
+
+Open your TaskFlow Web code from [P14](/projects/p14) and list every **port** (an interface the app depends on) and every **adapter** (a concrete implementation of one) you can find. For each external dependency that *isn't* behind a port (direct `fetch`, `localStorage`, `Date.now()`, analytics calls), note the files that use it directly and say whether it deserves a port, using the four criteria from 90.4.
+
+### Level 2 — Application
+
+TaskFlow Web reads and writes `localStorage` directly in several places (saved filters, the last-opened project, dismissed banners). Define a typed `Storage` port in TaskFlow's vocabulary, so callers ask for "saved filters" rather than a string key and get typed values back. Then write two adapters: one backed by `localStorage` (which must validate what it reads, because stored data is a boundary), and one in-memory adapter for tests. Replace every direct `localStorage` call and write one component test that uses the in-memory adapter.
+
+### Level 3 — Challenge
+
+Generate TaskFlow Web's module dependency graph with `dependency-cruiser` (or draw it by hand from the imports). Find at least one **cycle** between features. Remove it without merging the two features, and add a `no-circular` rule to CI so it can't come back.
+
+*Hint: cycles between features usually mean some logic belongs to neither of them. Ask which feature should own it, or whether it's a domain function that belongs below both.*
+
+### Level 4 — Real-world
+
+**Ticket ARCH-12: Record the capstone's riskiest decisions.** Before building more of your capstone ([Chapter 98](/chapter/98)), capture the three decisions that would be most expensive to reverse.
+
+- Three ADRs in `docs/adr/`, each with Status, Context, Decision, Options considered, and Consequences (including the negative ones).
+- Each ADR names how the decision is enforced or verified (a lint rule, a test, a package boundary), or explains why it can't be.
+- A teammate (or a future you, one week later) can read each ADR in under three minutes and explain the decision back.
+
+## Key takeaways
+
+- Architecture is the set of decisions that are expensive to change. At scale, its job is to keep the cost of change **local** to one team.
+- Model the domain with entities, value objects, branded IDs, and state machines, so illegal states can't be written down.
+- Treat features as **bounded contexts** with their own vocabulary, and translate from the shared contract at each feature's edge.
+- **Ports** are interfaces in your app's language; **adapters** implement them for one technology. Port what's external, slow, nondeterministic, or replaceable.
+- Every piece of state has **one owner**. Others read through public hooks and write through the owner's commands.
+- Share contracts and domain primitives; duplicate view types deliberately. Ask "do these change for the same reasons?"
+- Make rules executable with lint, graph checks, and package boundaries, and record the *why* in ADRs.
+
+## What comes next
+
+Every boundary you drew in this chapter has a type on it: a port interface, a feature's public hooks, a contract DTO. Those types are now **promises** to other teams, and changing them has consequences you can't see from your own code. How do you design types that others can depend on for years, and change them without breaking anyone? That's [Chapter 91: Designing Reusable Types & Public APIs](/chapter/91).

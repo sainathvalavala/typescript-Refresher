@@ -1,0 +1,424 @@
+> 📖 **The problem.** On Friday afternoon a TaskFlow release goes out, and by Friday evening the board page shows a white screen for everyone. The cause: a function was renamed, and one caller was missed. TypeScript would have flagged it instantly, **but nobody ran it**. The developer's laptop had the editor open with the error underlined, and Vite's dev server and production build happily compiled the file anyway (as [Chapter 70](/chapter/70) explained, bundlers strip types without checking them). The reviewer saw only the diff. There was no automated gate, so the "type-check" existed only as a habit, and habits skip Fridays.
+
+Every practice in this part of the book (type safety, tests, accessibility, security, performance) is only real if something checks it **every time**, for **every change**, whoever makes it. That something is the **CI/CD pipeline**. This chapter builds one for TaskFlow Web with GitHub Actions, makes it fast, wires it to preview deployments and required checks, and then looks at the slower disease: codebases that rot over months. You'll finish with a production checklist that ties the whole of Part XII together.
+
+> 🧠 **Mental model.** **CI is the team's shared memory of "what must always be true".** If it isn't checked automatically, it isn't guaranteed. Each rule you care about becomes a step that can fail a pull request.
+
+## 76.1 A CI pipeline for TypeScript + React
+
+**Continuous integration (CI)** means that every change is automatically built and verified on a clean machine before it joins the main branch. A pipeline is an ordered list of **steps**, and the order is a design decision: put the **cheapest, fastest, most-likely-to-fail** checks first, so a typo costs thirty seconds of feedback instead of ten minutes.
+
+The standard order for a TypeScript and React app:
+
+1. **Install** the exact locked dependencies (`npm ci`).
+2. **Type-check** (`tsc --noEmit`): the step the bundler doesn't do.
+3. **Lint**: catches bugs and rule violations (including accessibility rules, [Chapter 73](/chapter/73)).
+4. **Unit and component tests**.
+5. **Build**: proves the production bundle compiles, and gives you the artifact (and size budgets from [Chapter 72](/chapter/72)).
+6. **End-to-end (E2E) tests** against the built app: slowest, so last.
+
+Here is the workflow, as a GitHub Actions file at `.github/workflows/ci.yml`:
+
+```yaml
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:                       # a new push cancels the older run for the same branch
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck     # tsc --noEmit
+      - run: npm run lint -- --max-warnings 0
+      - run: npm test -- --run
+      - run: npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+  e2e:
+    needs: verify                  # only runs if verify passed
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run build
+      - run: npx playwright test
+```
+
+Three details deserve attention. `npm ci` (not `npm install`) guarantees the lockfile is respected. `--max-warnings 0` makes lint warnings fail the build, otherwise warnings pile up unread. And the scripts the workflow calls live in `package.json`, so the same commands run on your laptop and in CI:
+
+```json
+{
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest",
+    "build": "vite build",
+    "e2e": "playwright test"
+  }
+}
+```
+
+> 💡 **Tip.** Run the CI sequence locally before pushing with one script (`npm run typecheck && npm run lint && npm test -- --run && npm run build`). "Works on my machine" then means "passes the same gates".
+
+## 76.2 Speed and caching
+
+A slow pipeline gets bypassed: people stop waiting for it, batch up changes, and merge on red "because it's flaky". Treat CI time like a user-facing performance budget: **under ten minutes** for a pull request is a good target. Four levers do most of the work.
+
+**Cache dependencies.** `setup-node` with `cache: npm` stores the npm download cache keyed on the lockfile, so `npm ci` reinstalls from disk, not the network. Also cache what's expensive to rebuild: the Playwright browser download, and the TypeScript incremental build info.
+
+```yaml
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+```
+
+**Parallelize.** Independent checks don't need to wait for each other. Split type-check, lint, and tests into separate jobs, so wall-clock time is the *slowest* job rather than the sum. Shard long test suites across machines with `matrix`:
+
+```yaml
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version-file: .nvmrc, cache: npm }
+      - run: npm ci
+      - run: npx vitest --run --shard=${{ matrix.shard }}/3
+```
+
+**Do less.** Cancel superseded runs (the `concurrency` block above). Skip work that cannot be affected, using path filters (`on.pull_request.paths`) for docs-only changes, or build tools that only rebuild what changed (Turborepo and Nx do this in monorepos).
+
+**Use the cheap tools.** `tsc --incremental` reuses earlier results; Vitest runs in parallel by default; and an ESLint cache (`--cache`) skips unchanged files. Measure first: the job summary shows time per step, and the slowest step is the one to attack.
+
+> ⚠️ **Common mistake.** Caching `node_modules` directly, so a stale cache silently masks lockfile changes. Cache the package-manager download cache and always run `npm ci`.
+
+## 76.3 Preview deployments and required checks
+
+Checks that run are useful. Checks that **can't be skipped** are a policy. In GitHub, **branch protection** (or rulesets) on `main` can require that named checks pass, that the branch is up to date, and that at least one reviewer approves, before the merge button works. Without it, "CI is red" is advice. With it, it's a wall.
+
+```text
+Settings → Branches → Branch protection rule for "main"
+  ✔ Require a pull request before merging (1 approval)
+  ✔ Require status checks to pass: verify, e2e
+  ✔ Require branches to be up to date before merging
+  ✔ Do not allow bypassing the above settings
+```
+
+**Preview deployments** give every pull request its own temporary URL, built from that branch, such as `pr-482.taskflow-preview.example`. Hosts like Vercel, Netlify, and Cloudflare Pages create them automatically; you can also script them. A preview lets reviewers and designers *use* the change instead of imagining it from a diff, lets E2E tests run against something real, and lets you check the build on a phone.
+
+```yaml
+  preview:
+    needs: verify
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write          # to comment the URL on the PR
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: dist, path: dist }
+      - run: ./scripts/deploy-preview.sh "pr-${{ github.event.number }}"
+        env:
+          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}   # a CI secret: never in the bundle (Chapter 74)
+```
+
+> 🚫 **When not to.** Don't give preview environments access to production data or production secrets. Point them at a staging backend with fake data, and treat the preview URL as public.
+
+Two cautions. **Secrets** (`secrets.*`) are not available to workflows triggered by pull requests from forks, which is a deliberate protection, so decide how outside contributors' PRs get previewed. And a required check must have a **stable name**: if you rename a job, branch protection waits forever for the old name.
+
+## 76.4 Continuous delivery
+
+**Continuous delivery (CD)** extends the pipeline past "tests passed" to "the change is live (or one click from live)". The core ideas:
+
+- **Build once, promote the same artifact.** The `dist` folder that passed E2E on staging is the one that goes to production, not a new build that merely *should* be identical.
+- **Environments.** A typical chain is *preview → staging → production*. Each has its own configuration and its own secrets. Keep configuration **out of the code** so one build can run in any of them.
+- **Gates.** Staging deploys automatically on every merge to `main`; production may need a manual approval, a time window, or a passing smoke test.
+- **Fast rollback.** The most important property of a delivery system is how quickly you can **undo**. Keep the last several builds deployable, so rolling back means redeploying the previous artifact (minutes), not reverting code and rebuilding.
+
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy
+on:
+  workflow_run:                              # runs after CI finishes on main
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+jobs:
+  staging:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - run: ./scripts/deploy.sh staging
+
+  production:
+    needs: staging
+    runs-on: ubuntu-latest
+    environment: production                  # configured with required reviewers: waits for approval
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - run: ./scripts/deploy.sh production
+```
+
+The `environment:` key is what attaches approvals and per-environment secrets. Pair deploys with the tools from [Chapter 75](/chapter/75): tag the release in your error tracker, and watch error and vitals dashboards for a few minutes after each rollout. When a new feature is risky, ship it behind a **feature flag** ([Chapter 75](/chapter/75)) so that "rollback" can be "turn it off" without a deploy at all.
+
+## 76.5 Dependency updates
+
+Dependencies age. Left alone, a project falls behind until upgrading is a frightening, multi-week project, and a security fix can't be applied because the patched version needs three major upgrades first. The cure is small, frequent updates, automated.
+
+**Dependabot** (built into GitHub) and **Renovate** open pull requests when new versions appear. CI then does its job: if the update's types or behavior break something, the PR is red, and you see exactly what to fix.
+
+```yaml
+# .github/dependabot.yml
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 5
+    groups:
+      react:
+        patterns: ["react", "react-dom", "@types/react", "@types/react-dom"]
+      testing:
+        patterns: ["vitest", "@testing-library/*", "jsdom"]
+```
+
+**Grouping** related packages (React and its types, the test stack) into one PR avoids half-upgraded combinations that can't type-check. Auto-merge only **patch** updates that pass CI, and review minors and majors.
+
+Upgrades that **break types** deserve a plan, because the code still runs while the compiler objects:
+
+- Read the changelog for "breaking" and "types" entries before upgrading.
+- Upgrade the library and its `@types/*` package together, in their own PR.
+- Let the compiler produce the to-do list: run `tsc --noEmit` and fix errors by category.
+- For a large migration, use a **codemod** (an automated code rewriter) if the library provides one.
+- Don't bundle a major upgrade with feature work. If it goes badly, you want to revert only the upgrade.
+
+> 💡 **Tip.** TypeScript itself is a dependency with type-breaking releases (stricter checks, changed inference). Upgrading it monthly in a dedicated PR keeps each step small, and the compiler's new errors usually point at real latent bugs.
+
+## 76.6 Maintainability practices
+
+Most codebases don't fail in a dramatic crash. They rot: one `any` here, one `@ts-ignore` there, unused files nobody dares delete, and rules that were "temporarily" turned off. Maintainability practices are small automatic forces pushing the other way.
+
+**Strictness ratchets.** A **ratchet** is a mechanism that lets quality improve but never get worse. You can't fix 400 type errors at once, but you can forbid adding the 401st. Enable strict flags one at a time ([Chapter 26](/chapter/26)), and put a counter in CI that fails if a "bad thing" count goes **up**:
+
+```ts
+// scripts/ratchet.ts: run in CI
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import { join } from "node:path";
+
+const BASELINE = { "@ts-ignore": 12, "as any": 31 }; // lower these as you pay debt down; never raise them
+
+function* sourceFiles(dir: string): Generator<string> {
+  for (const name of readdirSync(dir)) {
+    const path = join(dir, name);
+    if (statSync(path).isDirectory()) yield* sourceFiles(path);
+    else if (/\.(ts|tsx)$/.test(name)) yield path;
+  }
+}
+
+const counts: Record<string, number> = { "@ts-ignore": 0, "as any": 0 };
+for (const file of sourceFiles("src")) {
+  const text = readFileSync(file, "utf8");
+  for (const key of Object.keys(counts)) counts[key] += text.split(key).length - 1;
+}
+
+let failed = false;
+for (const [key, max] of Object.entries(BASELINE)) {
+  if (counts[key] > max) {
+    console.error(`❌ "${key}" count rose to ${counts[key]} (baseline ${max})`);
+    failed = true;
+  }
+}
+process.exit(failed ? 1 : 0);
+```
+
+The same idea works for ESLint (`--max-warnings` set to the current count) and for type coverage (`npx type-coverage --at-least 97` fails when the share of non-`any` identifiers drops below the bar).
+
+**Dead-code detection.** Unused exports, files, and dependencies make every search and every refactor harder, and unused dependencies are also attack surface ([Chapter 74](/chapter/74)). **Knip** finds unused files, exports, and `package.json` dependencies; run it in CI so dead code can't accumulate:
+
+```sh
+npx knip                      # report unused files, exports, and dependencies
+npx type-coverage --at-least 97
+```
+
+**Other cheap habits.** Keep functions and files small enough to understand; prefer deleting code to commenting it out; use `@ts-expect-error` (which *fails* when the error goes away) rather than `@ts-ignore`; and keep one formatter and one lint config, run automatically on commit and in CI.
+
+> 🚫 **When not to.** Don't ratchet things you can't measure meaningfully, and don't chase 100% of any metric. A 100% type-coverage mandate leads to contortions around legitimately dynamic code. The goal is a **direction**, not a number.
+
+## 76.7 Documentation that stays current
+
+Documentation rots faster than code, because nothing fails when it's wrong. Two rules keep it alive: keep it **close to the code**, and document **decisions**, not just descriptions.
+
+The **README** is the front door. It should let a new developer go from clone to running app in minutes, and contain only what stays true: how to install and run, the scripts (`typecheck`, `test`, `build`), the environment variables (with a `.env.example`), the folder structure in one paragraph, and links to deeper docs. Even better, **make the README executable**: if the setup steps are a script, CI proves they work.
+
+An **architecture decision record (ADR)** is a short document that captures *one* decision: the context, what was chosen, what was rejected, and the consequences. Code shows what was built; ADRs explain *why*, which is the first thing that is forgotten and the most expensive to rediscover. They live in the repository (`docs/adr/0007-use-tanstack-query.md`), are numbered, and are never rewritten: a changed decision becomes a new ADR that supersedes the old one.
+
+```text
+# ADR 0007: Use TanStack Query for server state
+
+Status: Accepted (2026-03-14)
+
+## Context
+Components fetch with useEffect and hand-rolled loading flags. We have duplicated
+requests, stale data after mutations, and inconsistent error handling.
+
+## Decision
+Use TanStack Query for all server state. Local UI state stays in useState/useReducer.
+
+## Alternatives considered
+- Keep useEffect + custom hooks: no caching, repeats the same bugs.
+- Redux Toolkit Query: heavier, and we do not otherwise use Redux.
+
+## Consequences
++ Caching, deduplication, and retries for free.
+- A new dependency and a new mental model for the team.
+- Tests must wrap components in a QueryClientProvider.
+```
+
+Write an ADR when a decision is hard to reverse, was debated, or would make a newcomer ask "why did they do it this way?". Link to them from pull requests. Also keep a short **CONTRIBUTING** guide (how to branch, test, and open a PR) and a **CHANGELOG** generated from commits or PR titles, so release notes aren't written from memory.
+
+## 76.8 The production checklist
+
+Part XII has covered a lot of ground. Here it is as a single list you can run against any app before launch, and again every quarter. Each item points to the chapter that explains it.
+
+```text
+Build and delivery
+[ ] Production build is minified, tree-shaken, and has size budgets in CI        (Ch 70, 72)
+[ ] Routes are code-split; heavy libraries load lazily                           (Ch 70)
+[ ] Pipeline: install, typecheck, lint, test, build, E2E; required on main       (Ch 76)
+[ ] Preview deploys per PR; build once and promote; rollback tested              (Ch 76)
+
+Resilience
+[ ] Error boundaries at app, route, and widget level with a recovery action      (Ch 71)
+[ ] Network failures and empty/loading/error states designed for every list      (Ch 71)
+
+Performance
+[ ] Profiled the slowest interactions; no unnecessary re-render storms           (Ch 72)
+[ ] Long lists virtualized; heavy updates use transitions                        (Ch 72)
+[ ] Core Web Vitals measured in the field, with alerts                           (Ch 75)
+
+Accessibility
+[ ] Semantic HTML; everything works with a keyboard; visible focus               (Ch 73)
+[ ] Focus managed in dialogs, route changes, deletions; forms labeled            (Ch 73)
+[ ] jsx-a11y lint + axe in CI; a manual screen-reader pass done                  (Ch 73)
+
+Security
+[ ] No unsanitized HTML; hrefs allowlisted with safeHref                         (Ch 74)
+[ ] Session in an HttpOnly, Secure, SameSite cookie; CSRF handled                (Ch 74)
+[ ] No secrets in VITE_ variables or the repo; lockfile + npm audit in CI        (Ch 74)
+[ ] CSP deployed (report-only first); server validates and authorizes            (Ch 74, 65)
+
+Observability
+[ ] Errors reported with release, route, and readable (hidden) source maps       (Ch 75)
+[ ] Typed analytics catalog; no personal data in logs or events                  (Ch 75)
+[ ] Typed flags with safe defaults; consent gate in one place                    (Ch 75)
+
+Maintainability
+[ ] Strict mode on; ratchets in CI for any, ts-ignore, and lint warnings         (Ch 76)
+[ ] Dependency update PRs automated; dead-code check; ADRs for big decisions     (Ch 76)
+```
+
+A checklist is only useful if it's **used**: make it a pull-request template for release PRs, review it quarterly, and add to it whenever an incident teaches you something new.
+
+## Common mistakes
+
+> ⚠️ **A type-check that only runs on laptops.** The bundler doesn't type-check; CI must run `tsc --noEmit` on every PR.
+
+> ⚠️ **Optional checks.** If a failing check doesn't block the merge, people learn to ignore it. Make the important ones required.
+
+> ⚠️ **Flaky tests tolerated with retries.** A test that fails randomly trains the team to click "re-run". Quarantine and fix it.
+
+> ⚠️ **Rebuilding for each environment.** Build once, then promote the same artifact, with config supplied per environment.
+
+> ⚠️ **Letting dependency updates pile up**, then facing a ten-major-versions-behind upgrade during a security incident.
+
+> ⚠️ **Secrets in workflow logs or in the build output.** CI secrets are for the pipeline only ([Chapter 74](/chapter/74)).
+
+## When to use it, and when not to
+
+> ✅ **Use it when** more than one person touches the code, or the app has real users. A basic pipeline (typecheck, lint, test, build) takes an hour to set up and pays back the first time it blocks a bad merge.
+
+> 🚫 **When not to.** Don't over-engineer a pipeline for a prototype: three steps are plenty. Don't add every check at once, since a wall of failures on day one teaches people to disable it. Add checks gradually (ratchet style), and keep total runtime short enough that people wait for it.
+
+## How it connects
+
+> 🔗 **Connection.** The pipeline is where every earlier chapter becomes enforceable: type safety ([Chapter 26](/chapter/26), [Chapter 66](/chapter/66)), tests ([Chapter 67](/chapter/67), [Chapter 68](/chapter/68), [Chapter 69](/chapter/69)), performance budgets ([Chapter 72](/chapter/72)), accessibility ([Chapter 73](/chapter/73)), security audits ([Chapter 74](/chapter/74)), and release tracking ([Chapter 75](/chapter/75)). [P17](/projects/p17) is where you'll apply the full checklist.
+
+> 🌍 **Real world.** Mature teams treat the pipeline as a product: they track CI duration and flaky-test rate like any other metric, and give someone ownership of keeping it fast. Open-source projects often publish their workflows, which are excellent models to copy.
+
+## Exercises
+
+### Level 1 — Recall
+
+Put these steps in the best order and justify each position in a sentence: build, E2E tests, install, unit tests, lint, type-check, deploy to production.
+
+### Level 2 — Application
+
+Write a GitHub Actions workflow for TaskFlow Web that runs on pull requests and pushes to `main`, caches dependencies, and runs type-check, lint (zero warnings), tests, and build. Add a `concurrency` block so superseded runs are cancelled.
+
+### Level 3 — Challenge
+
+Cut your pipeline's wall-clock time in half. Record a baseline from the job summary, then apply caching, splitting independent checks into parallel jobs, and test sharding. Report the before and after numbers, and which change helped most.
+
+*Hint: the slowest single job determines the total once things run in parallel.*
+
+### Level 4 — Real-world
+
+**Ticket TF-455: Production readiness review for the P17 dashboard.** Leadership wants a launch go or no-go.
+
+- Run the production checklist in 76.8 against [P17](/projects/p17), marking each item pass, fail, or not applicable, with evidence.
+- Fix every failing item that blocks launch, and file tickets for the rest with owners.
+- Add a ratchet script and a dead-code check to CI, and write one ADR for the most debatable decision you find.
+- Present the results: what was fixed, what remains, and your recommendation.
+
+## Key takeaways
+
+- A bundler doesn't type-check. CI is where `tsc --noEmit` must run, for every change.
+- Order steps cheapest and fastest first: install, type-check, lint, test, build, E2E.
+- Keep CI under about ten minutes with caching, parallel jobs, sharding, and cancelling superseded runs.
+- Required checks and preview deployments turn "advice" into policy and make review concrete.
+- Build once, promote the same artifact through environments, and keep rollback fast.
+- Update dependencies in small automated steps, and give type-breaking upgrades their own PR.
+- Ratchets, dead-code detection, and ADRs stop slow rot: the aim is a direction, not a number.
+- The production checklist ties Part XII together, and it only helps if you actually run it.
+
+## What comes next
+
+With the pipeline in place, you've finished Part XII: a React and TypeScript app that is fast, resilient, accessible, secure, observable, and maintainable. In [P17](/projects/p17) you'll put it all into one production-grade dashboard. After that, [Part XIII](/part/xiii) turns back to the type system itself, starting with the mechanics of [variance and soundness](/chapter/77).

@@ -1,0 +1,381 @@
+> 📖 **The problem.** The TaskFlow task list feels sluggish with a few thousand rows. Someone wraps `TaskRow` in `memo` so unchanged rows can skip rendering. Nothing improves. The profiler shows every row still re-rendering on every keystroke in the search box. The `memo` is doing its job: its props really are "the same" in every way a human would notice. But one of them, `onSelect`, is a *new function* on every render of the parent, and to React a new function is a changed prop.
+
+Performance advice in React is full of folklore: wrap everything in `useCallback`, memoize every object, `memo` every component. Most of it is wrong in the "everything" direction, and the rest is right only in specific, *measurable* situations. This chapter replaces folklore with a mechanism. Once you understand **referential identity** (what React actually compares) you can predict which components re-render, explain why `memo` sometimes seems to do nothing, and decide when memoization pays for its own complexity (usually: not yet).
+
+> 🧠 **Mental model.** *Every render creates new objects and functions.* Memoization keeps the previous one when its inputs haven't changed, trading a little memory and a lot of complexity for skipped work. It's an optimization with a price, and it's applied to a measured bottleneck, not as a habit.
+
+## 47.1 Referential identity
+
+JavaScript compares primitives by **value** and objects, arrays, and functions by **identity**: whether they're the very same object in memory.
+
+```ts
+"a" === "a";            // true: same value
+42 === 42;              // true
+{} === {};              // false: two different objects that happen to look alike
+[1, 2] === [1, 2];      // false
+(() => 1) === (() => 1); // false: two separate function objects
+
+const a = { id: 1 };
+const b = a;
+a === b;                // true: the very same object
+```
+
+React compares props and dependency lists with **`Object.is`**, which behaves like `===` for these purposes. Now recall that a component is a function that runs on **every render** ([Chapter 37](/chapter/37)). Anything created inside it is created *again* each time:
+
+```tsx
+function TaskBoard({ tasks }: { tasks: Task[] }) {
+  const options = { showDone: true };              // a new object every render
+  const handleSelect = (id: string) => select(id); // a new function every render
+  const sorted = [...tasks].sort(byDueDate);       // a new array every render
+  // …
+}
+```
+
+Between two renders, `options` has the same *contents* but a different *identity*. If it's passed to a child or used as a dependency, React sees "changed". The values didn't change, but the identities did, and identity is all `Object.is` can see.
+
+```tsx
+// Render 1:  options = { showDone: true }   (object A)
+// Render 2:  options = { showDone: true }   (object B)
+Object.is(A, B); // false: "the prop changed"
+```
+
+Everything in this chapter is a consequence of that one fact. Memoization is the set of tools for *keeping the same identity* across renders when nothing relevant changed.
+
+## 47.2 When re-renders are a problem
+
+Before any tool, calibrate: **re-rendering is not slow by default.** When a component's state changes, React re-renders it *and all of its children* (whether or not their props changed), compares the results, and touches the DOM only where something differs. For typical components this takes a fraction of a millisecond.
+
+```tsx
+function Parent() {
+  const [count, setCount] = useState(0);
+  return (
+    <>
+      <button onClick={() => setCount(count + 1)}>{count}</button>
+      <Child />   {/* Child re-renders every click, even though it has no props */}
+    </>
+  );
+}
+
+function Child() {
+  console.log("Child rendered"); // logs on every click of the parent's button
+  return <p>I never change.</p>;
+}
+```
+
+This looks wasteful, and for a `<p>` it's irrelevant. A re-render becomes a *problem* only when it's **expensive** (a heavy calculation, thousands of elements) and **frequent** (every keystroke), so users can feel it: typing lags, scrolling stutters, a click takes visible time to respond.
+
+How do you know? **Measure.** React DevTools' *Profiler* records a session and shows which components rendered, why, and how long each took. The browser's Performance tab shows whether rendering is the bottleneck or something else (a slow network, a heavy layout, a big image).
+
+```text
+Profiler session: typing "report" in the search box (5,000 tasks)
+  TaskList     12.4 ms
+    TaskRow ×5000   (each 0.002 ms, total ~10 ms)    <- all re-rendered, none changed
+```
+
+The question "is it slow enough to fix?" has a data-driven answer. If the whole interaction is under a frame (about 16 ms), leave it alone. If it isn't, you have a specific target.
+
+> ⚠️ **Common mistake.** Memoizing "to be safe" before measuring. You pay the complexity cost everywhere and the benefit nowhere.
+
+## 47.3 memo
+
+`memo` wraps a component so React can **skip re-rendering it** when its props are equal to the previous render's props. Equality is checked *shallowly*: each prop is compared with `Object.is`.
+
+```tsx
+import { memo } from "react";
+
+interface TaskRowProps {
+  task: Task;
+  onSelect: (id: string) => void;
+}
+
+const TaskRow = memo(function TaskRow({ task, onSelect }: TaskRowProps) {
+  console.log("render", task.id);
+  return <li onClick={() => onSelect(task.id)}>{task.title}</li>;
+});
+```
+
+Now, when the parent re-renders and passes the *same* `task` object and the *same* `onSelect` function, `TaskRow` doesn't run. Here is the opening problem:
+
+```tsx
+function TaskList({ tasks }: { tasks: Task[] }) {
+  const [query, setQuery] = useState("");
+
+  return (
+    <>
+      <input value={query} onChange={(e) => setQuery(e.target.value)} />
+      {tasks.map((t) => (
+        <TaskRow
+          key={t.id}
+          task={t}                          // ✅ same object every render: tasks didn't change
+          onSelect={(id) => select(id)}     // ❌ a new function every render: memo can never skip
+        />
+      ))}
+    </>
+  );
+}
+```
+
+Each keystroke re-renders `TaskList`, which creates a fresh arrow function per row. `Object.is(oldFn, newFn)` is `false`, so every `TaskRow` re-renders, and the `memo` wrapper only added a comparison cost. The next two sections are the fix: make the props *actually stable*.
+
+> 🧠 **Mental model.** `memo` is a bouncer comparing the guest list from last time. If even one prop is a "new person" (a new identity), the child gets in, regardless of whether it looks identical.
+
+## 47.4 useMemo
+
+`useMemo` caches the **result of a calculation** between renders, and recomputes it only when its dependencies change. It serves two distinct purposes.
+
+**Purpose 1: skip an expensive computation.** Filtering and sorting thousands of items on every render, including renders caused by something unrelated:
+
+```tsx
+function TaskList({ tasks, query }: { tasks: Task[]; query: string }) {
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+
+  const visible = useMemo(
+    () => tasks.filter((t) => t.title.toLowerCase().includes(query.toLowerCase())).sort(byDueDate),
+    [tasks, query],              // recompute only when these change
+  );
+  // Clicking a row changes `selectedId` and re-renders, but `visible` is reused.
+  /* … */
+}
+```
+
+**Purpose 2: keep an object or array's identity stable**, when its identity matters to a memoized child or a dependency list:
+
+```tsx
+const sortOrder = useMemo(() => ({ field: "dueDate", direction: "asc" }) as const, []); // same object forever
+return <MemoizedTable rows={rows} sortOrder={sortOrder} />;   // memo can now skip when rows is unchanged
+```
+
+The array is the **dependency list**: React re-runs the function when any dependency differs (by `Object.is`) from last time. The types come out of the function: `visible` is `Task[]` with no annotation, and the dependency array is *not* type-checked, so a forgotten dependency is a silent bug that the lint rule `react-hooks/exhaustive-deps` is there to catch ([Chapter 43](/chapter/43)).
+
+```tsx
+const visible = useMemo(() => tasks.filter((t) => t.done), []);
+//                                 ^^^^^ ⚠️ lint: React Hook useMemo has a missing dependency: 'tasks'.
+// `visible` is stale forever: it never reflects later changes to `tasks`.
+```
+
+> ⚠️ **Common mistake.** Memoizing a cheap computation. `useMemo(() => a + b, [a, b])` costs more (storing the value, comparing the dependencies) than the addition. Reach for it when the calculation is *measurably* expensive, or when identity is the point.
+
+## 47.5 useCallback
+
+`useCallback` is `useMemo` for functions: it returns the **same function object** across renders as long as its dependencies are unchanged. That's exactly what the opening problem needs:
+
+```tsx
+function TaskList({ tasks }: { tasks: Task[] }) {
+  const [query, setQuery] = useState("");
+
+  const handleSelect = useCallback((id: string) => {
+    select(id);
+  }, []);                                 // no dependencies: one function for the component's whole life
+
+  return (
+    <>
+      <input value={query} onChange={(e) => setQuery(e.target.value)} />
+      {tasks.map((t) => <TaskRow key={t.id} task={t} onSelect={handleSelect} />)}
+    </>
+  );
+}
+```
+
+Now typing in the search box re-renders `TaskList`, but each `memo`'d `TaskRow` sees identical `task` and `onSelect` and **skips**. The two tools work as a pair: `memo` on the child (the thing that checks), and `useCallback` or `useMemo` on the props (the things being checked). Either one alone does nothing.
+
+The classic trap is a stale value captured in the function. A `useCallback` with the wrong dependencies closes over old state ([Chapter 41](/chapter/41)'s snapshots, again). Where you can, use the **updater form** of a setter, so the function needs no dependency on the state:
+
+```tsx
+const toggle = useCallback((id: string) => {
+  setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, done: !t.done } : t))); // ✅ no `tasks` dependency
+}, []);
+
+const toggleBad = useCallback((id: string) => {
+  setTasks(tasks.map((t) => (t.id === id ? { ...t, done: !t.done } : t)));          // ❌ captures `tasks` from the first render
+}, []);                                                                              // stale: later toggles overwrite earlier ones
+```
+
+Typing is straightforward: parameters need annotations, since there's no context to infer them from, and the return type is inferred.
+
+```tsx
+const handleSelect = useCallback((id: string) => select(id), []); // (id: string) => void
+const handleBad = useCallback((id) => select(id), []);            // ❌ Parameter 'id' implicitly has an 'any' type.
+```
+
+Identity matters beyond `memo`, too: a function or object in an **effect's dependency array** that changes every render makes the effect re-run on every render ([Chapter 44](/chapter/44)). Stabilizing that dependency is a legitimate reason to use `useCallback` even with no `memo` in sight.
+
+## 47.6 The cost of memoization
+
+Memoization isn't free, and its costs are paid by *you* more than by the computer:
+
+**Complexity.** Every `useMemo` and `useCallback` adds a dependency array to get right and to keep right through refactors. Code gets harder to read, and the original logic is buried:
+
+```tsx
+// Before: obvious
+const visible = tasks.filter((t) => t.done === showDone);
+
+// After: the same logic, plus a maintenance burden
+const visible = useMemo(() => tasks.filter((t) => t.done === showDone), [tasks, showDone]);
+```
+
+**Dependency bugs.** A missing dependency gives a stale value (a bug that only appears after some sequence of events). An *unstable* dependency (an object created inline) makes the memoization useless without any warning:
+
+```tsx
+const config = { showDone };                          // new object every render
+const visible = useMemo(() => filter(tasks, config), [tasks, config]);
+// ❌ `config` changes every render, so this recomputes every render: all cost, no benefit.
+```
+
+**Wasted comparisons.** `memo` compares every prop on every render. If the props nearly always change (a `Clock` receiving the current time), the comparison is pure overhead. The same goes for `useMemo` caching something that's recomputed constantly anyway.
+
+**Memory.** Cached values stay alive until their dependencies change.
+
+So the rule for adding memoization is: *it must pay for itself.* That means the thing you're skipping is **expensive enough**, **often enough**, to outweigh both the runtime overhead and the human overhead of maintaining it.
+
+```text
+Is the interaction visibly slow?        no  → stop. Don't memoize.
+Does the profiler point at this render? no  → look elsewhere (fetching, layout, bundle size).
+Would skipping this render save real time? yes → memo the child, stabilize the props.
+```
+
+> 🚫 **When not to.** In a small tree, on cheap components, on props that change every render anyway, and "just in case". A premature `useCallback` has all of the costs and none of the benefits.
+
+## 47.7 The React Compiler
+
+If memoization is mostly mechanical (find values that don't need recomputing, cache them with the right dependencies), a tool can do it. That's the **React Compiler**, a build-time tool, now stable, that analyses your components and inserts the equivalent of `memo`, `useMemo`, and `useCallback` automatically, wherever it can prove it's safe.
+
+You enable it as a plugin in your build (for Vite, it's a Babel plugin passed to the React plugin; check the React docs for the current setup). You don't change your code:
+
+```tsx
+// What you write: plain code, no memoization
+function TaskList({ tasks, query }: { tasks: Task[]; query: string }) {
+  const visible = tasks.filter((t) => t.title.includes(query));
+  const handleSelect = (id: string) => select(id);
+  return visible.map((t) => <TaskRow key={t.id} task={t} onSelect={handleSelect} />);
+}
+// What the compiler effectively produces: `visible` and `handleSelect` cached on their inputs,
+// so a memoized TaskRow stops seeing "new" props on each render.
+```
+
+What this changes is the **default**. With the compiler, you write ordinary code, and fine-grained memoization is applied for you, so manual `useMemo` and `useCallback` shrink from "everywhere, just in case" to "rarely". It also stabilizes things people forget, such as the context value in [Chapter 46](/chapter/46).
+
+It's important to be accurate about what it **doesn't** do:
+
+- It relies on your code following the **Rules of React** (pure rendering, no mutating props or state). Code that breaks them is skipped or can misbehave, which is one more reason to keep components pure.
+- It doesn't fix slow *algorithms*, giant lists, or needless state. Rendering 50,000 rows is still slow; that needs virtualization or a smaller list.
+- It isn't magic you can ignore. Manual `useMemo` and `useCallback` still have a place when you need precise control, such as stabilizing a value used in an effect's dependency list, and the compiler honours code that already has them. A component can opt out with a `"use no memo"` directive.
+- You still need the profiler. "The compiler is on" isn't evidence that a specific interaction is fast.
+
+```tsx
+function HeavyChart({ data }: { data: Point[] }) {
+  "use no memo"; // opt this component out of automatic memoization
+  /* … */
+}
+```
+
+Treat it as a good *default*, not as proof you can stop thinking about identity. Since a large amount of existing code (and every tutorial before 2025) still contains manual memoization, you need to understand what it means to read and maintain it. And the mental model, "new objects each render, and what depends on identity", is exactly what the compiler's analysis is based on.
+
+> 🆕 **Modern note.** New projects increasingly start with the compiler enabled. In such projects, adding `useMemo` and `useCallback` by default is mostly noise. Add one only when you can name the specific reason.
+
+## 47.8 A decision checklist
+
+Collect all of this into one routine to follow when something feels slow, or when you are tempted to memoize "just because".
+
+```text
+1. Reproduce and MEASURE (React DevTools Profiler, Performance tab).
+   Not slow? Stop.
+2. Fix the structure before reaching for memo:
+   - Is state higher than it needs to be?  → colocate it (Chapter 42).
+   - Is a slow subtree re-rendering for an unrelated change?  → move the changing state into its own component,
+     or pass the slow subtree as `children` so it isn't re-created.
+   - Is the list huge?  → virtualize or paginate.
+3. Still slow, and the profiler shows many unchanged children re-rendering?
+   → memo the child AND stabilize its props (useCallback / useMemo).
+4. Expensive calculation recomputed on unrelated renders?
+   → useMemo it (and measure again).
+5. Using the React Compiler?  Check the profiler first: it may already be handled.
+6. Re-measure. If it didn't help, REMOVE the memoization.
+```
+
+Step 2 deserves an example, because restructuring often beats memoizing. State that changes fast can be moved *down*, so it re-renders only the part that cares:
+
+```tsx
+// ❌ The whole page re-renders on every keystroke, including the 5,000-row table
+function Page() {
+  const [query, setQuery] = useState("");
+  return (<><input value={query} onChange={(e) => setQuery(e.target.value)} /><BigTaskTable /></>);
+}
+
+// ✅ The input owns its own state: typing re-renders only SearchBox
+function Page() {
+  return (<><SearchBox /><BigTaskTable /></>);
+}
+```
+
+This is [Chapter 42](/chapter/42)'s colocation principle paying a performance dividend: *state that lives where it's used re-renders only what uses it.*
+
+## Common mistakes
+
+> ⚠️ **Memoizing everything.** Every `useMemo` and `useCallback` costs readability and risks stale dependencies. Memoize measured bottlenecks.
+
+> ⚠️ **`memo` with unstable props.** A `memo`'d component given an inline function, object, or array re-renders every time. Stabilize the props, or the `memo` is wasted.
+
+> ⚠️ **Missing or unstable dependencies.** A missing dependency gives stale data, and an object recreated every render defeats the cache. Trust the exhaustive-deps lint rule.
+
+> ⚠️ **Using `useMemo` for correctness.** React may discard a cache and recompute it. Your code must produce the right result *without* the memo, which is only an optimization.
+
+> ⚠️ **Skipping the profiler.** Guessing at the bottleneck is how you spend a week memoizing the wrong component.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** a profiler shows a real problem, such as a large memoized list re-rendering on every keystroke, an expensive derived value recomputed constantly, or a function/object used as an effect dependency that must stay stable.
+
+> 🚫 **When not to.** By default, don't. Add memoization when a profiler shows a problem, or when identity matters (effect dependencies, memoized children). Restructure first (colocate state, split components, pass `children`), and in a project with the React Compiler, prefer plain code.
+
+## How it connects
+
+> 🔗 **Connection.** Identity is JavaScript's `===` on references ([Chapter 4](/chapter/4)); the snapshot behavior behind stale closures is from [Chapter 41](/chapter/41); the effect-dependency instability story continues in [Chapter 44](/chapter/44); context values are in [Chapter 46](/chapter/46). Rendering performance as a production concern, including profiling, virtualization, and the compiler, returns in [Chapter 72](/chapter/72).
+
+## Exercises
+
+### Level 1 — Recall
+
+Predict which children re-render in each scenario, then verify with `console.log`: **(A)** a parent with `count` state and a child with no props, **(B)** the same child wrapped in `memo`, **(C)** a `memo`'d child receiving an inline `() => {}`, **(D)** a `memo`'d child receiving a function from `useCallback(…, [])`.
+
+### Level 2 — Application
+
+Here is a memoized list item that doesn't skip anything. Find *every* unstable prop and fix it so that typing in the search box no longer re-renders unchanged rows. Prove it with a render counter:
+
+```tsx
+const Row = memo(function Row({ task, onToggle, style }: RowProps) { /* … */ });
+
+{tasks.map((t) => (
+  <Row key={t.id} task={t} style={{ padding: 8 }} onToggle={() => toggle(t.id)} />
+))}
+```
+
+*Hint: there are two unstable props, and one of them needs a change to what `Row` accepts.*
+
+### Level 3 — Challenge
+
+Take a component with at least six `useMemo` / `useCallback` calls. Remove every one that is **not** needed (cheap computation, props that aren't passed to a memoized child, no effect dependency) without changing behavior or measurable performance. For each one you keep, write a one-line comment explaining why.
+
+### Level 4 — Real-world
+
+**Ticket TF-455: Task search is laggy at 5,000 items.** Support reports that typing in the search box stutters for large projects.
+
+- Reproduce with a generated list of 5,000 tasks and record a Profiler session. Attach before/after numbers.
+- Identify the *real* bottleneck (re-rendering rows, the filtering, or something else) before changing code.
+- Fix it with the least complex change that works; justify any `memo`, `useMemo`, or `useCallback` you add, and remove ones that don't help.
+- Typing latency stays under one frame (about 16 ms) in the profiler.
+
+## Key takeaways
+
+- Objects, arrays, and functions are compared by **identity**, and every render creates new ones. That's why props "change" when they look identical.
+- A child re-renders whenever its parent does, and that's usually fast enough. **Measure** before optimizing.
+- `memo` skips a child when its props are shallowly equal, but only if the props are **stable**.
+- `useMemo` caches a value, `useCallback` caches a function. Use them for expensive work or when identity matters.
+- Memoization costs complexity and risks stale dependencies. It must pay for itself.
+- The React Compiler memoizes automatically at build time, which changes the default to plain code. It doesn't replace profiling, and it needs pure components.
+- Restructure first: colocate state, split components, and pass `children`.
+
+## What comes next
+
+You now have the full set of hooks for state, context, and performance. The remaining skill is **reuse**. The same "sync with `localStorage`" logic is probably sitting copy-pasted in several of your components, each with a slightly different bug. [Chapter 48: Custom Hooks](/chapter/48) shows how to extract stateful logic into your own hooks, and why hooks share *logic* but never *state*.
+
+

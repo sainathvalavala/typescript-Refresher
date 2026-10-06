@@ -1,0 +1,433 @@
+> 📖 **The problem.** You're adding a sign-up box to a page and write the obvious line: `document.querySelector("#email").value`. TypeScript underlines it twice. First, `Object is possibly 'null'`. Then, once you fix that, `Property 'value' does not exist on type 'Element'`. You didn't make a typo. Two errors on one line of perfectly normal browser code, and both of them are *right*. The first is "what if there's no such element?" The second is "an element could be a `<div>`, and a `<div>` has no `value`".
+
+This chapter teaches you the DOM the way TypeScript sees it: as a big typed class hierarchy. Once you can read that hierarchy, those errors stop being obstacles and become the compiler asking the two questions that every browser bug eventually asks. You'll learn to select elements safely, type events, read forms, handle values that come from `localStorage`, and then put it all together in a framework-free task app (project [P09](/projects/p09)) whose bugs will motivate [Chapter 36](/chapter/36).
+
+> 🧠 **Mental model.** *The DOM is a typed class hierarchy described by `lib.dom.d.ts`:* `EventTarget → Node → Element → HTMLElement → HTMLInputElement`. Selecting an element only tells TypeScript the most general thing it can prove. **You** supply the rest, by checking, not by claiming.
+
+## 35.1 lib.dom.d.ts
+
+Where does TypeScript learn what a `document` or a `HTMLInputElement` is? Not from your code and not from npm. It ships with the compiler, as a declaration file called **`lib.dom.d.ts`**: a few tens of thousands of lines describing every browser API: `document`, `window`, `fetch`, `localStorage`, `FormData`, `URL`, every element, every event.
+
+Which lib files TypeScript loads is controlled by the `lib` option in `tsconfig.json` ([Chapter 26](/chapter/26)):
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"]
+  }
+}
+```
+
+`"DOM"` provides the browser API types, and `"DOM.Iterable"` adds iteration (so `for (const el of document.querySelectorAll("li"))` works). If you leave `lib` unset, the defaults derived from `target` already include the DOM. But a **Node** project typically excludes it, so `document` is undefined there:
+
+```ts
+// In a Node-only tsconfig with "lib": ["ES2023"]
+document.title = "Hi"; // ❌ Cannot find name 'document'. Do you need to change your target library? Try changing the 'lib' compiler option to include 'dom'.
+```
+
+That error is a feature: it stops a server from silently calling browser APIs. The reverse also happens: a frontend project that pulls in `@types/node` can accidentally see Node's `process` and `Buffer`. Know which world each tsconfig describes.
+
+> 💡 **Tip.** Ctrl/Cmd-click on any DOM name in your editor (`document`, `HTMLInputElement`) to jump straight into `lib.dom.d.ts`. Reading a few declarations is the fastest way to learn the DOM's types.
+
+## 35.2 The element hierarchy
+
+DOM objects form an inheritance chain, and `lib.dom.d.ts` models it with interfaces that extend each other. The chain for a text box:
+
+```text
+EventTarget            can addEventListener
+  └─ Node              part of the tree: parentNode, childNodes, textContent
+      └─ Element       has tags and attributes: id, className, querySelector, closest
+          └─ HTMLElement   an HTML element: dataset, hidden, style, click(), focus()
+              └─ HTMLInputElement   value, checked, valueAsNumber, files, type
+```
+
+Each level adds members. Because of inheritance, an object of a *more specific* type is assignable to a *more general* one, but not the reverse:
+
+```ts
+declare const input: HTMLInputElement;
+
+const el: Element = input;       // ✅ an input is an Element
+const el2: HTMLElement = input;  // ✅ and an HTMLElement
+
+declare const generic: Element;
+generic.value;                   // ❌ Property 'value' does not exist on type 'Element'.
+generic.id;                      // ✅ every Element has an id
+```
+
+How does TypeScript know which interface to give you for a tag like `"input"` or `"canvas"`? Through **tag-name maps**: interfaces whose keys are tag names and whose values are element types.
+
+```ts
+interface HTMLElementTagNameMap {
+  a: HTMLAnchorElement;
+  button: HTMLButtonElement;
+  canvas: HTMLCanvasElement;
+  input: HTMLInputElement;
+  li: HTMLLIElement;
+  // …about a hundred more
+}
+
+const c = document.createElement("canvas"); // c: HTMLCanvasElement: found via the map
+const x = document.createElement("blink");  // x: HTMLElement: unknown tags get the general type
+c.getContext("2d");                          // ✅ canvas-only method
+```
+
+The same trick (a map plus a generic key, from [Chapter 17](/chapter/17)) powers `createElement`, `getElementsByTagName`, and `querySelector`. SVG has its own map (`SVGElementTagNameMap`), so `querySelector("svg")` gives `SVGSVGElement`, which is not an `HTMLElement` at all.
+
+## 35.3 Selecting elements safely
+
+`querySelector` is declared with **overloads** ([Chapter 11](/chapter/11)). When the argument is a *plain tag name*, TypeScript looks it up in the tag-name map. For *any other selector string*, it can't parse CSS at compile time, so it falls back to the most general thing it can prove:
+
+```ts
+const a = document.querySelector("input");        // a: HTMLInputElement | null
+const b = document.querySelector("#email");       // b: Element | null
+const c = document.querySelector("input.email");  // c: Element | null   (a class means "not a plain tag")
+const d = document.querySelector("form button.primary"); // d: Element | null
+const e = document.querySelectorAll("li");        // e: NodeListOf<HTMLLIElement>
+const f = document.getElementById("email");       // f: HTMLElement | null
+```
+
+Two things are unknown in every case: whether the element exists (`| null`), and, for non-tag selectors, what kind of element it is. There are three ways to resolve the second, and they are *not* equally safe.
+
+```ts
+// 1. Type assertion: you claim it, nothing checks. ❌ avoid
+const email1 = document.querySelector("#email") as HTMLInputElement;
+// If #email is actually a <div>, email1.value is silently undefined.
+
+// 2. Generic argument: the same claim in a different spelling. ❌ also unchecked
+const email2 = document.querySelector<HTMLInputElement>("#email"); // HTMLInputElement | null
+
+// 3. instanceof: a real runtime check, and TypeScript narrows. ✅
+const el = document.querySelector("#email");
+if (el instanceof HTMLInputElement) {
+  el.value; // ✅ el: HTMLInputElement
+}
+```
+
+`instanceof` works because `HTMLInputElement` is a real class at runtime, so this is one of the places where DOM types are *also* values ([Chapter 10](/chapter/10)). Since you'll do this check constantly, wrap it once in a helper that throws a useful error if the page doesn't match your expectations:
+
+```ts
+function getRequiredElement<T extends Element>(selector: string, ctor: new () => T): T {
+  const el = document.querySelector(selector);
+  if (!el) throw new Error(`Missing element: ${selector}`);
+  if (!(el instanceof ctor)) throw new Error(`Expected ${selector} to be ${ctor.name}, got ${el.constructor.name}`);
+  return el;
+}
+
+const email = getRequiredElement("#email", HTMLInputElement); // email: HTMLInputElement. No assertion anywhere.
+```
+
+Notice how the constructor argument serves two jobs: it *infers* `T` ([Chapter 17](/chapter/17)), and it provides the **runtime value** for `instanceof`. That's the standard trick for "generics that need to exist at runtime", from [Chapter 16](/chapter/16).
+
+> ⚠️ **Common mistake.** Sprinkling `as HTMLInputElement` everywhere, or using non-null assertions (`!`) to silence `null`. Both turn a clear "element missing" error at startup into a confusing `undefined` three screens later.
+
+## 35.4 Typed DOM events
+
+`addEventListener` is typed through another map. `HTMLElementEventMap` and `DocumentEventMap` connect each event name to its event interface, and the listener's parameter type is looked up from the string you pass:
+
+```ts
+document.addEventListener("keydown", (ev) => {
+  ev.key;      // ev: KeyboardEvent, so `key`, `ctrlKey`, `code` exist
+});
+
+const button = document.querySelector("button")!;
+button.addEventListener("click", (ev) => {
+  ev.clientX;  // ev: PointerEvent (a MouseEvent subtype): coordinates exist
+});
+
+document.addEventListener("input", (ev) => {
+  ev.data;     // ev: InputEvent: what was typed
+});
+```
+
+The event hierarchy mirrors the element one: `Event` is the root, `UIEvent` adds window-related details, and `MouseEvent`, `KeyboardEvent`, `InputEvent`, `FocusEvent`, and `SubmitEvent` specialise from there. Forms give you the most useful one:
+
+```ts
+const form = document.querySelector("form");
+form?.addEventListener("submit", (ev) => {
+  ev.preventDefault();              // stop the browser's full-page navigation
+  const who = ev.submitter;         // HTMLElement | null: which button was pressed
+});
+```
+
+The string must be a *known* event name for the narrow typing to apply. If you misspell it, the listener falls back to a generic `Event`, and (surprisingly) **compiles without error**:
+
+```ts
+button.addEventListener("clck", (ev) => {
+  ev; // ev: Event. No error for the typo, and no `clientX` either, because it's just an Event
+});
+```
+
+> 💡 **Tip.** If an event handler's parameter shows up as the bare `Event` when you expected `MouseEvent`, check the spelling of the event name. Custom events need their own typing (`CustomEvent<T>`), which you'd declare by augmenting `HTMLElementEventMap` ([Chapter 28](/chapter/28)).
+
+## 35.5 target vs currentTarget
+
+Here's the single most confusing thing in DOM typing, and it comes from how the DOM works. Events **bubble**: a click on a button inside a list bubbles up through the list. Each event has two properties that point at elements, and they answer different questions:
+
+- `event.target`: the element the event **originated** on (the exact thing clicked).
+- `event.currentTarget`: the element the listener is **attached** to.
+
+```ts
+const list = document.querySelector("ul")!;
+
+list.addEventListener("click", (ev) => {
+  ev.target;        // EventTarget | null  (the clicked <li>? a <span> inside it? the <ul> itself?)
+  ev.currentTarget; // EventTarget | null  (it's the <ul> we attached to, but the type is loose)
+});
+```
+
+Because *any* descendant can start the event, `target` is typed as the broadest possible thing, `EventTarget | null`, which doesn't even have `.value`. That's why `ev.target.value` fails:
+
+```ts
+input.addEventListener("input", (ev) => {
+  ev.target.value; // ❌ 'ev.target' is possibly 'null'.
+                   // ❌ Property 'value' does not exist on type 'EventTarget'.
+});
+```
+
+You resolve it the same way as selection: **check**, don't claim.
+
+```ts
+list.addEventListener("click", (ev) => {
+  if (!(ev.target instanceof HTMLElement)) return;   // narrow from EventTarget
+  const row = ev.target.closest("li");                // HTMLLIElement | null
+  const id = row?.dataset.id;                         // string | undefined
+  if (id) toggleTask(id);
+});
+```
+
+This pattern, one listener on a parent that figures out which child was clicked, is called **event delegation**. When you attach a listener directly to one element and want that element, a `function` handler gives you `this` already typed (and a closure over the variable works too):
+
+```ts
+button.addEventListener("click", function () {
+  this.disabled = true; // this: HTMLButtonElement
+});
+```
+
+(Arrow functions have no `this` of their own, so use the closure: `button.disabled = true`.) React's `currentTarget` is typed more precisely than the DOM's, which is a relief you'll appreciate in [Chapter 51](/chapter/51).
+
+## 35.6 Forms and inputs
+
+Everything the browser hands you from a form is **text**, even from `<input type="number">`. `input.value` is always a `string`. Two APIs give you better data. For numeric and checkbox inputs, the DOM exposes already-converted properties:
+
+```ts
+const qty = getRequiredElement("#estimate", HTMLInputElement);
+qty.value;          // string: "3"
+qty.valueAsNumber;  // number: 3 (NaN if empty or invalid: check with Number.isNaN)
+qty.checked;        // boolean (checkboxes)
+qty.files;          // FileList | null (file inputs)
+```
+
+For a whole form, **`FormData`** collects every named field in one call. Notice its return type; it *refuses* to pretend:
+
+```ts
+const form = getRequiredElement("form#new-task", HTMLFormElement);
+
+form.addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  const data = new FormData(form);
+  const title = data.get("title");        // FormDataEntryValue | null  (string | File | null)
+  const priority = data.get("priority");  // same
+
+  if (typeof title !== "string" || title.trim() === "") return; // narrow: title: string
+  if (!isPriority(priority)) return;                             // your own guard from Chapter 14
+
+  createTask({ title: title.trim(), priority }); // priority: "low" | "medium" | "high"
+});
+```
+
+The `FormDataEntryValue | null` type is TypeScript doing exactly what [Chapter 32](/chapter/32) asked: form values are *outside data*, so they arrive as an honest "could be a string, a file, or missing", and you check before using them. For a form with many fields, `Object.fromEntries(new FormData(form))` gives `{ [k: string]: FormDataEntryValue }`, which you then hand to a schema parser.
+
+```ts
+function isPriority(v: unknown): v is Priority {
+  return v === "low" || v === "medium" || v === "high";
+}
+```
+
+> ⚠️ **Common mistake.** Writing `data.get("title") as string`. If the field is missing, you now have `null` pretending to be a string, and `"null".trim()` is the *good* outcome.
+
+## 35.7 Browser APIs at the boundary
+
+The browser gives you several data sources, and each is a boundary in the sense of [Chapter 32](/chapter/32). **`localStorage`** stores only strings, so every read returns `string | null`, and `JSON.parse` of that returns `any`. The safe pipeline is the same as on the server:
+
+```ts
+function loadTasks(): Task[] {
+  const raw = localStorage.getItem("taskflow:tasks"); // string | null
+  if (raw === null) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);          // unknown, not any
+    return Array.isArray(parsed) ? parsed.filter(isTask) : [];
+  } catch {
+    return [];                                          // corrupted JSON must not crash the app
+  }
+}
+```
+
+Storage is especially risky: it lives for months, other versions of your app wrote it, and users (or extensions) can edit it. Always assume the stored shape might be from an older release or garbage. **URL parameters** are strings in the same way:
+
+```ts
+const params = new URLSearchParams(location.search);
+const filter = params.get("filter"); // string | null: could be "done", "banana", or missing
+const initial: Filter = filter === "active" || filter === "done" ? filter : "all"; // narrowed by equality
+```
+
+And **`fetch`** responses follow the Chapter 32 recipe: `await res.json()` is `any`, so assign to `unknown` and parse it.
+
+```ts
+const res = await fetch("/api/tasks");
+if (!res.ok) throw new Error(`HTTP ${res.status}`); // fetch does NOT reject on 404 or 500
+const json: unknown = await res.json();
+const tasks = TasksSchema.parse(json);              // Zod schema from Chapter 32: validated, typed
+```
+
+The browser's own types are generally precise about *what could be missing*: `getItem` is `string | null`, `get` on a map is `T | undefined`. Resist the urge to quiet them with `!`.
+
+## 35.8 Building Vanilla TaskFlow
+
+Now put it all together. This is project [P09](/projects/p09): TaskFlow with **no framework**, an array of tasks, a list on screen, add, toggle, filter, and a counter. The goal isn't elegance. The goal is to feel how this style of program behaves as it grows.
+
+Organize it into four files, as the project spec suggests. `state.ts` holds the data and mutations (no DOM at all):
+
+```ts
+// src/state.ts
+export type Filter = "all" | "active" | "done";
+export interface Task { id: string; title: string; done: boolean }
+
+export const state = { tasks: [] as Task[], filter: "all" as Filter };
+
+export function addTask(title: string): void {
+  state.tasks.push({ id: crypto.randomUUID(), title, done: false });
+}
+export function toggleTask(id: string): void {
+  const task = state.tasks.find((t) => t.id === id);
+  if (task) task.done = !task.done;
+}
+```
+
+`render.ts` turns the state into DOM nodes. This version simply rebuilds the list and updates the counter:
+
+```ts
+// src/render.ts
+const listEl = getRequiredElement("#task-list", HTMLUListElement);
+const countEl = getRequiredElement("#count", HTMLElement);
+
+export function render(): void {
+  const visible = state.tasks.filter(
+    (t) => state.filter === "all" || (state.filter === "done") === t.done,
+  );
+  listEl.replaceChildren(
+    ...visible.map((t) => {
+      const li = document.createElement("li");   // li: HTMLLIElement
+      li.dataset.id = t.id;
+      li.textContent = t.title;
+      li.classList.toggle("done", t.done);
+      return li;
+    }),
+  );
+  countEl.textContent = `${state.tasks.filter((t) => !t.done).length} left`;
+}
+```
+
+`events.ts` wires listeners to state changes, always followed by a `render()`:
+
+```ts
+// src/events.ts
+listEl.addEventListener("click", (ev) => {
+  if (!(ev.target instanceof HTMLElement)) return;
+  const id = ev.target.closest("li")?.dataset.id;
+  if (id) { toggleTask(id); render(); saveTasks(); }
+});
+
+form.addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  const title = new FormData(form).get("title");
+  if (typeof title === "string" && title.trim()) { addTask(title.trim()); render(); saveTasks(); form.reset(); }
+});
+```
+
+Look closely at those two handlers. Each must remember to call `render()` **and** `saveTasks()`. That small "and" is the seed of everything in the next section. Add the rest (delete, edit, filter tabs, empty state, clear completed) and watch what happens to the number of places that need to be remembered.
+
+> 💡 **Tip.** Try both strategies, as the project suggests: rebuild everything on each change (simple, but loses focus and scroll position), then try patching only the parts that changed (efficient, but much trickier). Write down how each *felt*.
+
+## 35.9 The pain log
+
+As you build, keep a file called `PAIN-LOG.md`. Every time you find a bug where **the screen disagrees with the data**, add a line: what you saw, what the cause was, and how long it took to find. Not abstract complaints: real incidents. Here's what a typical log looks like by the time P09 is finished:
+
+```text
+PAIN-LOG.md
+1. Counter shows "3 left" after I deleted a task. (delete handler forgot render of #count)   25 min
+2. Empty-state message still visible after adding the first task. (forgot to hide it)         10 min
+3. Filter tab "Active" not highlighted after page reload (tabs read from storage, UI didn't) 40 min
+4. Toggled a task while filter=done: it stayed on screen. (render path != toggle path)       30 min
+5. "Clear completed" removed items from the array but not from localStorage                    15 min
+6. Edited a title; the list showed the new text but the counter chip still showed the old.    20 min
+```
+
+Notice the pattern before it's pointed out to you: not one of those bugs is a *logic* error. The data was right every time. What went wrong was **keeping the screen in sync with the data**, remembering every place that shows a fact when that fact changes. TypeScript can't help much here, because every line is individually type-correct.
+
+Keep this file. You'll bring it to [Chapter 36](/chapter/36), where it stops being a list of annoyances and becomes the argument for an entire way of writing UIs.
+
+## Common mistakes
+
+> ⚠️ **`as HTMLInputElement` everywhere.** An assertion silences the compiler and checks nothing. Use `instanceof` or a helper like `getRequiredElement`.
+
+> ⚠️ **Ignoring `null` from selectors.** `document.querySelector(…)!` hides the "what if it isn't there" case. Fail early with a descriptive error instead.
+
+> ⚠️ **Reading `e.target.value` without narrowing.** `target` is `EventTarget | null`. Narrow with `instanceof`, or read from the element you already hold.
+
+> ⚠️ **Trusting `localStorage`.** What you read might be corrupted, from an older version, or edited by the user. Parse as `unknown` and validate.
+
+> ⚠️ **Misspelling an event name.** A typo in `addEventListener` silently falls back to a plain `Event`, so you lose all typing, and the handler never fires.
+
+## How it connects
+
+> 🔗 **Connection.** The tag-name and event maps use generics and indexed access from [Chapter 17](/chapter/17) and [Chapter 20](/chapter/20). `instanceof` narrowing is from [Chapter 14](/chapter/14), and the "outside data is `unknown`" rule is [Chapter 32](/chapter/32). Next, [Chapter 36](/chapter/36) explains why your pain log exists. In React, event handlers get friendlier types ([Chapter 51](/chapter/51)), and `useRef<HTMLInputElement>` ([Chapter 45](/chapter/45), [Chapter 53](/chapter/53)) is how you reach real DOM elements.
+
+## Exercises
+
+### Level 1 — Recall
+
+Write down the type returned by each call (including `| null` where applicable), then check by hovering:
+
+```ts
+document.querySelector("button");
+document.querySelector(".primary");
+document.querySelector("input[type=email]");
+document.querySelectorAll("a");
+document.getElementById("app");
+document.createElement("select");
+```
+
+### Level 2 — Application
+
+Write `getRequiredElement<T extends Element>(selector: string, ctor: new () => T): T` yourself, without looking at 35.3. It must throw a helpful error in two cases: no element matches the selector, or the element is of the wrong type. Use it to replace every `querySelector` in your P09 code, and delete every `as`.
+
+### Level 3 — Challenge
+
+Add keyboard navigation to the vanilla task list: the up and down arrow keys move focus between tasks, Space toggles the focused task, and Delete removes it. Use a single delegated `keydown` listener, make the list items focusable with `tabindex`, and keep `ev.target` narrowed by `instanceof` rather than asserted.
+
+*Hint: `ArrowDown` and `ArrowUp` are `ev.key` values, and `nextElementSibling` returns `Element | null`.*
+
+### Level 4 — Real-world
+
+**Ticket TF-410: Filter, counter, and empty state for P09.** Product wants a three-tab filter (All / Active / Done), an "N items left" counter, and an empty-state message that depends on the active filter.
+
+- All three features work correctly after add, toggle, delete, clear completed, and a full page reload.
+- The selected tab persists across reloads (URL parameter or `localStorage`, validated on load).
+- No `as` and no `!` on DOM lookups or event targets.
+- In `PAIN-LOG.md`, record **how many places in your code needed a manual update** for each feature, and every bug you hit along the way.
+
+## Key takeaways
+
+- The DOM is described by `lib.dom.d.ts` as a class hierarchy: `EventTarget → Node → Element → HTMLElement → HTMLInputElement`.
+- `querySelector("tag")` finds a specific type through a tag-name map. Any other selector gives `Element | null`.
+- Resolve `Element` to a specific type by **checking** (`instanceof`), not by claiming (`as`). Wrap the pattern in a helper.
+- `addEventListener` types its event from a name map. `target` is the origin (`EventTarget | null`), while `currentTarget` is where the listener is attached.
+- Form and storage values are outside data: `FormData.get` gives `FormDataEntryValue | null`, `localStorage` gives `string | null`, and `JSON.parse` should flow into `unknown`.
+- Hand-synchronising state and DOM is where the bugs live, and the pain log is the evidence.
+
+## What comes next
+
+You now have a working task app, and, if you were honest in your log, a list of bugs that are all variations on one theme. Why does this keep happening, and is there a way of writing UI where those bugs *can't* occur? That's the entire argument for React, told from your own experience. [Chapter 36: Why React?](/chapter/36) opens with your pain log.
+
+

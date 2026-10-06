@@ -1,0 +1,340 @@
+> 📖 **The problem.** A customer emails support: "TaskFlow is broken." That's the whole report. There are no logs, because the app only ever wrote `console.log` calls that vanished with the browser tab. There is no stack trace, because nobody was watching for errors. Nobody knows which version she was on, which browser, or which page she was looking at. The team spends two days failing to reproduce a bug that, it turns out, affects only one screen on one browser in the one release shipped last Tuesday. Two days is how long it took to guess. With the right data it would have taken ten minutes.
+
+Once code is in production, it runs on thousands of machines you don't control. **Observability** is the practice of making that code *tell you what's happening*: errors with context, performance as real users experience it, and product events you can trust. In this chapter you'll build the pieces in a frontend-friendly order: a structured logger that doesn't leak personal data, error reporting with release information and source maps, a **typed** analytics `track()` function, web-vitals measurement, typed feature flags, and the consent rules that govern all of it.
+
+> 🧠 **Mental model.** **You can't fix what you can't see.** Make errors, performance, and product events visible, and use typed event definitions so the data stays trustworthy.
+
+## 75.1 Why observability
+
+Observability is a feedback loop from production back to the people who write the code. It answers three kinds of questions, each with its own signal:
+
+| Question | Signal | Example |
+|---|---|---|
+| "What broke, for whom, in which version?" | **Errors and logs** | `TypeError` in `BoardColumn`, release `2.4.1`, Safari 17 |
+| "Is it slow for real users?" | **Performance metrics** | LCP of 4.1 s on the board route, on mobile |
+| "Are people using what we built?" | **Product events** | `task_created` fell 30% after the redesign |
+
+The difference from testing is that tests tell you the code works in conditions *you imagined*. Observability tells you what happens in the conditions that *actually occur*: slow networks, old browsers, browser extensions that rewrite the DOM, and data nobody expected.
+
+```ts
+// Before: the only trace of a failure, visible to nobody
+try {
+  await saveTask(task);
+} catch (err) {
+  console.log("save failed"); // ❌ no error, no task id, no version, and it's gone when the tab closes
+}
+
+// After: the failure is captured with context and travels to a place the team can see
+try {
+  await saveTask(task);
+} catch (err) {
+  reportError(err, { feature: "task-save", taskId: task.id });
+}
+```
+
+Everything in this chapter exists to turn the first snippet into the second, safely: without leaking user data and without slowing the app.
+
+## 75.2 Structured logging in the browser
+
+`console.log("save failed for " + id)` produces a sentence that people can read and machines can't search. A **structured log** is an object with consistent fields, so a tool can filter by `level`, group by `feature`, and count. The pieces are **levels** (how serious), a **message** (what happened), and **context** (the details, as fields).
+
+```ts
+type Level = "debug" | "info" | "warn" | "error";
+type Context = Record<string, string | number | boolean | null>;
+
+const ORDER: Record<Level, number> = { debug: 10, info: 20, warn: 30, error: 40 };
+const MIN_LEVEL: Level = import.meta.env.PROD ? "warn" : "debug";
+
+export function log(level: Level, message: string, context: Context = {}): void {
+  if (ORDER[level] < ORDER[MIN_LEVEL]) return;       // drop noisy logs in production
+  const entry = { level, message, time: new Date().toISOString(), ...redact(context) };
+  console[level](JSON.stringify(entry));             // or ship it to a log service in production
+}
+
+log("info", "task moved", { taskId: "t_42", from: "todo", to: "doing" });
+```
+
+The typed `Context` keeps you from logging whole objects (which may contain anything). The most important rule is **no personal data**. Emails, names, tokens, free-text titles and comments, and IP addresses are all personal or sensitive, and logs are copied to many systems and kept for months. Log **IDs**, not content, and redact by default:
+
+```ts
+const SENSITIVE_KEY = /email|name|token|password|authorization|cookie|phone/i;
+
+function redact(context: Context): Context {
+  return Object.fromEntries(
+    Object.entries(context).map(([key, value]) => [key, SENSITIVE_KEY.test(key) ? "[redacted]" : value]),
+  );
+}
+
+log("warn", "invite failed", { userId: "u_7", email: "ada@example.com" });
+// {"level":"warn","message":"invite failed","userId":"u_7","email":"[redacted]",…}
+```
+
+A key-name filter is a safety net, not a guarantee. The reliable defense is to never put sensitive values into the context in the first place, which a code review checklist should confirm.
+
+> 🚫 **When not to.** Don't log on every render or keystroke, and don't leave `debug` logging on in production. Excess logs cost money, hide real problems, and slow the page.
+
+## 75.3 Error tracking
+
+**Error tracking** captures unhandled errors and exceptions you catch, with a stack trace and context, groups identical ones into issues, and tells you when a new one appears or an old one returns. Services such as Sentry, Datadog, and Rollbar do this; the integration points are the same. Stay vendor-neutral by wrapping your tracker in one function that the rest of the app calls:
+
+```ts
+type ErrorContext = Record<string, string | number | boolean | null>;
+
+export function reportError(error: unknown, context: ErrorContext = {}): void {
+  const err = error instanceof Error ? error : new Error(String(error));
+  tracker.captureException(err, {
+    tags: { release: import.meta.env.VITE_RELEASE, route: window.location.pathname },
+    extra: context,
+  });
+}
+```
+
+Three hooks send errors to it. Browser-level handlers catch what nothing else caught, and the **error boundary** from [Chapter 71](/chapter/71) reports render failures with the component stack:
+
+```tsx
+window.addEventListener("error", (e) => reportError(e.error, { kind: "uncaught" }));
+window.addEventListener("unhandledrejection", (e) => reportError(e.reason, { kind: "promise" }));
+
+// React 19: report from the root
+createRoot(container, {
+  onCaughtError: (error, info) => reportError(error, { kind: "boundary", stack: info.componentStack ?? null }),
+  onUncaughtError: (error, info) => reportError(error, { kind: "uncaught-render", stack: info.componentStack ?? null }),
+}).render(<App />);
+```
+
+**Release versions.** Every report must say *which build* produced it, or you can't tell whether a fix worked. Inject the release identifier at build time (a git commit SHA works well) and send it with every event.
+
+**Source maps.** Production code is minified, so a stack trace reads `at e (main-3fa9c1.js:1:28391)`. A **source map** translates that back to `TaskCard.tsx:42`. Build with maps, upload them to the tracker for that release, and **don't serve them publicly** (they expose your source):
+
+```ts
+// vite.config.ts
+export default defineConfig({
+  build: { sourcemap: "hidden" }, // emits .map files but no reference comment in the bundles
+});
+```
+
+```sh
+# in CI, after build: upload maps for this release, then delete them from the deploy folder
+tracker-cli sourcemaps upload --release "$GIT_SHA" dist/assets
+find dist -name "*.map" -delete
+```
+
+## 75.4 Typed analytics events
+
+**Product analytics** answers "what do people do?" ("how many tasks are created per week, and how many users reach the board?"). The classic failure is **event drift**: one developer sends `taskCreated`, another `task_created`, a third forgets a property. Six months later the dashboard has three half-broken versions of the same metric, and no one trusts any of them.
+
+TypeScript can prevent this. Define the whole **event catalog** once, as a discriminated union ([Chapter 14](/chapter/14)) keyed by event name, with the payload each event must carry:
+
+```ts
+type Status = "todo" | "doing" | "done";
+type Priority = "low" | "medium" | "high";
+
+export type AnalyticsEvent =
+  | { name: "task_created"; props: { projectId: string; priority: Priority } }
+  | { name: "task_moved"; props: { from: Status; to: Status } }
+  | { name: "filter_applied"; props: { filter: "status" | "assignee" | "due" } }
+  | { name: "export_clicked" }; // no payload
+```
+
+Now write `track()` so that the **name decides what the payload must be**. A generic parameter `N` captures the name; the payload type is looked up from the catalog with `Extract`; and a rest parameter makes the payload required only for events that have one:
+
+```ts
+type EventName = AnalyticsEvent["name"];
+
+type EventProps<N extends EventName> =
+  Extract<AnalyticsEvent, { name: N }> extends { props: infer P } ? P : never;
+
+type TrackArgs<N extends EventName> = [EventProps<N>] extends [never] ? [] : [props: EventProps<N>];
+
+export function track<N extends EventName>(name: N, ...args: TrackArgs<N>): void {
+  const [props] = args;
+  sendToAnalytics({ name, props, release: import.meta.env.VITE_RELEASE });
+}
+```
+
+The call sites are checked against the catalog, and autocomplete lists every event name:
+
+```ts
+track("task_created", { projectId: "p1", priority: "high" });   // ✅
+track("export_clicked");                                        // ✅ no payload needed
+track("task_moved", { from: "todo", to: "later" });             // ❌ Type '"later"' is not assignable to type 'Status'.
+track("task_created");                                          // ❌ Expected 2 arguments, but got 1.
+track("export_clicked", { x: 1 });                              // ❌ Expected 1 arguments, but got 2.
+track("task_deleted");                                          // ❌ Argument of type '"task_deleted"' is not assignable to parameter of type '"export_clicked" | "filter_applied" | "task_created" | "task_moved"'.
+track("task_created", { projectId: "p1", priority: "high", email: "a@b.co" }); // ❌ Object literal may only specify known properties, and 'email' does not exist in type '{ projectId: string; priority: Priority; }'.
+```
+
+That last line shows a quiet benefit: because payloads are closed definitions, nobody can casually attach an email address to an event. The catalog is also the **documentation**: the data team reads one file to learn what exists. If you built a typed event emitter in [P05](/projects/p05), `track` is the same idea pointed at an analytics service.
+
+> ⚠️ **Common mistake.** Putting personal data or free text (task titles, comment bodies) in event payloads. Use IDs and enumerated values like the ones above.
+
+## 75.5 Performance monitoring
+
+A fast laptop on office Wi-Fi tells you little about a mid-range phone on a train. **Real-user monitoring (RUM)** measures performance on your actual visitors' devices. The standard measurements are the **Core Web Vitals**:
+
+| Metric | What it measures | Good |
+|---|---|---|
+| **LCP** (Largest Contentful Paint) | When the main content appears | 2.5 s or less |
+| **INP** (Interaction to Next Paint) | How quickly the page responds to clicks and taps | 200 ms or less |
+| **CLS** (Cumulative Layout Shift) | How much content jumps around while loading | 0.1 or less |
+
+The `web-vitals` library reports them, with the browser's own definitions. Send each metric with the route and release so you can slice the data:
+
+```ts
+import { onCLS, onINP, onLCP, type Metric } from "web-vitals";
+
+function sendVital(metric: Metric): void {
+  const body = JSON.stringify({
+    name: metric.name,      // "LCP" | "INP" | "CLS" | …
+    value: metric.value,
+    rating: metric.rating,  // "good" | "needs-improvement" | "poor"
+    route: window.location.pathname,
+    release: import.meta.env.VITE_RELEASE,
+  });
+  navigator.sendBeacon("/api/vitals", new Blob([body], { type: "application/json" }));
+}
+
+onLCP(sendVital);
+onINP(sendVital);
+onCLS(sendVital);
+```
+
+`sendBeacon` is built for this job: it queues the request so it's delivered even as the page unloads, without delaying navigation. Look at the **75th percentile** per route and per device class rather than averages, which hide the slow tail where the unhappy users are.
+
+**Lab versus field.** Tools like Lighthouse measure a synthetic, repeatable run (**lab data**, good for catching regressions in CI, as in [Chapter 72](/chapter/72)). RUM is **field data**: noisy but real. You need both. Add alerts on the field numbers (for example, "p75 INP on `/board` above 300 ms for an hour") so regressions announce themselves.
+
+## 75.6 Feature flags
+
+A **feature flag** is a switch, controlled outside your code, that turns behavior on or off for some or all users, without a deploy. Flags let you ship unfinished work dark, roll a feature out to 5% of users, run an A/B test, and (most valuable of all) **turn off a broken feature in seconds** instead of redeploying.
+
+The danger is stringly-typed flags: `isEnabled("newBord")` compiles, silently returns the default, and the feature never appears. Define flags once, with their value types and safe defaults, and make the reader generic over the key:
+
+```ts
+type FlagDefs = {
+  newBoard: boolean;
+  boardLayout: "list" | "grid";
+  maxFreeProjects: number;
+};
+
+const DEFAULTS: FlagDefs = { newBoard: false, boardLayout: "list", maxFreeProjects: 3 };
+
+export function getFlag<K extends keyof FlagDefs>(key: K, remote: Partial<FlagDefs>): FlagDefs[K] {
+  return remote[key] ?? DEFAULTS[key]; // always fall back to the safe default
+}
+
+const layout = getFlag("boardLayout", {}); // layout: "list" | "grid"
+const n: number = getFlag("newBoard", {}); // ❌ Type 'boolean' is not assignable to type 'number'.
+getFlag("newBord", {});                    // ❌ Argument of type '"newBord"' is not assignable to parameter of type 'keyof FlagDefs'.
+```
+
+In React, expose the flags through context ([Chapter 54](/chapter/54)) and a hook, so components read `useFlag("newBoard")` and re-render when values arrive:
+
+```tsx
+const FlagContext = createContext<Partial<FlagDefs>>({});
+
+export function useFlag<K extends keyof FlagDefs>(key: K): FlagDefs[K] {
+  return getFlag(key, useContext(FlagContext));
+}
+
+function BoardPage() {
+  return useFlag("newBoard") ? <NewBoard /> : <LegacyBoard />;
+}
+```
+
+Good practice: the default must be the **safe, old behavior** (so a failed flag service doesn't break the app); decide who removes each flag and when, because **stale flags are technical debt** that multiplies code paths; and record which flag values were active when an error was reported, so you can see "only users with `newBoard` on crash".
+
+> 🚫 **When not to.** Don't use flags for permissions (they are not a security boundary, as in [Chapter 74](/chapter/74)) or for long-lived configuration. And don't flag everything: each flag doubles the states to test.
+
+## 75.7 Privacy and consent
+
+Observability collects data about people. Treat that as a responsibility, not a footnote: privacy laws (GDPR in the EU, CCPA/CPRA in California, and others) require a legal basis, minimal collection, and, for many kinds of tracking, the user's **consent**. This is general engineering guidance, not legal advice; check requirements with whoever handles compliance.
+
+The engineering principles are simple:
+
+- **Collect the minimum.** If you don't need an email address to answer your question, don't collect it. Prefer IDs and aggregates (sections 75.2 and 75.4).
+- **Separate what is essential from what is optional.** Error reports with no personal data are usually treated differently from behavioral analytics and cross-site tracking. Ask your compliance contact where the line is for your product.
+- **Make consent a first-class input** to the code, and enforce it in **one place**, not at each call site.
+- **Make it revocable.** A user who changes their mind expects collection to stop.
+
+```ts
+export type ConsentState = { analytics: boolean; errors: boolean };
+
+let consent: ConsentState = { analytics: false, errors: true }; // default: analytics OFF until the user opts in
+
+export function setConsent(next: ConsentState): void {
+  consent = next;
+  localStorage.setItem("consent", JSON.stringify(next));
+}
+
+export function sendToAnalytics(event: { name: string; props?: unknown }): void {
+  if (!consent.analytics) return;       // the single gate
+  navigator.sendBeacon("/api/events", new Blob([JSON.stringify(event)], { type: "application/json" }));
+}
+```
+
+Because every `track()` call goes through `sendToAnalytics`, no feature can forget to check consent. Add a retention policy (how long data lives), respect the browser's **Do Not Track** and **Global Privacy Control** signals where the law or your policy requires it, and make sure deleting an account also deletes (or anonymizes) its analytics.
+
+## Common mistakes
+
+> ⚠️ **Logging personal data**: emails, names, tokens, and free text. Log IDs instead, and redact by default.
+
+> ⚠️ **Errors without a release or route.** If you can't tell which build and page a report came from, you can't tell if your fix worked.
+
+> ⚠️ **Shipping source maps publicly**, or not uploading them at all (then you have unreadable stack traces).
+
+> ⚠️ **Untyped event names and payloads**, which leads to dashboards nobody trusts.
+
+> ⚠️ **Flag defaults that enable the new, risky behavior.** The default must be the safe one.
+
+> ⚠️ **Collecting analytics before consent**, and checking consent in scattered places instead of one gate.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** you have users in production: every app needs error tracking and basic vitals from day one. Add typed analytics when you need product decisions, and flags when you need safe rollouts.
+
+> 🚫 **When not to.** Don't collect data you have no question for, don't build an in-house observability stack when a vendor's free tier covers your needs, and don't alert on everything. Alerts that fire constantly teach the team to ignore them.
+
+## How it connects
+
+> 🔗 **Connection.** Error boundaries ([Chapter 71](/chapter/71)) are where render errors get reported; performance numbers extend [Chapter 72](/chapter/72) from the lab into the field; the security rules about secrets and PII come from [Chapter 74](/chapter/74); and CI ([Chapter 76](/chapter/76)) is where releases and source-map uploads are automated.
+
+> 🌍 **Real world.** Sentry, Datadog RUM, and OpenTelemetry cover errors and traces; PostHog, Amplitude, and Segment cover product analytics; LaunchDarkly, Statsig, and GrowthBook cover flags. Most expose typed SDKs, and most teams still wrap them in a thin typed layer like the one in this chapter, so a vendor can be swapped without touching feature code.
+
+## Exercises
+
+### Level 1 — Recall
+
+Design the event union for five TaskFlow product events (for example `task_created`, `task_completed`, `project_archived`, `comment_added`, `search_used`). For each, write its `props`, and list one value you deliberately did **not** include for privacy reasons.
+
+### Level 2 — Application
+
+Report errors caught by your `ErrorBoundary` ([Chapter 71](/chapter/71)) through `reportError`, adding the release version, the current route, and the component stack. Write a test that renders a throwing component and asserts `reportError` was called once with those fields.
+
+### Level 3 — Challenge
+
+Make `track()` reject events whose payloads don't match the catalog at compile time, including events with no payload, extra properties, and wrong enum values. Prove it with a test file of `@ts-expect-error` lines, one per failure mode.
+
+*Hint: a rest parameter whose type is computed from the event name.*
+
+### Level 4 — Real-world
+
+**Ticket TF-433: Observability plan for TaskFlow Web.** The team keeps learning about bugs from customers.
+
+- Write a one-page plan: what is logged (and what is never logged), what is tracked as product events, and which metrics have alerts, with thresholds and owners.
+- Implement error tracking with release and source maps uploaded in CI, and verify a deliberate test error shows a readable stack trace.
+- Add Core Web Vitals reporting per route.
+- Gate analytics behind consent, with a test proving that no event is sent before the user opts in.
+
+## Key takeaways
+
+- You can't fix what you can't see. Errors, performance, and product events are the three signals.
+- Log **structured** entries with levels and IDs, never personal data, and filter noise in production.
+- Error reports need a **release**, a **route**, and **source maps** (uploaded privately) to be useful.
+- A discriminated-union **event catalog** and a typed `track(name, ...args)` make analytics data trustworthy and self-documenting.
+- Measure real users with Core Web Vitals and look at percentiles, not averages.
+- Typed feature flags need safe defaults and an owner who removes them.
+- Collect the minimum, and enforce consent in one place.
+
+## What comes next
+
+You can now see what happens in production. The last piece of Part XII keeps all of it, the type checks, tests, accessibility audits, security scans, and performance budgets, from quietly eroding: [Chapter 76](/chapter/76) builds the pipeline that makes "what must always be true" an automatic check.

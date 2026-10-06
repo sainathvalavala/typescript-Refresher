@@ -1,0 +1,407 @@
+> 📖 **The problem.** Open P09's `events.ts` and find the handler that toggles a task. It flips the task's `done` flag in the array, finds the row in the DOM, toggles a CSS class, rewrites the "N left" counter, decides whether the "Clear completed" button should still be visible, removes the row if the "Active" filter is showing, and checks whether the empty state should appear. Thirty-five lines, and your pain log says it broke three times. The React version of the same feature is eight lines long, and not one of them touches the DOM.
+
+This chapter installs the picture that every other chapter in Part VIII builds on. React is not a faster way to patch the DOM; it is a way to **stop patching the DOM yourself**. You describe what the screen should look like for the current data, and React works out what has to change.
+
+By the end, you'll be able to create a React + TypeScript project, explain the three steps between a click and a changed screen, say why components must be pure (and why Strict Mode calls them twice to check), and use React DevTools to watch it all happen.
+
+> 🧠 **Mental model.** **UI = f(state).** A **render** is React calling your component function to get a *description* of the UI. A **commit** is React applying the differences between the new description and the old one to the real DOM. You describe; React updates.
+
+## 37.1 Setting up React with Vite and TypeScript
+
+You need two things to write React in TypeScript: something that turns `.tsx` files into JavaScript the browser can run, and a development server that reloads the page as you edit. **Vite** (French for "fast", pronounced "veet") does both. It is the standard way to start a client-side React project today, and its `react-ts` template gives you React, TypeScript, and a lint setup in one command:
+
+```sh
+npm create vite@latest taskflow-react -- --template react-ts
+cd taskflow-react
+npm install
+npm run dev
+#   VITE ready
+#   ➜  Local:   http://localhost:5173/
+```
+
+Open the URL and you'll see a spinning logo and a counter button. Before changing anything, take a tour of what the template made. Most of it you already know from [Chapter 26](/chapter/26) and [Chapter 27](/chapter/27):
+
+```txt
+taskflow-react/
+├── index.html          The one HTML page. It contains an empty <div id="root">.
+├── package.json        Scripts: dev, build, lint, preview. Dependencies: react, react-dom.
+├── vite.config.ts      Vite's config, with the React plugin.
+├── tsconfig.json       Points at tsconfig.app.json (your code) and tsconfig.node.json (config files).
+├── eslint.config.js    Lint rules, including the rules of hooks (Chapter 43).
+└── src/
+    ├── main.tsx        The entry point: hands the #root div to React.
+    ├── App.tsx         The first component.
+    └── App.css, index.css
+```
+
+The most important file is the shortest one. `main.tsx` is where React takes ownership of a piece of the page:
+
+```tsx
+// src/main.tsx
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import "./index.css";
+import App from "./App.tsx";
+
+createRoot(document.getElementById("root")!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+);
+```
+
+`createRoot` takes a DOM element and returns a **root**: from now on, React manages everything inside that `div`. `render` tells the root what to show. The `!` after `getElementById` is the non-null assertion from [Chapter 9](/chapter/9). It's justified here because `index.html` always contains the `#root` element. `StrictMode` is a development-only checker that we'll meet in 37.6.
+
+Now replace `App.tsx` with the smallest possible component and watch the browser update the moment you save:
+
+```tsx
+// src/App.tsx
+export default function App() {
+  return <h1>TaskFlow</h1>;
+}
+```
+
+> 💡 **Tip.** `npm run dev` does **not** type-check. Vite strips the types and runs your code as fast as possible. Your editor shows type errors as you work, and `npm run build` runs `tsc` before bundling, so a type error fails the build. Keep an eye on the editor's Problems panel.
+
+## 37.2 UI as a function of state
+
+In P09 you had two jobs. Job one was keeping the data correct: the `tasks` array, the current filter. Job two was keeping the DOM in sync with that data, by hand, in every handler. Every bug in your pain log lived in job two. React deletes job two.
+
+Here is a trimmed version of the P09 handler. Notice that only four lines are about the *data*; everything else is about the *screen*:
+
+```ts
+// P09: src/events.ts (abridged)
+function onToggle(id: string) {
+  const task = state.tasks.find((t) => t.id === id);
+  if (!task) return;
+  task.done = !task.done;
+
+  const row = document.querySelector(`[data-id="${id}"]`);
+  row?.classList.toggle("done", task.done);
+  counterEl.textContent = `${state.tasks.filter((t) => !t.done).length} left`;
+  clearButton.hidden = !state.tasks.some((t) => t.done);
+  if (state.filter === "active" && task.done) row?.remove();
+  // …plus 20 more lines: the empty state, the tab badges, re-inserting rows…
+}
+```
+
+In React you write the two jobs separately. The handler only changes the data. A component function describes the screen *for any* data, including the counter, the empty state, and the filter, in one place:
+
+```tsx
+type Task = { id: string; title: string; done: boolean };
+
+function toggle(id: string) {
+  setTasks(tasks.map((t) => (t.id === id ? { ...t, done: !t.done } : t)));
+}
+
+type TaskSummaryProps = { tasks: Task[] };
+
+function TaskSummary({ tasks }: TaskSummaryProps) {
+  const left = tasks.filter((t) => !t.done).length;
+  if (tasks.length === 0) return <p>Nothing to do. Enjoy your day!</p>;
+  return <p>{left} of {tasks.length} left</p>;
+}
+```
+
+Don't worry about the syntax yet: `setTasks` comes from state ([Chapter 41](/chapter/41)), and the braces are JSX ([Chapter 38](/chapter/38)). Focus on the shape. `TaskSummary` doesn't know *how* the screen got here or what it looked like a moment ago. Given these tasks, it says what the summary should be. If the tasks change, React asks again. That's the whole equation: the same state always produces the same UI, so the counter can't drift out of date, because there is no separate copy of it to forget.
+
+> 🔗 **Connection.** This is the "UI = f(state)" idea from [Chapter 36](/chapter/36), now in real code. Throughout Part VIII we'll use the pared-down `Task` shape above; P02's full domain model returns in Part IX.
+
+## 37.3 Components return descriptions
+
+What does a component actually return? Not a DOM node. When you write `<li className="task">Write docs</li>`, TypeScript compiles it into a function call that builds a small, plain JavaScript object called a **React element**. An element is a description: "an `li`, with these props, containing this text". Log one and see for yourself:
+
+```tsx
+const element = <li className="task">Write docs</li>;
+console.log(element);
+// (simplified)
+// {
+//   $$typeof: Symbol(react.transitional.element),
+//   type: "li",
+//   key: null,
+//   props: { className: "task", children: "Write docs" }
+// }
+
+element instanceof HTMLElement; // false: it's a plain object, not a DOM node
+```
+
+Creating an element is cheap. Nothing appears on screen, nothing is inserted anywhere, and you can create thousands and throw them away. That's what makes "describe the whole UI every time" affordable.
+
+Elements can also describe *your* components. Then `type` holds the component function itself, and React hasn't called it yet:
+
+```tsx
+type TaskRowProps = { title: string };
+
+function TaskRow({ title }: TaskRowProps) {
+  return <li className="task">{title}</li>;
+}
+
+const row = <TaskRow title="Write docs" />;
+row.type === TaskRow; // true: a reference to the function, not its result
+row.props;            // { title: "Write docs" }
+```
+
+Think of the element as an order ticket. `<TaskRow title="Write docs" />` says "please run `TaskRow` with these props". React decides *when* to run it, which is during the next step: render.
+
+> 🧠 **Mental model.** Your components are **pure description factories**. They take props and return a tree of plain objects. React is the only thing that turns those objects into DOM nodes.
+
+## 37.4 Trigger, render, commit
+
+Every change you ever see on a React screen happens in the same three steps. Picture an architect and a builder. You, the architect, draw a complete blueprint each time anything changes. React, the builder, compares the new blueprint with the building that already exists and changes only what's different.
+
+1. **Trigger.** Something asks for an update. There are only two triggers: the initial `root.render(...)` call, and a state update such as `setCount(1)`.
+2. **Render.** React calls your component functions to get a fresh description. On the first render it starts at the root; on later renders it starts at the component whose state changed.
+3. **Commit.** React compares the new description with the previous one and applies the minimal set of DOM operations. On the first render that means creating every node; afterward, often just changing one text node or one attribute.
+
+After the commit, the browser paints the screen. That part isn't React's job. Here are the steps traced through a tiny counter:
+
+```tsx
+import { useState } from "react";
+
+function AddedCounter() {
+  const [count, setCount] = useState(0);
+  console.log("render, count =", count);
+  return <button onClick={() => setCount(count + 1)}>Added: {count}</button>;
+}
+
+createRoot(document.getElementById("root")!).render(<AddedCounter />);
+// 1. Trigger: root.render(...) requests the initial render
+// 2. Render:  React calls AddedCounter() and gets a <button> description, "Added: 0"
+// 3. Commit:  React creates the <button> DOM node and appends it to #root
+//
+// The user clicks:
+// 1. Trigger: setCount(1) queues a re-render of AddedCounter
+// 2. Render:  React calls AddedCounter() again and gets "Added: 1"
+// 3. Commit:  React diffs, sees only the text changed, and updates that one text node
+```
+
+You haven't met `useState` yet ([Chapter 41](/chapter/41)). For now, read it as "a value React remembers between renders, plus a function that changes it and triggers a render".
+
+> 💡 **Tip.** When something on screen surprises you, ask which step you're in. "Why didn't it update?" is usually a missing **trigger**. "Why is this value wrong?" is usually a **render** question. "Why did my input lose focus?" is usually a **commit** question: React replaced a node you expected it to keep.
+
+## 37.5 The render tree
+
+Components contain other components, so a React app is a **tree**. `App` renders a `Header`, a `TaskList`, and a `Footer`; `TaskList` renders one `TaskRow` per task. React DevTools (37.8) shows you this tree, and it is how you should picture your app from now on:
+
+```txt
+App
+├── Header
+├── TaskList
+│   ├── TaskRow   "Write docs"
+│   ├── TaskRow   "Fix login bug"
+│   └── TaskRow   "Plan sprint"
+└── Footer
+```
+
+The rule for re-rendering follows from the tree. When a component's state changes, React re-renders **that component and everything below it**. Its parents and siblings are not called again. If `TaskList` re-renders, every `TaskRow` re-renders too, even rows whose props didn't change. That's the default, and it's almost always fine; [Chapter 47](/chapter/47) covers the rare cases where you'd skip it.
+
+Here is the part people get wrong: **re-rendering does not mean replacing the DOM**. It means calling functions and comparing descriptions. If the description of a node didn't change, its DOM node is left completely alone. You can prove it:
+
+```tsx
+function App() {
+  const [clicks, setClicks] = useState(0);
+  return (
+    <main>
+      <button onClick={() => setClicks(clicks + 1)}>Clicked {clicks} times</button>
+      <NoteBox />
+    </main>
+  );
+}
+
+function NoteBox() {
+  console.log("NoteBox rendered"); // logs on every click: NoteBox re-renders…
+  return <input placeholder="Type a note, then click the button" />;
+}
+// …yet your half-typed note survives every click, with the cursor where you left it.
+// The <input> description never changed, so React never touched that DOM node.
+```
+
+In P09, "re-render everything" meant wiping `innerHTML` and losing focus, scroll position, and typed text. In React, re-rendering everything is the normal, safe thing to do, because the commit step only touches what differs.
+
+## 37.6 Purity
+
+React can call your component whenever it wants, as often as it wants, and throw away the result. That only works if your component behaves like a math function. A **pure** component follows two rules:
+
+- **Same inputs, same output.** Given the same props and state, it returns the same description.
+- **It minds its own business.** It doesn't change anything that existed before it was called: no mutating props, no writing to module variables, no touching the DOM, no network requests.
+
+The classic violation is a variable that lives outside the component:
+
+```tsx
+let rowNumber = 0;
+
+function TaskRow({ title }: TaskRowProps) {
+  rowNumber++; // ❌ changes a variable that existed before this render
+  return <li>#{rowNumber} {title}</li>;
+}
+// Three tasks should show #1, #2, #3.
+// In development you see #2, #4, #6, and after the next re-render, #8, #10, #12.
+```
+
+The sneakier TaskFlow version is mutating a prop. `sort` sorts *in place*, so this component silently reorders its parent's array during render:
+
+```tsx
+type TaskListProps = { tasks: Task[] };
+
+function SortedTaskList({ tasks }: TaskListProps) {
+  tasks.sort((a, b) => a.title.localeCompare(b.title)); // ❌ mutates the parent's array
+  const sorted = [...tasks].sort((a, b) => a.title.localeCompare(b.title)); // ✅ sorts a copy
+  return <ul>{sorted.map((t) => <li key={t.id}>{t.title}</li>)}</ul>;
+}
+```
+
+Purity does not mean "no mutation at all". Mutating something you **created during this render** is fine, because nobody else can see it:
+
+```tsx
+function TaskStats({ tasks }: TaskListProps) {
+  const counts = { open: 0, done: 0 }; // ✅ created during this render
+  for (const t of tasks) {
+    if (t.done) counts.done++;
+    else counts.open++;
+  }
+  return <p>{counts.open} open, {counts.done} done</p>;
+}
+```
+
+So why did the first example skip numbers? Because of `StrictMode` in `main.tsx`. In development, React **calls every component function twice** and keeps one result. A pure component can't tell the difference. An impure one shows its bug immediately (`#2, #4, #6`) instead of months later. In production, components render once. If you see a double log in the console, that's Strict Mode doing its job; React DevTools dims the log from the second call.
+
+Side effects aren't banned; they just don't belong in render. Things that happen *because the user did something* go in event handlers ([Chapter 41](/chapter/41)). Synchronizing with outside systems goes in effects ([Chapter 44](/chapter/44)).
+
+## 37.7 What React is and isn't
+
+React is a **library**, not a framework. It does one job: turning components and state into a UI, and keeping that UI up to date. Look at what the template installed:
+
+```json
+{
+  "dependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  }
+}
+```
+
+That's the whole of React, in two packages. `react` holds the model: components, elements, hooks. It knows nothing about browsers. `react-dom` is a **renderer**: it knows how to commit descriptions to the browser DOM. That split is why React Native exists. It swaps the renderer and keeps the model, so the same component ideas produce native iOS and Android views.
+
+Many things a real app needs are deliberately *not* in React. You'll add each one when you need it, and the book has a chapter for each:
+
+| You need… | Where it comes from | Chapter |
+|---|---|---|
+| Different pages for different URLs | A router (React Router) | [59](/chapter/59) |
+| Loading and caching server data | `fetch` plus a server-state library (TanStack Query) | [61](/chapter/61), [62](/chapter/62) |
+| Forms with validation | Your own code, then a schema library | [63](/chapter/63), [64](/chapter/64) |
+| App-wide state architecture | Context, reducers, or a store | [60](/chapter/60) |
+| Styling | CSS Modules, utility CSS, or a component library | [58](/chapter/58), [93](/chapter/93) |
+| Server rendering, file-based routes | A React framework (Next.js, React Router framework mode) | [96](/chapter/96) |
+
+> 🌍 **Real world.** "Should we use a framework?" is a real decision teams make. A framework bundles routing, data loading, and server rendering with strong opinions. Plain React + Vite, which this book uses until [Chapter 96](/chapter/96), keeps every choice visible, which is exactly what you want while learning how the pieces fit.
+
+## 37.8 React DevTools
+
+React DevTools is a browser extension (Chrome, Firefox, and Edge) that adds two tabs to your browser's developer tools. Install it now; you'll use it in every remaining chapter. It shows you the **component tree** instead of the DOM tree, which is the view that matches how you write the code.
+
+Take a small app like this one:
+
+```tsx
+type TaskRowProps = { task: Task; onToggle: (id: string) => void };
+
+function TaskRow({ task, onToggle }: TaskRowProps) {
+  return (
+    <li>
+      <input type="checkbox" checked={task.done} onChange={() => onToggle(task.id)} />
+      {task.title}
+    </li>
+  );
+}
+```
+
+In the **Components** tab you'll see the tree from 37.5. Click a `TaskRow` and the right-hand panel shows what React knows about it: its props, its state (listed under "hooks"), and which component rendered it:
+
+```txt
+▾ App
+  ▾ TaskList
+      TaskRow  key="t1"     ← selected
+      TaskRow  key="t2"
+
+TaskRow
+  props
+    onToggle: ƒ toggle() {}
+    task: { done: false, id: "t1", title: "Write docs" }
+  rendered by
+    TaskList
+    App
+    createRoot()
+```
+
+Three habits pay off immediately. First, **edit values live**: double-click a prop or a piece of state in the panel and change it, and the UI re-renders, which is a fast way to check "what does this look like with zero tasks?". Second, open the settings gear and turn on **"Highlight updates when components render"**. Every render flashes a border, so you can *see* 37.5's rule that a parent's re-render reaches its whole subtree. Third, the **Profiler** tab records renders and how long each took; you'll use it properly in [Chapter 47](/chapter/47).
+
+> 💡 **Tip.** DevTools shows the names of your functions. Use named function declarations (`function TaskRow()`) rather than anonymous arrow functions in default exports, or your tree fills up with `Anonymous`.
+
+## Common mistakes
+
+> ⚠️ **Thinking a re-render rewrites the DOM.** A re-render calls functions and compares descriptions; only the differences are committed. Developers who believe otherwise start "optimizing" renders that cost nothing, or avoid state because it "redraws the page". Measure before you worry ([Chapter 47](/chapter/47)).
+
+> ⚠️ **Side effects during render.** Writing to `localStorage`, setting `document.title`, starting a timer, or calling `fetch` in the body of a component runs on every render, twice in development, and possibly for renders React throws away. Move the work to an event handler or, if it truly synchronizes with something outside React, an effect.
+
+```tsx
+function TaskPage({ tasks }: TaskListProps) {
+  localStorage.setItem("tasks", JSON.stringify(tasks)); // ❌ side effect during render
+  document.title = `${tasks.length} tasks`;              // ❌ same problem
+  return <TaskList tasks={tasks} />;
+}
+```
+
+> ⚠️ **Mutating props.** Props belong to the parent. `props.tasks.push(...)`, `tasks.sort()`, and `task.done = true` all change the parent's data behind React's back, so the screen and the data disagree. Make a copy, or ask the parent to change its data through a callback ([Chapter 39](/chapter/39)).
+
+## When to use it, and when not to
+
+> ✅ **Use it when** the screen has many pieces that depend on the same changing data: lists with filters and counters, dashboards, editors, anything where P09-style manual synchronization would multiply. React's model pays off in proportion to how much of your UI is *derived* from state.
+
+> 🚫 **When not to.** A mostly static page, such as a marketing site, a blog, or documentation with one small widget, doesn't need a client-side UI library at all; plain HTML, CSS, and a few lines of DOM code are smaller and faster. React also adds a build step and about 60 KB of compressed JavaScript. For a single interactive form on an otherwise static page, that may be more machinery than the problem deserves.
+
+## How it connects
+
+> 🔗 **Connection.** [Chapter 36](/chapter/36) argued for "UI = f(state)"; this chapter showed the mechanism behind it (descriptions, render, commit). The pain you logged in [P09](/projects/p09) was all synchronization work that the commit step now does for you. Next, [Chapter 38](/chapter/38) explains the JSX syntax used to write descriptions, and [Chapter 41](/chapter/41) explains the state that triggers re-renders. In Part IX, [Chapter 49](/chapter/49) shows how TypeScript types the element objects you logged in 37.3.
+
+> 🌍 **Real world.** The render/commit split is why React can do things that hand-written DOM code can't easily do: pause a large render to keep typing responsive, render on a server and commit in a browser ([Chapter 96](/chapter/96)), or target phones with React Native. All of those rely on render being pure.
+
+## Exercises
+
+### Level 1 — Recall
+
+For each scenario, write down what the **trigger** is, which components **render**, and what the **commit** changes in the DOM (it may be "nothing"):
+
+1. The page loads and `createRoot(...).render(<App />)` runs for the first time.
+2. The user checks the box on the "Write docs" row, and `App` calls `setTasks` with a new array in which that task is done.
+3. `App` re-renders because the user typed in a search box, but the `Footer` component's props and output are exactly the same as before.
+
+### Level 2 — Application
+
+Port P09's static task list markup into a component tree in a new Vite `react-ts` project. Create `App`, `Header`, `TaskList`, `TaskRow`, and `Footer` components, each in its own file. Hard-code an array of three tasks in `App` and pass what each component needs as props. There is no state and no interactivity yet; the goal is that the rendered page looks like P09's initial screen.
+
+### Level 3 — Challenge
+
+Write a deliberately impure component: a `TaskRow` that increments a module-level counter during render and displays it. Run it under `StrictMode` and record exactly which numbers appear, then explain the pattern. Next, write a second impure component that sorts its `tasks` prop in place, and find a way to make the bug *visible* in the parent. Finally, fix both so they produce correct output with and without Strict Mode.
+
+*Hint: the row number already exists in the data you're rendering; you just need to pass it down.*
+
+### Level 4 — Real-world
+
+**Ticket TF-201: Component map of a production app.** Before we design TaskFlow's React structure, the team wants to see how a mature React app is organized.
+
+- Pick a production site built with React (the React DevTools icon lights up on them) and explore it with the Components tab.
+- Sketch its component hierarchy for one screen, at least three levels deep.
+- With "Highlight updates" on, perform three interactions and note which subtrees re-render for each.
+- Write a paragraph on one thing that surprised you about where they drew component boundaries.
+
+## Key takeaways
+
+- **UI = f(state).** You write functions that describe the screen for any data; React keeps the DOM matching the latest description.
+- Components return **elements**: plain, cheap objects that describe UI. They are not DOM nodes.
+- Every update is **trigger → render → commit**. Only the commit touches the DOM, and only where something changed.
+- A re-render re-runs a component and its whole subtree, but **does not replace DOM nodes** whose description didn't change.
+- Components must be **pure** during render. Strict Mode calls them twice in development to expose violations.
+- React is a **library** (`react` plus a renderer such as `react-dom`); routing, data, and forms are added separately.
+
+## What comes next
+
+We've been writing `<li className="task">` as if it were HTML, but you just saw it become an object. So what is that syntax, why is it `className` and not `class`, and what are the curly braces doing? [Chapter 38: JSX, Describing UI with JavaScript](/chapter/38) answers all of it, starting with what the compiler actually produces.

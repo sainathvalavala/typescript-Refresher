@@ -1,0 +1,325 @@
+> 📖 **The problem.** TaskFlow has a dark mode and a signed-in user. The theme is needed by a tiny `Badge` four levels down, and the user's name by an avatar in the header and a "assigned to you" label deep inside a task row. So `App` passes `theme` and `currentUser` to `Layout`, which passes them to `Sidebar`, which passes them to `TaskList`, which passes them to `TaskRow`, which finally passes them to `Badge`. Five components handle a value only to hand it on. Adding a `locale` means touching all of them again.
+
+This is **prop drilling**, and it's the problem context solves. By the end of this chapter you'll be able to create and provide a context, read it from any descendant, build a provider that owns state, decide when context is the right tool (and when it's heavier than you need), avoid the re-render trap, and reach for plain composition first.
+
+> 🧠 **Mental model.** *Context is a broadcast channel scoped to a subtree.* A **provider** sends a value, and any descendant can **tune in** to it, without the components in between knowing it exists. The nearest provider above a component wins.
+
+## 46.1 The prop-drilling problem
+
+Look at the pain in code. Everything between `App` and `Badge` receives `theme` purely to forward it:
+
+```tsx
+function App() {
+  const [theme, setTheme] = useState<Theme>("light");
+  return <Layout theme={theme} />;
+}
+function Layout({ theme }: { theme: Theme }) {
+  return <Sidebar theme={theme} />;           // doesn't use theme
+}
+function Sidebar({ theme }: { theme: Theme }) {
+  return <TaskList theme={theme} />;          // doesn't use theme
+}
+function TaskList({ theme }: { theme: Theme }) {
+  return <ul><TaskRow theme={theme} /></ul>;  // doesn't use theme
+}
+function TaskRow({ theme }: { theme: Theme }) {
+  return <li><Badge theme={theme} /></li>;    // only this one finally uses it
+}
+```
+
+Is that actually bad? It depends. Drilling through **one or two** layers is explicit, searchable, and type-checked: you can see where every value comes from. That's a real virtue, and for most data it's the right answer.
+
+It starts to hurt when three things combine: the data is needed in **many places**, the **path is long**, and the intermediate components **have no reason to know** about it. Then every new piece of "ambient" data (locale, current user, feature flags) means editing a whole chain of components that have nothing to do with it, and each edit is a chance to forget one.
+
+```tsx
+// Adding `locale` means a new prop on every component in the chain:
+<Layout theme={theme} locale={locale} />
+<Sidebar theme={theme} locale={locale} />
+<TaskList theme={theme} locale={locale} />   // …and so on, and a missing one is a bug
+```
+
+> 💡 **Tip.** Before reaching for context, check [46.7](#467-composition-before-context): restructuring the components often removes the chain without any new concept.
+
+## 46.2 Creating and providing context
+
+Context has two halves. You **create** a context object, which carries a default value, and you **provide** a real value to a subtree by rendering the context itself as a component around it.
+
+```tsx
+import { createContext } from "react";
+
+export type Theme = "light" | "dark";
+
+export const ThemeContext = createContext<Theme>("light"); // "light" is the default when there is no provider
+```
+
+```tsx
+function App() {
+  const [theme] = useState<Theme>("dark");
+  return (
+    <ThemeContext value={theme}>      {/* everything inside can read "dark" */}
+      <Layout />
+    </ThemeContext>
+  );
+}
+```
+
+`Layout` and everything between now take no `theme` prop at all. The type argument to `createContext<Theme>` states what *kind* of value flows through the channel, and every provider and consumer is checked against it.
+
+```tsx
+<ThemeContext value="blue">  {/* ❌ Type '"blue"' is not assignable to type 'Theme'. */}
+  <Layout />
+</ThemeContext>
+```
+
+> 🆕 **Modern note.** In React 19 you render the context object directly: `<ThemeContext value={...}>`. Earlier versions required `<ThemeContext.Provider value={...}>`, which you'll still see in older code (and it still works). New code can drop the `.Provider`.
+
+## 46.3 Consuming context
+
+Any component beneath the provider reads the value with the `useContext` hook, passing the context object:
+
+```tsx
+import { useContext } from "react";
+
+function Badge({ label }: { label: string }) {
+  const theme = useContext(ThemeContext); // theme: Theme
+  return <span className={`badge badge-${theme}`}>{label}</span>;
+}
+```
+
+`useContext` returns the value from the **nearest provider above** the component in the tree. That makes it easy to override a value for one region by nesting providers:
+
+```tsx
+<ThemeContext value="light">
+  <Header />                       {/* reads "light" */}
+  <ThemeContext value="dark">
+    <Sidebar />                    {/* reads "dark": the nearest provider wins */}
+  </ThemeContext>
+</ThemeContext>
+```
+
+If there is *no* provider above, the component gets the **default value** given to `createContext`. For simple values like a theme, a sensible default is fine. For contexts whose value only exists when a provider supplies it (a logged-in user, a store), a default is misleading, so the usual TypeScript pattern is to default to `null` and make misuse an error:
+
+```tsx
+const AuthContext = createContext<AuthValue | null>(null);
+
+export function useAuth(): AuthValue {
+  const value = useContext(AuthContext); // AuthValue | null
+  if (value === null) throw new Error("useAuth must be used inside <AuthProvider>"); // narrows to AuthValue
+  return value;
+}
+```
+
+Now every consumer calls `useAuth()` and gets a non-null `AuthValue`, or a clear error during development if the provider is missing. Without that guard, you'd write `value?.user` everywhere, and forgetting the provider would give you silent `undefined`s.
+
+> 🆕 **Modern note.** React 19 also adds `use(ThemeContext)`, which reads context like `useContext` but can be called conditionally (inside `if`, after an early return). `useContext` remains fine, and is what most code uses.
+
+## 46.4 Context with state
+
+A context value is usually *live*: it changes when the user toggles a switch or logs in. For that you need state, and the standard shape is a **provider component** that owns the state and publishes it, together with a way to change it:
+
+```tsx
+import { createContext, useContext, useState, useMemo, type ReactNode } from "react";
+
+interface ThemeContextValue {
+  theme: Theme;
+  toggleTheme: () => void;
+}
+
+const ThemeContext = createContext<ThemeContextValue | null>(null);
+
+export function ThemeProvider({ children }: { children: ReactNode }) {
+  const [theme, setTheme] = useState<Theme>("light");
+
+  const value = useMemo(
+    () => ({ theme, toggleTheme: () => setTheme((t) => (t === "light" ? "dark" : "light")) }),
+    [theme],
+  );
+
+  return <ThemeContext value={value}>{children}</ThemeContext>;
+}
+
+export function useTheme(): ThemeContextValue {
+  const ctx = useContext(ThemeContext);
+  if (ctx === null) throw new Error("useTheme must be used inside <ThemeProvider>");
+  return ctx;
+}
+```
+
+(The `useMemo` is explained in [46.6](#466-context-and-re-renders).) Anything inside the provider can now read the theme *and change it*:
+
+```tsx
+function ThemeToggle() {
+  const { theme, toggleTheme } = useTheme();
+  return <button onClick={toggleTheme}>Switch to {theme === "light" ? "dark" : "light"}</button>;
+}
+
+// main.tsx
+createRoot(document.getElementById("root")!).render(
+  <ThemeProvider>
+    <App />
+  </ThemeProvider>,
+);
+```
+
+Notice how few moving parts there are. The **state** lives in one component (`ThemeProvider`), where [Chapter 42](/chapter/42)'s rules say it should. The **context** is just the wire that carries it down. The **custom hook** `useTheme` hides the `useContext` call and the null check, so consumers never see either ([Chapter 48](/chapter/48)).
+
+The `children` pattern deserves a note: because `ThemeProvider` receives its children as a prop, changing its state re-renders only the provider and the *consumers*. The children elements were created by the parent and are unchanged, so React skips re-rendering the components between.
+
+## 46.5 When to use context
+
+Context is the right tool for data that is **needed by many components at different depths, and changes rarely**. That's a short list:
+
+| Good fit | Why |
+|---|---|
+| **Theme** (light/dark, density) | Read by many leaf components, changes on user action |
+| **Current user / auth** | Needed all over the tree, changes on login or logout |
+| **Locale / i18n** | Ambient, read in many places |
+| **Feature-level state** (a multi-step wizard, a drag-and-drop session) | Shared by a handful of components inside one feature |
+| **A dependency** (API client, router) | Pass services without drilling |
+
+Equally important is what *not* to put there. "Global state" isn't a reason on its own: putting your whole app's data into one giant context makes every consumer depend on everything, and every change re-render everyone ([46.6](#466-context-and-re-renders)).
+
+```tsx
+// ❌ A single "everything" context
+const AppContext = createContext<{
+  tasks: Task[]; filter: Filter; user: User; theme: Theme; modalOpen: boolean; /* … */
+} | null>(null);
+
+// ✅ Small, focused contexts, each with a clear reason to exist
+//    ThemeProvider, AuthProvider, and a TaskBoardProvider scoped to the board feature
+```
+
+The decision procedure, in order: **(1)** Can I keep the state local? **(2)** Is lifting to a parent and passing a few props fine ([Chapter 42](/chapter/42))? **(3)** Could composition remove the chain ([46.7](#467-composition-before-context))? **(4)** Only then, context. For *server data* (fetched tasks, users), context isn't the tool at all: use a data-fetching layer ([Chapter 62](/chapter/62)). [Chapter 60](/chapter/60) maps the whole landscape.
+
+> 🚫 **When not to.** Don't use context to avoid typing a prop that is used in two nearby components. Explicit props are traceable (you can "find all references"), and context is invisible wiring. Use it when the alternative is genuinely worse.
+
+## 46.6 Context and re-renders
+
+Here's the cost. **When a context's value changes, every component that reads it re-renders**, even if the part of the value it cares about didn't change. React compares the value with `Object.is` ([Chapter 47](/chapter/47)), so the trap is accidentally producing a *new* value object every render:
+
+```tsx
+function ThemeProvider({ children }: { children: ReactNode }) {
+  const [theme, setTheme] = useState<Theme>("light");
+  // ❌ A new object on every render of ThemeProvider: every consumer re-renders, even when nothing changed
+  return <ThemeContext value={{ theme, toggleTheme: () => setTheme(/* … */) }}>{children}</ThemeContext>;
+}
+```
+
+Whenever `ThemeProvider` renders (for any reason, such as its own parent re-rendering), the object literal is new, so React treats the context as "changed" and re-renders all consumers. The fix is a **stable value**: memoize the object with `useMemo`, as in 46.4, so it only changes when `theme` does.
+
+> 🆕 **Modern note.** If you use the React Compiler ([Chapter 47](/chapter/47)), it stabilizes this for you. Without it, the `useMemo` is a correct, cheap habit for any provider value that is an object.
+
+The second fix is **splitting**. If a context bundles values that change at different rates, consumers that need only the stable part still re-render on the fast part. Separate them:
+
+```tsx
+const TasksContext = createContext<Task[]>([]);                     // changes often
+const TasksDispatchContext = createContext<(a: TaskAction) => void>(() => {}); // the dispatch function never changes
+
+function TasksProvider({ children }: { children: ReactNode }) {
+  const [tasks, dispatch] = useReducer(tasksReducer, []);
+  return (
+    <TasksContext value={tasks}>
+      <TasksDispatchContext value={dispatch}>{children}</TasksDispatchContext>
+    </TasksContext>
+  );
+}
+```
+
+A component that only *dispatches* (an "add task" button) reads `TasksDispatchContext` and does **not** re-render when the list changes. This "state context + dispatch context" split is the standard recipe, and it pairs naturally with reducers ([Chapter 55](/chapter/55)).
+
+> ⚠️ **Common mistake.** Reaching for context to solve a performance problem. Context doesn't prevent re-renders; it can *cause* wider ones. If a value changes ten times per second (mouse position, a timer), keep it out of context.
+
+## 46.7 Composition before context
+
+Before adding any context, check whether the chain exists because of how you structured the components. The drilling in 46.1 happened because `TaskRow` was created *deep inside* `TaskList`, which forced the data to travel through. If instead the **parent builds the parts and passes them down as children (or props)**, nothing needs to travel:
+
+```tsx
+// ❌ Drilling: Layout must receive `user` only to forward it
+function Layout({ user }: { user: User }) {
+  return <header><Avatar user={user} /></header>;
+}
+
+// ✅ Composition: Layout accepts a slot. The caller, which already has `user`, fills it.
+function Layout({ avatar, children }: { avatar: ReactNode; children: ReactNode }) {
+  return (
+    <>
+      <header>{avatar}</header>
+      <main>{children}</main>
+    </>
+  );
+}
+
+function App() {
+  const user = useCurrentUser();
+  return (
+    <Layout avatar={<Avatar user={user} />}>
+      <TaskBoard />
+    </Layout>
+  );
+}
+```
+
+`Layout` no longer knows `User` exists. `App` created `<Avatar user={user} />` itself, where `user` is in scope, and handed the finished element down. The chain collapsed from three layers to zero, with no new concept: just `children` and props that accept elements ([Chapter 39](/chapter/39)).
+
+It's worth trying this first in a surprising number of cases, because it keeps data flow **explicit and local**, and it has no runtime cost. Context is the better answer when many *different* components at *many* depths need the same ambient value, and you can't (or don't want to) restructure the parents.
+
+## Common mistakes
+
+> ⚠️ **Putting everything in context.** A giant `AppContext` re-renders every consumer on every change. Keep contexts small and purposeful.
+
+> ⚠️ **Creating a new value object in every render.** `value={{ a, b }}` re-renders all consumers each time the provider renders. Memoize the value, or use the Compiler.
+
+> ⚠️ **Forgetting the provider.** With a `null` default and no guard, consumers get `null` and crash far from the cause. Write a `useX` hook that throws a clear error.
+
+> ⚠️ **Using context for fast-changing values.** Mouse position, scroll offset, and timers re-render all consumers constantly.
+
+> ⚠️ **Using context where a prop is clearer.** Don't hide a two-level data path behind invisible wiring.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** many components at different depths need the same ambient data that changes rarely: theme, current user, locale, and feature-scoped state.
+
+> 🚫 **When not to.** Local state, a prop through one or two layers, or a chain that composition can remove. Never use context as a substitute for a data-fetching layer or as a way to make performance problems disappear.
+
+## How it connects
+
+> 🔗 **Connection.** The provider pattern uses `useState` ([Chapter 41](/chapter/41)) and the ownership rules of [Chapter 42](/chapter/42). The `useX` accessor is a tiny custom hook ([Chapter 48](/chapter/48)). Typing contexts, including the `null`-default pattern in depth, is the subject of [Chapter 54](/chapter/54), and [Chapter 55](/chapter/55) pairs context with reducers. Where each piece of state lives in a real application is mapped in [Chapter 60](/chapter/60).
+
+## Exercises
+
+### Level 1 — Recall
+
+Decide **context or props** for each, and justify in one sentence: (1) the current theme, (2) a task's title shown in `TaskRow`, (3) the signed-in user, (4) the selected filter used by two sibling components, (5) the app's API client, (6) a "loading" flag for one button.
+
+### Level 2 — Application
+
+Add a theme context with a toggle to your TaskFlow app. Create `ThemeProvider`, a `useTheme` hook that throws if used outside the provider, a `ThemeToggle` button, and apply the theme to a wrapping element's `data-theme` attribute. Confirm that no intermediate component receives a `theme` prop.
+
+### Level 3 — Challenge
+
+Take a prop-drilling chain of three or more layers in your code (or this one: `Page → Sidebar → ProjectList → ProjectItem → DeleteButton`, where only the last needs `onDelete`). Remove it using **composition alone**: no context, no global store.
+
+*Hint: let the component that has the data build the element that uses it, and pass that element down as `children` or a named prop.*
+
+### Level 4 — Real-world
+
+**Ticket TF-440: Design the context map for TaskFlow.** Before the team starts adding providers, produce a one-page design.
+
+- List every piece of cross-cutting state (theme, user, locale, toasts, the current project, the task board's filters) and say where it lives: local state, lifted state, context, or server-state library.
+- For each context, list its provider's position in the tree and the consumers it expects.
+- Identify which values change often, and how you'll split contexts to avoid unnecessary re-renders.
+- Explain why the list of fetched tasks is *not* in context.
+
+## Key takeaways
+
+- Prop drilling is fine for one or two layers, and painful when many components need ambient data through components that don't care.
+- **Create** a context with `createContext<T>`, **provide** with `<Ctx value={…}>` (React 19), and **consume** with `useContext`. The nearest provider wins.
+- A provider component owns the state, and a `useX` hook hides `useContext` plus a null check.
+- When a context value changes, **every** consumer re-renders. Memoize object values, and split contexts that change at different rates.
+- Try composition first: pass finished elements as `children` or props instead of data through layers.
+- Context suits theme, auth, locale, and feature-scoped state, not "everything global" and not server data.
+
+## What comes next
+
+Context just forced us to talk about **new objects every render** and `Object.is`. That's a much bigger topic, and it's the root of React's whole performance story: why a memoized child re-renders anyway, what `useMemo` and `useCallback` really do, and when none of it matters. [Chapter 47: useMemo, useCallback & memo](/chapter/47) is about identity.
+

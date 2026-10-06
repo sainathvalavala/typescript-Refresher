@@ -1,0 +1,389 @@
+> 📖 **The problem.** The new-task form should focus its title field when it opens. You write `const inputRef = useRef<HTMLInputElement>(null)`, attach it with `ref={inputRef}`, and call `inputRef.current.focus()` in an effect. TypeScript refuses: `'inputRef.current' is possibly 'null'`. But you *know* the input is there. Why can't the ref just *be* the element?
+
+Because during the first render, the element doesn't exist yet. React creates it after your component function returns, then fills the ref in. So the honest type of a DOM ref includes `null`, and the compiler is simply reminding you of that moment. This chapter covers the whole ref toolbox: DOM refs, mutable "value" refs, how React 19 changed the types, passing `ref` to your own components, callback refs, the legacy `forwardRef` you'll still meet in older code, `useImperativeHandle`, and merging refs. By the end, you'll be able to type any ref, and migrate old `forwardRef` components confidently.
+
+> 🧠 **Mental model.** **A DOM ref is empty during the first render and filled in after commit**, so its type honestly includes `null`. A *value* ref (a timer id, a counter) holds whatever you put in it, and never touches the DOM.
+
+## 53.1 DOM refs
+
+A **ref** is a box with a single field, `.current`, that React keeps across renders without re-rendering when it changes. To get a DOM element, create the ref with `null`, hand it to the element's `ref` prop, and read `.current` later. The type argument says *which* element you expect:
+
+```tsx
+import { useEffect, useRef } from "react";
+
+function NewTaskForm() {
+  const titleRef = useRef<HTMLInputElement>(null);
+  // titleRef: RefObject<HTMLInputElement | null>
+
+  useEffect(() => {
+    titleRef.current.focus();
+    //  ^^^^^^^^^^^ ❌ 'titleRef.current' is possibly 'null'.
+    titleRef.current?.focus(); // ✅ narrowed with optional chaining
+  }, []);
+
+  return <input ref={titleRef} />;
+}
+```
+
+`.current` is `null` before the element mounts and again after it unmounts. Effects and event handlers run after mount, so the value is *usually* there, but the compiler can't know that, so you narrow:
+
+```tsx
+function handleReset() {
+  const input = titleRef.current;
+  if (input === null) return; // narrowing once, then use the local variable
+  input.value = "";
+  input.focus();
+}
+```
+
+Pick the element type that matches the JSX tag: `HTMLInputElement` for `input`, `HTMLButtonElement`, `HTMLDivElement`, `HTMLFormElement`, `HTMLTextAreaElement`, and so on. A mismatch is a compile error at the `ref` prop: `<div ref={titleRef} />` fails because a `div` can't be an input.
+
+> ⚠️ **Common mistake.** Silencing the error with `titleRef.current!.focus()`. It compiles, and crashes with `Cannot read properties of null` the day the code runs before mount or after unmount. The `?.` costs two characters.
+
+## 53.2 Mutable value refs
+
+Refs aren't only for the DOM. Anything you want to remember *across renders without causing a re-render* belongs in one: a timer id, the previous value of a prop, a counter, a flag that says "already submitted". These **value refs** aren't tied to an element, so the type is just whatever you store.
+
+```tsx
+function AutoSave({ draft, onSave }: { draft: string; onSave: (text: string) => void }) {
+  const timerRef = useRef<number | null>(null);   // number while a timer is pending, otherwise null
+  const saveCountRef = useRef(0);                 // inferred as number; the argument is the initial value
+  const lastSavedRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+    timerRef.current = window.setTimeout(() => {
+      onSave(draft);
+      lastSavedRef.current = draft;
+      saveCountRef.current += 1; // ✅ writable: no re-render, just a stored number
+    }, 500);
+    return () => {
+      if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+    };
+  }, [draft, onSave]);
+
+  return <small>Saved {saveCountRef.current} times</small>;
+}
+```
+
+A rule of thumb: if changing the value should update the screen, it's **state**. If it should not, it's a ref. And notice the last line above reads a ref during render; React discourages that, since it won't re-render when the value changes. Show derived data from state, and keep refs for effects and handlers.
+
+> 💡 **Tip.** In browsers, `setTimeout` returns a `number`, but in Node's types it returns `NodeJS.Timeout`. When code must work for both, write `useRef<ReturnType<typeof setTimeout>>(undefined)`, which uses whichever the environment provides.
+
+## 53.3 Modern ref typings
+
+Two things changed in React 19's types, and they make refs simpler.
+
+**First, `useRef` always requires an argument.** The old overload that allowed `useRef<string>()` with nothing is gone, because it produced a confusing type, `MutableRefObject<string | undefined>`. If you really mean "empty at first", say so:
+
+```tsx
+const a = useRef<string>();          // ❌ Expected 1 arguments, but got 0.
+const b = useRef<string>(undefined); // ✅ b: RefObject<string | undefined>
+const c = useRef<string | null>(null); // ✅ c: RefObject<string | null>
+```
+
+**Second, there is now one ref type, and it's mutable.** Previously, `useRef<T>(null)` returned a read-only `RefObject<T>` for DOM refs, while `useRef<T>(initial)` returned a writable `MutableRefObject<T>`. Now `RefObject<T>` has a plain, writable `current: T`, and `MutableRefObject` is deprecated. So you'll sometimes see this difference between old and new code:
+
+```tsx
+const ref = useRef<HTMLInputElement>(null);
+// React 19 types: ref is RefObject<HTMLInputElement | null>
+ref.current = document.createElement("input"); // ✅ allowed now (it was a read-only error before)
+```
+
+Note the `| null` inside the type: `useRef<HTMLInputElement>(null)` gives `RefObject<HTMLInputElement | null>`, because the type you wrote is the *element*, and `null` joins it for the initial value. That's the `| null` you narrow in 53.1.
+
+> 🕰 **Legacy note.** In React 18 types, you will see `useRef<T>(null)` documented as returning `RefObject<T>` with `readonly current: T | null`, and `MutableRefObject<T>` for value refs. If you read older code or older tutorials, treat both as "a ref", and remember the new typing covers both cases with one `RefObject`.
+
+## 53.4 Refs as props
+
+A parent often needs a ref to an element *inside* a child: to focus a custom text field, say. In React 19, **`ref` is just a regular prop for function components.** You declare it in your props type, and pass it on to the element. No wrapper function required.
+
+```tsx
+import type { Ref } from "react";
+
+type TextFieldProps = {
+  label: string;
+  ref?: Ref<HTMLInputElement>; // the type a parent can pass: a RefObject or a callback ref
+};
+
+function TextField({ label, ref }: TextFieldProps) {
+  return (
+    <label>
+      {label}
+      <input ref={ref} />
+    </label>
+  );
+}
+
+function SignInForm() {
+  const emailRef = useRef<HTMLInputElement>(null);
+  return (
+    <>
+      <TextField label="Email" ref={emailRef} />
+      <button onClick={() => emailRef.current?.focus()}>Jump to email</button>
+    </>
+  );
+}
+```
+
+`Ref<T>` is the type of *what a parent may pass*: a `RefObject<T | null>`, a callback ref, or `null`. It's the right type to declare on a prop.
+
+For wrappers around native elements, you rarely want to list props one by one. `ComponentProps<"input">` already includes the `ref` prop with the right type, so extending it passes everything through:
+
+```tsx
+import type { ComponentProps } from "react";
+
+type TextFieldProps = ComponentProps<"input"> & { label: string };
+
+function TextField({ label, ...inputProps }: TextFieldProps) {
+  return (
+    <label>
+      {label}
+      <input {...inputProps} /> {/* includes ref, onChange, value, and the rest */}
+    </label>
+  );
+}
+```
+
+Because `ref` is inside `inputProps`, the spread forwards it with no extra code. If you read that props type in [Chapter 50](/chapter/50), this is the same technique; refs simply ride along.
+
+## 53.5 Callback refs
+
+Instead of a ref *object*, the `ref` prop also accepts a **function**, called with the element when it mounts and with `null` when it unmounts. This is useful when you need to *do something* the moment an element appears (measure it, observe it), rather than reading it later.
+
+```tsx
+function MeasuredBox() {
+  const [height, setHeight] = useState(0);
+
+  // node: HTMLDivElement | null, because React calls this with null on unmount
+  const measure = (node: HTMLDivElement | null) => {
+    if (node !== null) setHeight(node.getBoundingClientRect().height);
+  };
+
+  return <div ref={measure}>Height is {height}px</div>;
+}
+```
+
+React 19 adds something new: a callback ref may **return a cleanup function**, just like `useEffect`. React runs the cleanup when the element unmounts (or the ref changes) *instead of* calling your callback again with `null`. That keeps setup and teardown side by side:
+
+```tsx
+function ObservedBox({ onResize }: { onResize: (width: number) => void }) {
+  return (
+    <div
+      ref={(node) => {
+        if (node === null) return; // the type is still HTMLDivElement | null, so narrow it
+        const observer = new ResizeObserver(([entry]) => onResize(entry.contentRect.width));
+        observer.observe(node);
+        return () => observer.disconnect(); // ✅ runs when the element is removed
+      }}
+    />
+  );
+}
+```
+
+The parameter is still typed `HTMLDivElement | null` (older React versions, and older callers, still pass `null`), so you narrow once at the top. What the types *do* restrict is the return value: it must be nothing, or a cleanup function.
+
+> ⚠️ **Common mistake.** Writing `ref={(node) => (nodes[id] = node)}`. An assignment expression *returns* the assigned value, so the callback returns an element or `null`, which React 19 would mistake for a cleanup. The types catch it: `Type 'null' is not assignable to type 'void | (() => VoidOrUndefinedOnly)'.` Use braces and no `return`: `ref={(node) => { nodes[id] = node; }}`.
+
+
+## 53.6 🕰 forwardRef in existing code
+
+Before React 19, function components couldn't receive `ref` as a prop; React stripped it out. The workaround was `forwardRef`, which wraps your component and passes the ref as a *second* argument. You'll find it all over older codebases and libraries, so learn to read it:
+
+```tsx
+import { forwardRef } from "react";
+
+type TextFieldProps = { label: string };
+
+const TextField = forwardRef<HTMLInputElement, TextFieldProps>(function TextField({ label }, ref) {
+  return (
+    <label>
+      {label}
+      <input ref={ref} />
+    </label>
+  );
+});
+//                          ┌ the element type the ref points at
+//      forwardRef<HTMLInputElement, TextFieldProps>(…)
+//                                    └ the props (without ref; forwardRef adds it)
+```
+
+Note the odd order: the **ref type comes first**, the props type second. Callers still write `<TextField ref={inputRef} label="…" />`, and `ref` is typed as `Ref<HTMLInputElement>`.
+
+`forwardRef` still works in React 19, but it is legacy and will be deprecated. Migrating is mechanical: drop the wrapper, add `ref` to the props type, and destructure it:
+
+```tsx
+// Before
+const TextField = forwardRef<HTMLInputElement, { label: string }>(function TextField({ label }, ref) {
+  return <input aria-label={label} ref={ref} />;
+});
+
+// After: public type is unchanged for callers
+function TextField({ label, ref }: { label: string; ref?: Ref<HTMLInputElement> }) {
+  return <input aria-label={label} ref={ref} />;
+}
+```
+
+Callers see no difference, so it's safe to migrate one component at a time. Two details: the new `ref` is optional by writing `ref?:`, matching how `forwardRef` made it optional, and there's no more `displayName` to set, because the function has a real name.
+
+## 53.7 useImperativeHandle
+
+Handing a parent the raw DOM element gives it *everything*: it can change `style`, `value`, `innerHTML`. Sometimes you want the opposite: a small, deliberate API. `useImperativeHandle` lets a component decide what its ref exposes. You define the handle's type, accept a `Ref` of that type, and build the object React will put in `ref.current`.
+
+```tsx
+import { useImperativeHandle, useRef, type Ref } from "react";
+
+export type SearchBoxHandle = {
+  focus(): void;
+  reset(): void;
+};
+
+type SearchBoxProps = {
+  onSearch: (query: string) => void;
+  ref?: Ref<SearchBoxHandle>; // note: the ref is to the handle, not to an HTMLInputElement
+};
+
+export function SearchBox({ onSearch, ref }: SearchBoxProps) {
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useImperativeHandle(ref, () => ({
+    focus() {
+      inputRef.current?.focus();
+    },
+    reset() {
+      if (inputRef.current) inputRef.current.value = "";
+    },
+  }), []);
+
+  return <input ref={inputRef} onChange={(e) => onSearch(e.currentTarget.value)} />;
+}
+```
+
+The parent gets exactly two methods and nothing else:
+
+```tsx
+function Toolbar() {
+  const searchRef = useRef<SearchBoxHandle>(null);
+  return (
+    <>
+      <SearchBox onSearch={console.log} ref={searchRef} />
+      <button onClick={() => searchRef.current?.focus()}>Search (/)</button>
+      <button onClick={() => searchRef.current?.blur()}>…</button>
+      {/* ❌ Property 'blur' does not exist on type 'SearchBoxHandle'. */}
+    </>
+  );
+}
+```
+
+> 🚫 **When not to.** Imperative handles are an escape hatch. If the parent can express what it wants through props (`autoFocus`, `open={true}`, a changing `key` to reset), prefer that. Reach for a handle only for things that are inherently *commands*: focus, scroll to, play, reset.
+
+## 53.8 Merging refs
+
+A component sometimes needs its **own** ref to an element *and* must forward the ref it was given. You can't pass two refs to one element, so you merge them into a single callback ref. The helper is a good place to see the 19-era types together: `Ref<T>` as input, `RefCallback<T>` as output, and cleanup functions.
+
+```tsx
+import type { Ref, RefCallback } from "react";
+
+function mergeRefs<T>(...refs: Array<Ref<T> | undefined>): RefCallback<T> {
+  return (node) => {
+    const cleanups: Array<() => void> = [];
+    for (const ref of refs) {
+      if (typeof ref === "function") {
+        const cleanup = ref(node); // a callback ref may return its own cleanup
+        cleanups.push(typeof cleanup === "function" ? cleanup : () => { ref(null); });
+      } else if (ref) {
+        ref.current = node; // RefObject is mutable in React 19 types
+        cleanups.push(() => { ref.current = null; });
+      }
+    }
+    return () => { for (const c of cleanups) c(); };
+  };
+}
+```
+
+Use it with `useMemo`, so the merged callback keeps a stable identity (a new function each render would make React detach and re-attach the ref every time):
+
+```tsx
+function TextField({ label, ref, ...rest }: ComponentProps<"input"> & { label: string }) {
+  const innerRef = useRef<HTMLInputElement>(null); // my own use: measuring, autofocus, …
+  const mergedRef = useMemo(() => mergeRefs(innerRef, ref), [ref]);
+
+  useEffect(() => {
+    innerRef.current?.select();
+  }, []);
+
+  return <input {...rest} ref={mergedRef} />; // the parent's ref and mine both get the element
+}
+```
+
+> 🌍 **Real world.** Libraries such as Radix UI, Headless UI, and `@floating-ui/react` ship a `useMergedRef` or `composeRefs` for exactly this. Use theirs if you already depend on them.
+
+## Common mistakes
+
+> ⚠️ **Non-null assertion on `.current`.** `ref.current!.focus()` compiles and crashes whenever the element isn't mounted. Use `?.` or an `if`.
+
+> ⚠️ **Using `useRef()` with no argument.** In React 19 types this is an error. Write `useRef<T>(null)` for DOM refs, or `useRef<T | undefined>(undefined)` for "empty value".
+
+> ⚠️ **Storing display data in a ref.** Changing `.current` doesn't re-render, so the screen goes stale. If it shows on the screen, it's state.
+
+> ⚠️ **Reading refs during render.** `ref.current` is `null` on the first render, and changes aren't tracked. Read refs in effects and handlers.
+
+> ⚠️ **Forgetting `ref` on custom components in React 18.** Passing `ref` to a function component *without* `forwardRef` silently does nothing there (React 19 supports it). If you target both, check which version you're on.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** you need to call a DOM method (`focus`, `scrollIntoView`, `select`), measure an element, hold a timer or "previous value" across renders, or integrate a non-React library that needs a real element.
+
+> 🚫 **When not to.** Don't use a ref to *read* what the user typed when a controlled input would do, and don't use refs to copy data between components. Derived or displayed data belongs in state. Prefer props over `useImperativeHandle` whenever the parent can say what it wants declaratively.
+
+## How it connects
+
+> 🔗 **Connection.** The `| null` in a DOM ref is the same "honest absence" idea as nullable state ([Chapter 52](/chapter/52)). Ref props build on `ComponentProps` from [Chapter 50](/chapter/50), and imperative handles reappear when [Chapter 57](/chapter/57) builds generic list components. Event handlers ([Chapter 51](/chapter/51)) are where you'll read most refs.
+
+> 🌍 **Real world.** Most production `forwardRef` usage lives in design-system components (inputs, buttons, dialogs). As libraries upgrade to React 19, you'll see their types change from `ForwardRefExoticComponent<…>` to plain function components with a `ref` prop, with no change for users.
+
+## Exercises
+
+### Level 1 — Recall
+
+Write the correct `useRef` call (type argument and initial value) for each:
+
+1. The `<canvas>` element, assigned via `ref`.
+2. A `setInterval` id (a number, or none yet).
+3. A render counter that starts at zero.
+4. The previous value of a `string` prop, which doesn't exist on the first render.
+5. A `<form>` element.
+6. A `WebSocket` that is created in an effect.
+
+### Level 2 — Application
+
+Build a `TextField` component that accepts a `ref` and forwards it to its inner `<input>`. It must accept every native input prop plus a required `label`, and a parent must be able to call `emailRef.current?.focus()`. Do not use `forwardRef`.
+
+### Level 3 — Challenge
+
+A virtualized list component renders many items. Expose a typed `scrollToItem(id: string)` handle through `useImperativeHandle`, so a parent can call `listRef.current?.scrollToItem("t42")`. Use a callback ref (or a map of refs) to track item elements. Unknown ids must be a no-op, and the handle must not expose the underlying `HTMLUListElement`.
+
+*Hint: a `Map<string, HTMLElement>` stored in a `useRef` is a good place to keep the elements, with the map's lifetime tied to the component.*
+
+### Level 4 — Real-world
+
+**Ticket TF-318: Migrate `forwardRef` components.** Three design-system components (`Input`, `Textarea`, `IconButton`) use `forwardRef`, and the library is moving to React 19.
+
+- Convert each to a plain function component with `ref` as a prop.
+- Callers' type-checking must be unchanged: the same `ref` types are accepted, and no call site needs editing.
+- Any component that also needs its own internal ref uses a merged-ref helper.
+- `tsc --noEmit` passes, and a test per component confirms the ref receives the element.
+
+## Key takeaways
+
+- A DOM ref's type includes `null` because the element doesn't exist before mount. Narrow with `?.` or `if`, not `!`.
+- `useRef<HTMLInputElement>(null)` gives `RefObject<HTMLInputElement | null>`. A value ref (`useRef(0)`) just holds your value. Both are mutable in React 19 types.
+- `useRef` requires an argument in React 19. For "no value yet", pass `undefined` or `null` explicitly.
+- `ref` is a regular prop on function components. Type it as `Ref<T>`, or inherit it through `ComponentProps<"input">`.
+- Callback refs receive `T | null` and may return a cleanup function. Never return anything else from one.
+- `forwardRef` is legacy: read it as `forwardRef<ElementType, Props>`, and migrate by moving `ref` into the props.
+- Use `useImperativeHandle` for a small, typed command API, and merge refs when a component needs its own ref and the parent's.
+
+## What comes next
+
+Refs hand you one element. The next problem is the opposite: sharing *values* with a whole subtree without threading props through every level. That's context, and the most common context mistake is `createContext<AuthValue>({} as AuthValue)`, a lie that compiles and then crashes. [Chapter 54: Typed Context](/chapter/54) shows how to make a context tell the truth.

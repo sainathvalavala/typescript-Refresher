@@ -1,0 +1,318 @@
+> 📖 **The problem.** You're building TaskFlow's profile page. You write `const [user, setUser] = useState(null)` because there's no user until the request finishes. The fetch completes, you call `setUser(data)`, and TypeScript objects: `Argument of type 'User' is not assignable to parameter of type 'SetStateAction<null>'`. You haven't done anything wrong, exactly. You just never told TypeScript that `user` will *later* hold something other than `null`, and it believed the only thing you showed it.
+
+`useState` is a generic function, so everything you learned in [Part IV](/part/iv) applies: TypeScript infers the type parameter from the argument, and when the argument doesn't tell the whole story, you supply the type yourself. This chapter covers the whole spectrum: when inference is enough, when to be explicit, how to model "no value yet", how to replace a pile of boolean flags with one union, and how to initialize state lazily. By the end, you'll model most UI state so that impossible combinations don't type-check.
+
+> 🧠 **Mental model.** **`useState` is a generic function: TypeScript infers `T` from the initial value.** So whenever the initial value doesn't represent *every* value the state will ever hold (empty arrays, `null`, a single starting string out of many), tell it `T` explicitly.
+
+## 52.1 useState inference
+
+For most state, you write nothing extra. The initial value is the evidence, and TypeScript infers `T` from it, exactly as it infers `T` for `first([1, 2])`:
+
+```tsx
+const [count, setCount] = useState(0);              // count: number
+const [title, setTitle] = useState("");             // title: string
+const [done, setDone] = useState(false);            // done: boolean
+const [draft, setDraft] = useState({ title: "", priority: 1 }); // draft: { title: string; priority: number }
+const [ids, setIds] = useState(["t1", "t2"]);       // ids: string[]
+
+setCount("5");        // ❌ Argument of type 'string' is not assignable to parameter of type 'SetStateAction<number>'.
+setDraft({ title: "x" }); // ❌ Argument of type '{ title: string; }' is not assignable to parameter of type 'SetStateAction<{ title: string; priority: number; }>'. (Property 'priority' is missing.)
+```
+
+The setter's parameter type, `SetStateAction<T>`, is simply `T | ((previous: T) => T)`: either the new value or an updater function. Both forms are checked against the same `T`:
+
+```tsx
+setCount(5);                  // ✅ a value
+setCount((prev) => prev + 1); // ✅ prev: number
+```
+
+Inference widens literals: `useState("todo")` gives `string`, not `"todo"`, because state is *supposed* to change. If you want a narrower type, you must ask for it, which is the next section.
+
+## 52.2 Explicit state types
+
+Pass the type in angle brackets when the initial value is **narrower than the real range of values**. The classic case is an empty array: with nothing in it, TypeScript has no element type to infer.
+
+```tsx
+const [tasks, setTasks] = useState([]);
+// tasks: never[]  (an array that can hold nothing)
+setTasks(loadedTasks); // loadedTasks: Task[]
+// ❌ Argument of type 'Task[]' is not assignable to parameter of type 'SetStateAction<never[]>'.
+
+const [tasks2, setTasks2] = useState<Task[]>([]); // ✅ tasks2: Task[]
+```
+
+The same applies to a string that is really one of several, or an optional object:
+
+```tsx
+type TaskStatus = "todo" | "doing" | "done";
+
+const [status, setStatus] = useState<TaskStatus>("todo"); // not just string
+setStatus("finished"); // ❌ Argument of type '"finished"' is not assignable to parameter of type 'SetStateAction<TaskStatus>'.
+
+const [selected, setSelected] = useState<Task | undefined>(); // no argument means undefined is the initial value
+```
+
+> 💡 **Tip.** Treat the angle brackets as documentation of *intent*. A reader seeing `useState<Task[]>([])` immediately knows the shape. If inference already gives the right type (`useState(0)`), adding `<number>` is noise.
+
+## 52.3 Nullable state
+
+"No value yet" is the most common reason to need an explicit type. Use a union with `null` (or `undefined`) and keep `null` as the initial value:
+
+```tsx
+function ProfilePage({ userId }: { userId: string }) {
+  const [user, setUser] = useState<User | null>(null);
+
+  useEffect(() => {
+    fetchUser(userId).then(setUser); // ✅ fetchUser resolves to User
+  }, [userId]);
+
+  return <h1>{user.name}</h1>;
+  //            ^^^^ ❌ 'user' is possibly 'null'.
+}
+```
+
+That error is TypeScript doing its job: on the first render, `user` really is `null`. You must handle that case before touching the value. Narrowing works exactly as in [Chapter 14](/chapter/14):
+
+```tsx
+if (user === null) return <p>Loading…</p>;
+return <h1>{user.name}</h1>; // ✅ user: User
+```
+
+Or inline, with optional chaining and a fallback:
+
+```tsx
+return <h1>{user?.name ?? "Loading…"}</h1>;
+```
+
+Use `null` for "intentionally empty" and `undefined` for "not provided" consistently across a codebase; this book uses `null` for state that is waiting on something. Beware that a nullable value can't tell you *why* it's null: still loading, failed, or the server returned nothing. When that distinction matters, you want a status union, which is 52.6.
+
+## 52.4 Union state
+
+When state is one value out of a small fixed set, a string-literal union both documents the options and stops typos. This is a very common fit for "what is the component doing right now?":
+
+```tsx
+type SaveState = "idle" | "saving" | "saved";
+
+function SaveButton({ onSave }: { onSave: () => Promise<void> }) {
+  const [state, setState] = useState<SaveState>("idle");
+
+  async function handleClick() {
+    setState("saving");
+    await onSave();
+    setState("saved");
+    setState("done"); // ❌ Argument of type '"done"' is not assignable to parameter of type 'SetStateAction<SaveState>'.
+  }
+
+  return (
+    <button onClick={handleClick} disabled={state === "saving"}>
+      {state === "saving" ? "Saving…" : state === "saved" ? "Saved" : "Save"}
+    </button>
+  );
+}
+```
+
+Without the explicit `<SaveState>`, `useState("idle")` would infer `string`, and `setState("saveing")` would compile. The comparison `state === "saveing"` would also compile silently under `string`, but with the union TypeScript flags it: `This comparison appears to be unintentional because the types 'SaveState' and '"saveing"' have no overlap.`
+
+You can also derive the union from a `const` array when you need the values at runtime too (for rendering `<option>`s, say):
+
+```ts
+const STATUSES = ["todo", "doing", "done"] as const;
+type TaskStatus = (typeof STATUSES)[number]; // "todo" | "doing" | "done"
+```
+
+## 52.5 Object and array state
+
+React compares state by reference: if you mutate an object and call the setter with the *same* object, nothing re-renders. So updates must create **new** objects and arrays. TypeScript can't enforce immutability by default, but it checks every new value against `T`, which catches wrong shapes. Spread for objects, and `map`, `filter`, and spread for arrays:
+
+```tsx
+const [task, setTask] = useState<Task>({ id: "t1", title: "Write docs", status: "todo" });
+const [tasks, setTasks] = useState<Task[]>([]);
+
+setTask((prev) => ({ ...prev, status: "doing" }));
+setTask((prev) => ({ ...prev, status: "finished" }));
+// ❌ Type '"finished"' is not assignable to type 'TaskStatus'.
+
+setTasks((prev) => [...prev, newTask]);                                    // add
+setTasks((prev) => prev.filter((t) => t.id !== id));                       // remove
+setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, status: "done" } : t))); // update one
+```
+
+For forms with many fields, a small **`Partial<T>` helper** avoids writing a spread in every handler. `Partial<Task>` makes every field optional, so a caller passes only what changed:
+
+```tsx
+function useTaskDraft(initial: Task) {
+  const [draft, setDraft] = useState<Task>(initial);
+  const update = (changes: Partial<Task>) => setDraft((prev) => ({ ...prev, ...changes }));
+  return [draft, update] as const;
+}
+
+const [draft, update] = useTaskDraft(task);
+update({ title: "New title" });  // ✅
+update({ status: "finished" });  // ❌ Type '"finished"' is not assignable to type 'TaskStatus | undefined'.
+```
+
+> ⚠️ **Common mistake.** `tasks.push(newTask); setTasks(tasks);`. The type checks fine (it's a `Task[]`), but React sees the same array and skips the update. Type checking can't see mutation; `readonly Task[]` can help: `useState<readonly Task[]>([])` makes `push` a compile error.
+
+## 52.6 Discriminated state
+
+Here is where state typing pays off most. Loading data has *modes*, and each mode owns different data: nothing while idle, nothing yet while loading, a result on success, an error on failure. A **discriminated union** ([Chapter 13](/chapter/13)) puts each mode's data inside that mode, and nowhere else:
+
+```tsx
+type AsyncState<T> =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "success"; data: T }
+  | { status: "error"; error: Error };
+
+function TaskList() {
+  const [state, setState] = useState<AsyncState<Task[]>>({ status: "idle" });
+
+  useEffect(() => {
+    setState({ status: "loading" });
+    loadTasks().then(
+      (data) => setState({ status: "success", data }),
+      (error: unknown) => setState({ status: "error", error: error instanceof Error ? error : new Error(String(error)) }),
+    );
+  }, []);
+
+  switch (state.status) {
+    case "idle":
+    case "loading":
+      return <p>Loading…</p>;
+    case "error":
+      return <p role="alert">{state.error.message}</p>; // ✅ error exists only here
+    case "success":
+      return <ul>{state.data.map((t) => <li key={t.id}>{t.title}</li>)}</ul>; // ✅ data exists only here
+  }
+}
+```
+
+Because `data` exists only on the `"success"` member, reading `state.data` in the loading branch is a compile error, so you can't render stale or missing data by accident. And you can't set `{ status: "success" }` without data. The `switch` is exhaustive, so if you add a `"refreshing"` member later, the function stops compiling until you handle it (add an `assertNever` default, as in [Chapter 55](/chapter/55), if you want the error to point at the exact line).
+
+## 52.7 Lazy initial state
+
+`useState(expensive())` calls `expensive()` on **every render**, even though React only uses the result on the first one. When the initial value is costly to compute (reading `localStorage`, parsing JSON, building a big structure), pass a function instead. React calls it once, on mount. This is a **lazy initializer**, and TypeScript infers `T` from the function's return type.
+
+```tsx
+function loadDraft(): TaskDraft {
+  try {
+    const raw = localStorage.getItem("taskflow:draft");
+    return raw ? (JSON.parse(raw) as TaskDraft) : { title: "", notes: "" };
+  } catch {
+    return { title: "", notes: "" };
+  }
+}
+
+function DraftEditor() {
+  const [draft, setDraft] = useState(loadDraft);   // ✅ pass the function itself; draft: TaskDraft
+  const [bad] = useState(loadDraft());              // ⚠️ runs loadDraft on every render (the result is thrown away after the first)
+  const [d2] = useState(() => loadDraft());         // ✅ equivalent to the first line
+  // …
+}
+```
+
+Careful when `T` is itself a function type: `useState(fn)` would be read as a lazy initializer. To store a function as state, wrap it: `useState<() => void>(() => myCallback)`. That's rare, and usually a ref or a `useCallback` is what you meant.
+
+Notice the `as TaskDraft` on `JSON.parse`: it returns `any`, and this cast is an unchecked promise about what's in storage. [Chapter 56](/chapter/56) replaces it with a parser, so corrupt data can't slip into your state.
+
+> 💡 **Tip.** The updater-function form of the setter (`setCount((prev) => prev + 1)`) is a different feature with a different purpose: it gives you the latest value when several updates are batched. Don't confuse it with lazy *initial* state.
+
+## 52.8 From boolean soup to a state machine
+
+Here's how a fetch gets modeled when developers reach for the obvious tool, one flag at a time:
+
+```tsx
+const [isLoading, setIsLoading] = useState(false);
+const [isError, setIsError] = useState(false);
+const [error, setError] = useState<Error | null>(null);
+const [data, setData] = useState<Task[] | null>(null);
+```
+
+Four variables give you 2 × 2 × 2 × 2 = 16 combinations, but only four are meaningful (idle, loading, success, error). The other twelve are **impossible states**, such as "loading and failed at once", or "success but `data` is null", and nothing stops your code from reaching them. Every render must defensively check for them, and one forgotten `setIsError(false)` after a retry leaves the UI showing both a spinner and an error banner.
+
+The refactor is mechanical: list the *real* states, and let each own its data. You've already seen the result in 52.6. Compare the two call sites:
+
+```tsx
+// Before: reaching an impossible state is one forgotten line away
+setIsLoading(false);
+setData(result);
+// forgot setIsError(false), so the error banner from the last attempt is still showing
+
+// After: one assignment, and the previous mode is gone entirely
+setState({ status: "success", data: result });
+```
+
+> 🚫 **When not to.** Not every pair of booleans needs a union. Independent flags (`isSidebarOpen`, `isDarkMode`) can legitimately be any combination, and a union would only add ceremony. Ask: "Are there combinations of these values that must never happen?" If yes, model the allowed combinations. If no, keep the booleans.
+
+## Common mistakes
+
+> ⚠️ **`useState(null)` with no type.** The state is typed as `null` forever. Write `useState<User | null>(null)`.
+
+> ⚠️ **`useState([])` with no type.** You get `never[]`, and every later `setTasks(…)` fails. Write `useState<Task[]>([])`.
+
+> ⚠️ **Letting literals widen to `string`.** `useState("idle")` is `string`, so typos compile. Use a union type argument.
+
+> ⚠️ **Parallel boolean flags for one process.** `isLoading`, `isError`, and `data` drifting out of sync is the classic source of "spinner and error at the same time". Use a status union.
+
+> ⚠️ **Mutating state in place.** `state.items.push(x)` compiles but React won't re-render. Use immutable updates, or `readonly` types to forbid mutation.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** state can be "not there yet" (nullable), is one of a few modes (union), or has modes that carry different data (discriminated union). Use explicit generics for empty collections and for narrowing a literal.
+
+> 🚫 **When not to.** Don't annotate what inference already got right (`useState<number>(0)`). Don't build a discriminated union for flags that are truly independent. And when several state values change together under complex rules, move to a reducer ([Chapter 55](/chapter/55)) rather than a taller tower of `useState`.
+
+## How it connects
+
+> 🔗 **Connection.** Discriminated unions come from [Chapter 13](/chapter/13), and narrowing in render branches from [Chapter 14](/chapter/14). The setters you create here are what the event handlers of [Chapter 51](/chapter/51) call. Next, [Chapter 53](/chapter/53) covers the other kind of mutable cell in React, refs, and [Chapter 55](/chapter/55) combines union state with reducers.
+
+> 🌍 **Real world.** TanStack Query's `useQuery` returns exactly this idea: a result whose `status` is `"pending"`, `"error"`, or `"success"`, with `data` and `error` available only when they exist. Learning to model state this way makes those libraries' types obvious.
+
+## Exercises
+
+### Level 1 — Recall
+
+Give the inferred type of `T` (or say "needs a type argument") for each call:
+
+```tsx
+useState(0);
+useState("");
+useState(null);
+useState([]);
+useState(["a", "b"]);
+useState({ open: false });
+useState<string | undefined>();
+useState(() => new Map<string, Task>());
+```
+
+### Level 2 — Application
+
+Type a `FileUpload` component's state as a discriminated union: `idle`, `uploading` (with `progress: number`), `done` (with `url: string`), and `failed` (with `error: Error`). Render each state, and make the compiler reject a `done` state without a `url`.
+
+### Level 3 — Challenge
+
+Refactor a component that has five boolean flags (`isOpen`, `isSubmitting`, `isSuccess`, `hasError`, `isDirty`) into a single union state. First list which combinations are *actually* valid, then write the type, then replace every setter call. Show which states became unrepresentable.
+
+*Hint: `isDirty` may be independent of the others and belong in a separate `useState`.*
+
+### Level 4 — Real-world
+
+**Ticket TF-267: Multi-step checkout state.** Model TaskFlow's upgrade checkout (plan, shipping, payment, review) as one `useState` holding a union.
+
+- You cannot construct the `"payment"` step without a shipping address, and you cannot construct `"review"` without a payment method.
+- Going back a step keeps the data entered so far.
+- A `"submitting"` and a `"failed"` state exist, and `failed` keeps the form data for a retry.
+- Rendering uses an exhaustive `switch`, and adding a step breaks compilation until it's handled.
+
+## Key takeaways
+
+- `useState` is generic: `T` is inferred from the initial value, and widened (`"todo"` becomes `string`).
+- Supply the type when the initial value is narrower than the real range: `null`, `[]`, one literal of a union.
+- Nullable state forces you to handle "not loaded yet" before using the value. That's a feature.
+- Immutable updates create new values that TypeScript checks against `T`. `readonly` types can forbid mutation.
+- Model modes with a discriminated union so each mode carries only its own data, and impossible states can't be constructed.
+- Pass a function to `useState` to compute the initial value only once.
+
+## What comes next
+
+State covers values React re-renders on. But sometimes you need a handle on a DOM element, such as to focus an input, or a value that must *not* trigger a re-render. That's a ref, and its type honestly includes `null` before the component mounts. [Chapter 53: Typing Refs](/chapter/53) explains why, and how React 19 simplified the whole story.

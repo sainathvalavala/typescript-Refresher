@@ -1,0 +1,395 @@
+> 📖 **The problem.** You built the hand-rolled `useQuery` in [Chapter 61](/chapter/61) and shipped it. Now the bug reports arrive. The sidebar and the board both ask for the task list, so every page load makes two identical requests. Switching to another project and back shows a spinner for data you had a second ago. Someone creates a task in the modal, closes it, and the board stays stale until a manual refresh. And once, while typing in the search box, results for "ab" arrived after "abc" and overwrote them. Each bug has a fix, and each fix adds state to a hook that was supposed to be simple.
+
+These are not bugs in your hook. They are the *requirements* of server state: data you do not own, that others can change, that is shared between components and goes out of date. This chapter introduces TanStack Query v5, the de facto cache for that job, and shows how to use it with strong types: inferred data, shared query options, key factories, mutations that invalidate, optimistic updates with a typed rollback, Suspense, and infinite lists.
+
+> 🧠 **Mental model.** **A server-state library is a cache with rules.** Queries *read* and *share* data by key; mutations *change* the server and then *invalidate* keys so the cache refetches what is now wrong. You describe what data you want; the library decides when to fetch it.
+
+## 62.1 What a server-state library solves
+
+Here is the pain list from Chapter 61, matched with what the library does about each:
+
+| Hand-rolled pain | What the cache does |
+|---|---|
+| Two components, two identical requests | **Deduplication**: one in-flight request per key, shared by all subscribers |
+| Spinner every time you navigate back | **Caching**: data is kept by key; shown instantly, refreshed in the background |
+| Stale data shown as fresh | **`staleTime`**: you declare how long data counts as fresh |
+| Race between "ab" and "abc" | **Key-based results**: each key has its own entry, so an old response cannot overwrite a new key |
+| Nothing refreshes after a mutation | **Invalidation**: mutations mark keys stale and active queries refetch |
+| No retry, no refetch on focus | **Retries** with backoff, refetch on window focus and reconnect |
+| `loading` booleans that contradict | A real status: `pending`, `error`, or `success` |
+
+The same list as code. Setup is one client at the root, and everything below it shares one cache:
+
+```tsx
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+
+const queryClient = new QueryClient({
+  defaultOptions: { queries: { staleTime: 30_000 } }, // data is "fresh" for 30 seconds
+});
+
+export function App() {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <Router />
+    </QueryClientProvider>
+  );
+}
+```
+
+> 🚫 **When not to.** Not everything needs a cache. A value that is only used once, never shared, and never mutated (a one-off fetch in a marketing page, say) is fine with a plain `fetch`. The library earns its place when data is shared, refetched, or mutated.
+
+## 62.2 Queries
+
+A query needs two things: a **key** that identifies the data, and a **function** that produces it. The hook's types are *inferred from the function*, so there is nothing to annotate:
+
+```tsx
+import { useQuery } from "@tanstack/react-query";
+
+function BoardPage({ projectId }: { projectId: string }) {
+  const query = useQuery({
+    queryKey: ["tasks", projectId],
+    queryFn: ({ signal }) => fetchTasks(projectId, signal), // from Chapter 61: validated and mapped
+  });
+
+  query.data; // Task[] | undefined
+  query.status; // "pending" | "error" | "success"
+
+  if (query.isPending) return <TaskListSkeleton />;
+  if (query.isError) return <ErrorPanel message={query.error.message} />; // error: Error
+  return <TaskList tasks={query.data} />; // narrowed: data is Task[] here
+}
+```
+
+Notice three things. `fetchTasks` already returns `Promise<Task[]>`, so `data` is `Task[] | undefined` without a single generic argument. The `signal` from the context gives you cancellation for free. And `isPending` / `isError` are **discriminants**: after you check them, TypeScript narrows `query.data` to a defined `Task[]`, exactly like the `RemoteData` union you modeled by hand.
+
+In v5, `isLoading` still exists but means "pending *and* currently fetching". For "no data yet", use `isPending`.
+
+The default error type is `Error`. If your client throws the `ApiError` union from Chapter 61, tell the library once, globally, with declaration merging:
+
+```ts
+declare module "@tanstack/react-query" {
+  interface Register {
+    defaultError: ApiError;
+  }
+}
+// Now query.error is ApiError | null everywhere, and describeError(query.error) type-checks.
+```
+
+> ⚠️ **Common mistake.** Putting a type argument on `useQuery<Task[]>` to "help" it. If you write explicit generics you must write all of them, and you have turned inference off. Let the function's return type drive everything.
+
+## 62.3 Query keys
+
+The key is the cache's address. It is an array, compared **structurally** (by value, not identity), and it must contain everything the query function depends on. If `projectId` changes, the key changes, and the library fetches a different entry. This is the same rule as the dependency array in an effect, and it is why the stale-response race disappears.
+
+Keys scattered as string literals are a bug waiting to happen: `["tasks", id]` in one file and `["task", id]` in another means invalidation silently misses. Centralize them in a **key factory**, hierarchical from broad to specific:
+
+```ts
+export const taskKeys = {
+  all: ["tasks"] as const,
+  lists: () => [...taskKeys.all, "list"] as const,
+  list: (filters: { projectId: string; status?: TaskStatus }) =>
+    [...taskKeys.lists(), filters] as const,
+  details: () => [...taskKeys.all, "detail"] as const,
+  detail: (id: string) => [...taskKeys.details(), id] as const,
+};
+
+taskKeys.list({ projectId: "p1" });
+// readonly ["tasks", "list", { projectId: string; status?: TaskStatus }]
+```
+
+The hierarchy is the point. Invalidating `taskKeys.all` refreshes every task query; invalidating `taskKeys.lists()` refreshes only lists, leaving open detail views alone. Prefix matching does this for you.
+
+Next, `queryOptions` bundles a key and a function into one typed, reusable object. Without it, the key in your component and the key in your prefetch code can drift apart:
+
+```ts
+import { queryOptions } from "@tanstack/react-query";
+
+export const taskDetailQuery = (id: string) =>
+  queryOptions({
+    queryKey: taskKeys.detail(id),
+    queryFn: ({ signal }) => fetchTask(id, signal), // Promise<Task>
+    staleTime: 60_000,
+  });
+
+// The same object works everywhere, and the types follow it:
+const a = useQuery(taskDetailQuery("t1"));          // a.data: Task | undefined
+const b = await queryClient.ensureQueryData(taskDetailQuery("t1")); // b: Task
+const c = queryClient.getQueryData(taskDetailQuery("t1").queryKey); // c: Task | undefined
+```
+
+The last line is the quiet win: `getQueryData` is typed *by the key*, because `queryOptions` tags the key with the data type. A plain `["tasks", "t1"]` array would give you `unknown`.
+
+> 💡 **Tip.** One file per feature exports its key factory and its `queryOptions` builders. Components import those, and never write a key by hand.
+
+## 62.4 Mutations
+
+A query *reads*. A **mutation** *changes* something on the server: create, update, delete. It does not cache by key and does not run automatically; you call `mutate`. Its types come from the mutation function:
+
+```tsx
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+
+function useCreateTask() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (input: CreateTaskInput) => createTask(input), // Promise<Task>
+    onSuccess: (created) => {
+      // created: Task (inferred from mutationFn)
+      queryClient.invalidateQueries({ queryKey: taskKeys.lists() });
+    },
+  });
+}
+```
+
+`invalidateQueries` marks matching cache entries stale and immediately refetches the ones that are currently on screen. That one line fixes "my list is stale after I create a task": the mutation *tells the cache what it just made wrong*.
+
+Using it from a component:
+
+```tsx
+function NewTaskForm({ projectId }: { projectId: string }) {
+  const create = useCreateTask();
+
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        create.mutate({ title: "Write docs", projectId, dueAt: null }); // variables are typed
+      }}
+    >
+      <button disabled={create.isPending}>{create.isPending ? "Adding…" : "Add task"}</button>
+      {create.isError && <p role="alert">{describeError(create.error)}</p>}
+    </form>
+  );
+}
+```
+
+`mutate` fires and forgets, with callbacks. `mutateAsync` returns a promise you can `await`, but then you own the `try/catch`. Prefer `mutate` unless you need to sequence work after it.
+
+> ⚠️ **Common mistake.** Invalidating too narrowly or too broadly. `invalidateQueries({ queryKey: ["tasks", "list"] })` written by hand misses the filtered lists if someone later changes the key shape. Use the factory: `taskKeys.lists()` always matches whatever `list(...)` produces.
+
+## 62.5 Optimistic updates
+
+Waiting for the server makes checkboxes feel sluggish. An **optimistic update** changes the cache immediately, assumes success, and undoes the change if the request fails. The sequence is always the same four steps: cancel in-flight refetches (so they cannot overwrite your guess), snapshot the old data, write the new data, and return the snapshot so you can roll back.
+
+```tsx
+type ToggleVars = { id: string; status: TaskStatus };
+type ToggleContext = { previous: Task[] | undefined }; // the typed rollback context
+
+function useSetTaskStatus(projectId: string) {
+  const queryClient = useQueryClient();
+  const key = taskKeys.list({ projectId });
+
+  return useMutation<Task, ApiError, ToggleVars, ToggleContext>({
+    mutationFn: ({ id, status }) => updateTaskStatus(id, status),
+
+    onMutate: async ({ id, status }) => {
+      await queryClient.cancelQueries({ queryKey: key });          // 1. stop races
+      const previous = queryClient.getQueryData<Task[]>(key);      // 2. snapshot
+      queryClient.setQueryData<Task[]>(key, (old) =>               // 3. optimistic write
+        old?.map((t) => (t.id === id ? { ...t, status } : t)),
+      );
+      return { previous };                                         // 4. context for rollback
+    },
+
+    onError: (_error, _vars, context) => {
+      // context: ToggleContext | undefined
+      if (context) queryClient.setQueryData(key, context.previous); // roll back
+    },
+
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: key }); // success or failure: resync with the server
+    },
+  });
+}
+```
+
+Here the four generics (data, error, variables, context) are written explicitly, because `onMutate`'s return value *is* the context and TypeScript needs to know it before `onError`. That is one of the rare cases where explicit type arguments are right. The `ToggleContext` type means `context.previous` is checked: you cannot roll back with the wrong shape.
+
+`onSettled` always runs. Even a successful optimistic update ends with a refetch, so the cache converges on what the server really has, including fields you could not guess (such as `updatedAt`).
+
+> 🧠 **Mental model.** Optimistic UI is a loan: you spend a result you do not have yet. `onMutate` borrows, `onError` repays if the loan was refused, and `onSettled` audits the books.
+
+## 62.6 Suspense queries and error boundaries
+
+With `useQuery`, every component must handle `pending` and `error` itself. React's **Suspense** moves those two branches out of the component: a component that is not ready *suspends*, and the nearest `<Suspense fallback>` above it shows the loading UI; one that fails *throws*, and the nearest **error boundary** shows the error UI. `useSuspenseQuery` is the hook built for this, and its payoff is in the type: `data` is **never undefined**.
+
+```tsx
+import { useSuspenseQuery } from "@tanstack/react-query";
+
+function TaskDetail({ id }: { id: string }) {
+  const { data: task } = useSuspenseQuery(taskDetailQuery(id));
+  // task: Task, with no undefined to check and no isPending branch
+  return <h2>{task.title}</h2>;
+}
+```
+
+The loading and error branches live above, once, for a whole subtree:
+
+```tsx
+import { Suspense } from "react";
+import { ErrorBoundary } from "react-error-boundary";
+import { QueryErrorResetBoundary } from "@tanstack/react-query";
+
+function TaskPanel({ id }: { id: string }) {
+  return (
+    <QueryErrorResetBoundary>
+      {({ reset }) => (
+        <ErrorBoundary
+          onReset={reset} // "Try again" also clears the query's error state
+          fallbackRender={({ resetErrorBoundary }) => (
+            <ErrorPanel message="Couldn't load the task." onRetry={resetErrorBoundary} />
+          )}
+        >
+          <Suspense fallback={<TaskDetailSkeleton />}>
+            <TaskDetail id={id} />
+          </Suspense>
+        </ErrorBoundary>
+      )}
+    </QueryErrorResetBoundary>
+  );
+}
+```
+
+The trade-off is *where* the waiting is decided. Suspense gives cleaner components and coarser loading states; `useQuery` gives fine control inside a single component. Suspense queries also fetch **sequentially** when nested (a child cannot start until its parent has data), so fetch siblings in parallel with `useSuspenseQueries` or prefetch with `queryOptions` in a route loader.
+
+> 🚫 **When not to.** Do not wrap the whole app in one `Suspense`. A single top-level spinner for everything is worse than the per-component one you were replacing. Place boundaries around independent regions: a sidebar, a detail panel, a board.
+
+## 62.7 Pagination and infinite queries
+
+A real task list is paged. The type that matters is the **page parameter**: what you pass to ask for "the next page". For cursor-based APIs, it is the `nextCursor` string from the previous response.
+
+```tsx
+import { useInfiniteQuery } from "@tanstack/react-query";
+
+type TaskPage = { items: Task[]; nextCursor: string | null };
+
+export const tasksInfiniteQuery = (projectId: string) =>
+  ({
+    queryKey: [...taskKeys.lists(), { projectId, infinite: true }],
+    queryFn: ({ pageParam, signal }: { pageParam: string | null; signal: AbortSignal }) =>
+      fetchTaskPage(projectId, pageParam, signal), // Promise<TaskPage>
+    initialPageParam: null as string | null,
+    getNextPageParam: (last: TaskPage) => last.nextCursor ?? undefined, // undefined means "no more"
+  }) as const;
+
+function InfiniteTaskList({ projectId }: { projectId: string }) {
+  const q = useInfiniteQuery(tasksInfiniteQuery(projectId));
+  // q.data: InfiniteData<TaskPage, string | null> | undefined
+
+  const tasks = q.data?.pages.flatMap((page) => page.items) ?? [];
+
+  return (
+    <>
+      <ul>{tasks.map((t) => <li key={t.id}>{t.title}</li>)}</ul>
+      <button onClick={() => q.fetchNextPage()} disabled={!q.hasNextPage || q.isFetchingNextPage}>
+        {q.isFetchingNextPage ? "Loading…" : q.hasNextPage ? "Load more" : "No more tasks"}
+      </button>
+    </>
+  );
+}
+```
+
+Two details make this type-safe. `initialPageParam` is required in v5, and its type (`string | null`) becomes the type of `pageParam` in `queryFn`. And `getNextPageParam` returns `undefined` to say "this was the last page", which flips `hasNextPage` to `false`.
+
+For classic numbered pages, use a plain `useQuery` with the page in the key, and `placeholderData: keepPreviousData` so the old page stays visible while the next one loads, instead of flashing a spinner:
+
+```ts
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
+
+const q = useQuery({
+  queryKey: taskKeys.list({ projectId, page }),
+  queryFn: ({ signal }) => fetchTaskPage(projectId, page, signal),
+  placeholderData: keepPreviousData, // q.isPlaceholderData is true while showing the old page
+});
+```
+
+## 62.8 Devtools and testing
+
+Because the cache is a real data structure, you can *look* at it. The devtools panel shows every key, its status (fresh, stale, fetching, inactive), its data, and lets you force refetches and error states. It is the quickest way to learn why something did or did not refetch.
+
+```tsx
+import { ReactQueryDevtools } from "@tanstack/react-query-devtools";
+
+<QueryClientProvider client={queryClient}>
+  <App />
+  <ReactQueryDevtools initialIsOpen={false} /> {/* tree-shaken out of production builds */}
+</QueryClientProvider>
+```
+
+For **tests**, the rule is: *every test gets its own fresh client*. A shared client leaks cached data from one test into the next, which produces the most confusing kind of flaky failure. Also turn retries off, otherwise a test that expects an error waits through three automatic retries.
+
+```tsx
+function createTestClient() {
+  return new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, gcTime: Infinity }, // gcTime is the v5 name for cacheTime
+      mutations: { retry: false },
+    },
+  });
+}
+
+function wrapper({ children }: { children: React.ReactNode }) {
+  return <QueryClientProvider client={createTestClient()}>{children}</QueryClientProvider>;
+}
+```
+
+You will wire this into a typed custom `render` in [Chapter 68](/chapter/68), and mock the network underneath it in [Chapter 69](/chapter/69).
+
+## Common mistakes
+
+> ⚠️ **Copying server data into `useState`.** `useEffect(() => setTasks(query.data), [query.data])` creates a second copy that goes stale and fights the cache. Read `query.data` directly, or derive from it.
+
+> ⚠️ **Keys that omit a dependency.** If the query function reads `status` and the key does not contain it, two different filters share one cache entry and you will see the wrong data. Everything the function uses goes in the key.
+
+> ⚠️ **Hand-written key arrays.** One typo in a literal breaks invalidation silently. Use a key factory and `queryOptions`.
+
+> ⚠️ **Forgetting `onSettled` after an optimistic update.** Without the final invalidation, the cache keeps your guess instead of the server's truth.
+
+> ⚠️ **Treating `staleTime: 0` as "no cache".** The default means data is cached but always considered stale, so it refetches on every mount and focus. Set a `staleTime` that matches how fast the data really changes.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** the data lives on a server, is shared between components, or can be changed by someone else; when you need refetching, retries, pagination, or optimistic UI.
+
+> 🚫 **When not to.** Do not put client-only state (a modal flag, a selected tab) in the query cache; that is [Chapter 60](/chapter/60)'s other four homes. Do not reach for optimistic updates on operations that fail often or that cannot be cleanly undone, such as sending an email. And a server-rendering framework with its own data layer may already own caching for you.
+
+## How it connects
+
+> 🔗 **Connection.** The pipeline from [Chapter 61](/chapter/61) (unknown, validate, map) is exactly what your `queryFn` should run. The key factories reuse `as const` and tuple types from [Chapter 20](/chapter/20). The `Register` trick is module augmentation from [Chapter 28](/chapter/28). Mutations and their errors feed the form handling in [Chapter 64](/chapter/64).
+
+> 🌍 **Real world.** TanStack Query is the most widely used server-state library in React, with close cousins in SWR, RTK Query, and Apollo for GraphQL. The vocabulary (key, stale, invalidate, optimistic) transfers between all of them.
+
+## Exercises
+
+### Level 1 — Recall
+
+Design the query keys for TaskFlow: all tasks, one task's detail, and a task list filtered by project and status. Write them as a key factory, and say which `invalidateQueries` call refreshes *every* list but no detail view.
+
+### Level 2 — Application
+
+Take the `useQuery` hook and `BoardPage` from [Chapter 61](/chapter/61) and replace them with `useQuery` and `queryOptions`. Add a `useCreateTask` mutation that invalidates the task lists. Verify that two components showing the same list produce one network request.
+
+### Level 3 — Challenge
+
+Implement **optimistic task completion** with rollback on failure. Type the mutation's context, make the checkbox flip instantly, and prove the rollback works by making the server return `500`. *Hint: remember `cancelQueries` before the optimistic write, and `onSettled` after.*
+
+### Level 4 — Real-world
+
+**Ticket TF-355: Infinite scroll for large projects.** Projects with thousands of tasks take seconds to load.
+
+- The task list loads 25 tasks at a time using the cursor from `nextCursor`, with `useInfiniteQuery`.
+- A "Load more" control (or intersection observer) is disabled while a page is loading and hidden when `hasNextPage` is `false`.
+- Completing a task still updates optimistically, wherever its page sits.
+- Tests use a fresh `QueryClient` per test with retries off.
+
+## Key takeaways
+
+- Server state is a cache problem: sharing, staleness, deduplication, and invalidation. Effects and `useState` do not solve it.
+- `useQuery` infers its data type from `queryFn`. Narrow on `isPending` / `isError`, or use `useSuspenseQuery` for a never-undefined `data`.
+- Centralize keys in a factory and bundle them with their functions in `queryOptions`, so keys, functions, and types stay in sync.
+- Mutations change the server and then **invalidate** keys; optimistic updates snapshot, write, and roll back through a typed context.
+- Use a fresh `QueryClient` per test, with retries off.
+
+## What comes next
+
+Reads and writes are typed. The next thing users do is type into forms, and forms are where data is at its messiest: half-entered, invalid, and not yet a `Task`. [Chapter 63: Typed Forms from Scratch](/chapter/63) builds a form as a small state machine over a typed values object.

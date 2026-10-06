@@ -1,0 +1,365 @@
+> 📖 **The problem.** TaskFlow's first `Tabs` component took a `tabs` array: `<Tabs tabs={[{ label: "Board", content: <Board /> }]} />`. Then design asked for an icon on one tab. Then a "3" badge on another. Then a disabled tab with a tooltip. Then a tab whose label is a link. Each request added a field to the config object, and each field added a branch inside `Tabs`. Six months later the type has fourteen optional properties, and nobody remembers which combinations work.
+
+The config object is a **mini-language you invented**, and you have to maintain its grammar forever. React already has a language for describing structure: markup. This chapter shows the **compound component** pattern, a family of components (`Tabs`, `Tabs.List`, `Tabs.Tab`, `Tabs.Panel`) that share hidden state, so callers arrange the pieces themselves. You'll build one with a safe typed context, type its namespace, make it controlled or uncontrolled, wire up accessibility, and learn when a plain props API is better.
+
+> 🧠 **Mental model.** A compound component is **a family of components sharing hidden state through context**. The caller gets markup-level control (what goes where), while the parent keeps behavior consistent (which tab is selected, which keys do what).
+
+## 87.1 The configuration-object problem
+
+Here is the config-driven `Tabs` after a few rounds of requirements. Every row of `TabConfig` is a decision the *component author* made on behalf of every future caller:
+
+```tsx
+type TabConfig = {
+  id: string;
+  label: string;
+  icon?: ReactNode;
+  badge?: number;
+  disabled?: boolean;
+  tooltip?: string;
+  href?: string;          // 😬 now a tab can be a link?
+  content: ReactNode;
+};
+
+function Tabs({ tabs }: { tabs: TabConfig[] }) {
+  const [active, setActive] = useState(tabs[0]?.id);
+  return (
+    <>
+      <div role="tablist">
+        {tabs.map((t) => (
+          <button key={t.id} disabled={t.disabled} title={t.tooltip} onClick={() => setActive(t.id)}>
+            {t.icon}{t.label}{t.badge ? <span>{t.badge}</span> : null}
+          </button>
+        ))}
+      </div>
+      {tabs.map((t) => (t.id === active ? <div key={t.id}>{t.content}</div> : null))}
+    </>
+  );
+}
+```
+
+The signs are always the same. Props whose names describe *rendering details* (`icon`, `badge`). Optional fields that interact (`href` with `disabled`?). A caller who wants something the author didn't anticipate (a badge *before* the label, a tooltip component instead of a `title`) has no way in except a new field. The component's API grows by **addition**, and additions are never removed.
+
+> ⚠️ **Common mistake.** Reaching for `renderTab`, `renderBadge`, `renderIcon` props next. That's the same problem with function-shaped fields. We'll look at when render props are right in [Chapter 88](/chapter/88).
+
+## 87.2 Compound components
+
+The compound version splits the one big component into a **family**. Each piece has one job, and the caller assembles them in JSX:
+
+```tsx
+<Tabs defaultValue="board">
+  <Tabs.List aria-label="Project views">
+    <Tabs.Tab value="board"><BoardIcon /> Board</Tabs.Tab>
+    <Tabs.Tab value="list">List <Badge>3</Badge></Tabs.Tab>
+    <Tabs.Tab value="archive" disabled>Archive</Tabs.Tab>
+  </Tabs.List>
+
+  <Tabs.Panel value="board"><Board /></Tabs.Panel>
+  <Tabs.Panel value="list"><TaskList /></Tabs.Panel>
+  <Tabs.Panel value="archive"><Archive /></Tabs.Panel>
+</Tabs>
+```
+
+Icons, badges, links, and tooltips are all just *children*. No new field was needed for any of them, because the caller already speaks the language of JSX. Notice what the pieces *don't* take as props: no `selected`, no `onSelect`, no ids. `Tabs.Tab` knows whether it's selected because it asks the shared state, which is the subject of the next section.
+
+The parent owns the rules; the children are free-form:
+
+```text
+Tabs            owns: which value is selected, ids, the controlled/uncontrolled logic
+Tabs.List       owns: role="tablist", keyboard navigation (arrow keys, Home, End)
+Tabs.Tab        owns: role="tab", aria-selected, click-to-select
+Tabs.Panel      owns: role="tabpanel", hidden/shown, labelled by its tab
+caller          owns: order, extra markup, styling, what goes inside each piece
+```
+
+> ✅ **When is this useful?** When callers need to **arrange** the parts differently (a sticky list above scrollable panels, a tab list inside a toolbar, extra elements between pieces), and the *behavior* between the parts (selection, focus, keyboard) must stay consistent.
+
+> 🚫 **When is this unnecessary complexity?** When every caller assembles the pieces in the same order. Then you've made them type six lines of boilerplate for what a `tabs` prop could do. See 87.7.
+
+## 87.3 Shared state via typed context
+
+The pieces find each other through **context** ([Chapter 54](/chapter/54)). `Tabs` provides `{ value, select, baseId }`; `Tab` and `Panel` consume it. There's one subtlety: `createContext` needs a default value, but there's no sensible default for "the selected tab" outside a `Tabs`. The **safe-context pattern** uses `null` as the default and makes the consuming hook throw with a clear message:
+
+```tsx
+type TabsContextValue = {
+  value: string;                   // the currently selected tab's value
+  select: (value: string) => void;
+  baseId: string;                  // shared prefix for generated ids
+};
+
+const TabsContext = createContext<TabsContextValue | null>(null);
+
+function useTabsContext(component: string): TabsContextValue {
+  const ctx = use(TabsContext); // React 19: `use` reads context, like useContext
+  if (ctx === null) throw new Error(`<${component}> must be rendered inside <Tabs>`);
+  return ctx; // narrowed: TabsContextValue (no null for callers)
+}
+```
+
+The narrowing is the whole point. Every consumer gets a non-null value, and misuse (a `Tabs.Tab` rendered outside `Tabs`) fails immediately with a message that names the component, instead of a mysterious `Cannot read properties of null` three layers down. This hook is **internal to the family**; don't export it unless callers truly need it.
+
+Here's the provider and the first consumer, using React 19's `<Context value>` (no `.Provider` needed):
+
+```tsx
+function TabsRoot({ defaultValue = "", children }: { defaultValue?: string; children: ReactNode }) {
+  const baseId = useId();
+  const [value, select] = useState(defaultValue);
+  return <TabsContext value={{ value, select, baseId }}>{children}</TabsContext>;
+}
+
+type TabProps = Omit<ComponentProps<"button">, "value"> & { value: string };
+
+function Tab({ value, onClick, ...rest }: TabProps) {
+  const ctx = useTabsContext("Tabs.Tab");
+  const selected = ctx.value === value;
+  return (
+    <button
+      type="button"
+      aria-selected={selected}
+      onClick={(e) => { onClick?.(e); if (!e.defaultPrevented) ctx.select(value); }}
+      {...rest}
+    />
+  );
+}
+```
+
+Two small design choices here deserve a name. `Omit<ComponentProps<"button">, "value">` removes the native `value` attribute so ours (a `string`) doesn't collide with it. And we call the caller's `onClick` *first*, letting them veto the selection with `e.preventDefault()`.
+
+> ⚠️ **Common mistake.** Putting a fake default in the context (`createContext({ value: "", select: () => {} })`). It makes misuse compile and silently do nothing.
+
+## 87.4 Typing the namespace
+
+How do callers write `Tabs.List`? There are three ways, and each type-checks differently.
+
+**1. `Object.assign`**: attaches the members and keeps the whole thing typed:
+
+```tsx
+const Tabs = Object.assign(TabsRoot, { List: TabsList, Tab, Panel });
+// Tabs: typeof TabsRoot & { List: …; Tab: …; Panel: … }
+```
+
+**2. Static assignment** on a function declaration (TypeScript treats it as an "expando" property):
+
+```tsx
+function Tabs(props: TabsProps) { return <TabsRoot {...props} />; }
+Tabs.List = TabsList;
+Tabs.Tab = Tab;
+// Tabs.Panel = Panel;   forgetting this line means <Tabs.Panel> fails: 
+// ❌ Property 'Panel' does not exist on type '{ (props: TabsProps): Element; List: …; Tab: …; }'.
+```
+
+**3. Named exports** with a namespace import, with no static properties at all:
+
+```tsx
+// tabs.tsx: export { TabsRoot as Root, TabsList as List, Tab, Panel };
+// usage:
+import * as Tabs from "./tabs";
+
+<Tabs.Root defaultValue="board">
+  <Tabs.List>…</Tabs.List>
+</Tabs.Root>;
+```
+
+Which to choose? `Object.assign` (or the expando form) gives the nicest call site, `<Tabs>` as the root, but it creates one object that bundlers can't tree-shake into pieces, and static properties on components can be awkward across some framework boundaries (for instance when a server component imports a client component's members). The namespace-import form is what Radix UI and many design systems use: more words (`Tabs.Root`), but plain ES module exports, individually importable and individually documented. Pick one style for the **whole component set** ([Chapter 89](/chapter/89) returns to consistency).
+
+> 💡 **Tip.** Whichever you choose, export the props types too (`TabsProps`, `TabProps`), so callers can wrap pieces: `type MyTabProps = TabProps & { count: number }`.
+
+## 87.5 Controlled compound components
+
+So far `Tabs` owns its selection (**uncontrolled**). Real screens often need to *own* it: sync the selected tab with the URL, or reset it when a project changes. That's **controlled** mode: the parent passes `value` and `onValueChange`, exactly like a native `input`'s `value` and `onChange`.
+
+Supporting both modes is a small reusable hook:
+
+```tsx
+function useControllableState<T>({ value, defaultValue, onChange }: {
+  value: T | undefined;          // present means controlled
+  defaultValue: T;
+  onChange?: (next: T) => void;
+}) {
+  const [internal, setInternal] = useState(defaultValue);
+  const isControlled = value !== undefined;
+  const current = isControlled ? value : internal;
+
+  const set = (next: T) => {
+    if (!isControlled) setInternal(next); // controlled: the parent decides
+    onChange?.(next);
+  };
+  return [current, set] as const; // [T, (next: T) => void]
+}
+```
+
+And the root uses it, with props typed to say what's allowed:
+
+```tsx
+type TabsProps = Omit<ComponentProps<"div">, "defaultValue" | "onChange"> & {
+  value?: string;
+  defaultValue?: string;
+  onValueChange?: (value: string) => void;
+};
+
+function TabsRoot({ value, defaultValue = "", onValueChange, children, ...rest }: TabsProps) {
+  const baseId = useId();
+  const [current, select] = useControllableState({ value, defaultValue, onChange: onValueChange });
+  return (
+    <TabsContext value={{ value: current, select, baseId }}>
+      <div {...rest}>{children}</div>
+    </TabsContext>
+  );
+}
+
+const [view, setView] = useState("board");
+<Tabs value={view} onValueChange={setView} />;                  // ✅ controlled
+<Tabs defaultValue="list" />;                                   // ✅ uncontrolled
+<Tabs value={view} onValueChange={(n: number) => {}} />;        // ❌ Type '(n: number) => void' is not assignable to type '(value: string) => void'.
+```
+
+> ⚠️ **Common mistake.** Switching between controlled and uncontrolled during a component's life (`value={maybeUndefined}`). Treat it as a bug; native inputs warn about it, and your component should document it.
+
+## 87.6 Accessibility
+
+A compound component isn't done until a keyboard user and a screen reader can use it. The WAI-ARIA tabs pattern has three requirements: the right **roles**, **IDs that link** the pieces together, and **keyboard support**.
+
+Roles and ID wiring live in the pieces; the shared `baseId` from context makes the links possible without the caller inventing ids:
+
+```tsx
+function Tab({ value, onClick, ...rest }: TabProps) {
+  const ctx = useTabsContext("Tabs.Tab");
+  const selected = ctx.value === value;
+  return (
+    <button
+      type="button"
+      role="tab"
+      id={`${ctx.baseId}-tab-${value}`}
+      aria-selected={selected}
+      aria-controls={`${ctx.baseId}-panel-${value}`}
+      tabIndex={selected ? 0 : -1} // roving tabindex: only the selected tab is in the Tab order
+      onClick={(e) => { onClick?.(e); if (!e.defaultPrevented) ctx.select(value); }}
+      {...rest}
+    />
+  );
+}
+
+function Panel({ value, ...rest }: PanelProps) {
+  const ctx = useTabsContext("Tabs.Panel");
+  return (
+    <div
+      role="tabpanel"
+      id={`${ctx.baseId}-panel-${value}`}
+      aria-labelledby={`${ctx.baseId}-tab-${value}`}
+      hidden={ctx.value !== value}
+      tabIndex={0}
+      {...rest}
+    />
+  );
+}
+```
+
+The tab says which panel it controls (`aria-controls`), and the panel says which tab labels it (`aria-labelledby`). `useId` produces ids that are stable across server and client rendering, and unique per `Tabs` instance, so two tab sets on one page don't collide.
+
+Keyboard support belongs in `Tabs.List`, since it's the one piece that sees *all* the tabs. Arrow keys move between tabs, and Home and End jump to the ends:
+
+```tsx
+function TabsList({ onKeyDown, ...rest }: ComponentProps<"div">) {
+  function handleKeyDown(e: KeyboardEvent<HTMLDivElement>) {
+    onKeyDown?.(e);
+    if (e.defaultPrevented) return;
+    const tabs = Array.from(e.currentTarget.querySelectorAll<HTMLElement>('[role="tab"]:not([disabled])'));
+    const i = tabs.indexOf(document.activeElement as HTMLElement);
+    const target = {
+      ArrowRight: (i + 1) % tabs.length,
+      ArrowLeft: (i - 1 + tabs.length) % tabs.length,
+      Home: 0,
+      End: tabs.length - 1,
+    }[e.key as string];
+    if (target === undefined) return; // not our key
+    e.preventDefault();
+    tabs[target]?.focus();
+    tabs[target]?.click(); // "automatic activation": focusing a tab selects it
+  }
+  return <div {...rest} role="tablist" onKeyDown={handleKeyDown} />;
+}
+```
+
+Querying the DOM for `[role="tab"]` is deliberate: it lets callers put any markup between the tabs, which is the whole point of the pattern. A caller also still needs to supply `aria-label` on the list, so we leave that to them.
+
+> 💡 **Tip.** Test accessibility the way users experience it: `userEvent.tab()` then `userEvent.keyboard("{ArrowRight}")`, and query by `getByRole("tab", { name: "List" })`, with Testing Library ([Chapter 68](/chapter/68)); [Chapter 73](/chapter/73) covers accessibility in depth. If the roles are wrong, the queries fail first.
+
+## 87.7 ✅ Useful / 🚫 Unnecessary
+
+> ✅ **When is this useful?** A **shared component with several visual or structural variations**: the callers genuinely differ in what they put between and inside the parts, and behavior (selection, focus, keyboard) must be identical everywhere. Design-system primitives such as `Tabs`, `Accordion`, `Menu`, `Dialog`, and `Select` are the classic cases. Also when the component set will outlive the team that wrote it: the markup API stays stable while internals change.
+
+> 🚫 **When is this unnecessary complexity?** When **every call site is identical**: five pages each render `Tabs`, `Tabs.List`, three `Tabs.Tab`s and three `Tabs.Panel`s in the same order, with the same content shape. You've made callers write boilerplate, you've added a context, a hook, and a namespace, and you've created new ways to misuse it (a `Tab` with no matching `Panel`). A `tabs` prop would be shorter and harder to break.
+
+A decision shortcut:
+
+```text
+Does any caller need to put arbitrary markup between or around the parts?
+  no  → props (maybe with slots)       <Tabs items={items} />
+  yes → compound                        <Tabs><Tabs.List>…
+Do the parts need to share state or ids (selection, focus, aria links)?
+  no  → plain composition with children
+  yes → compound + context
+```
+
+The honest middle ground: **start with props, and promote to a compound component when the third unusual request arrives.** The move is mechanical, since the config fields become children.
+
+## Common mistakes
+
+> ⚠️ **No guard on the context.** A default context value that "works" outside the parent hides misuse. Use `null` plus a throwing hook.
+
+> ⚠️ **Selection state in the wrong place.** If the parent keeps an array of registered tabs in state, every render re-registers. Prefer deriving from `value` and the DOM, as `Tabs.List` does.
+
+> ⚠️ **Spreading `rest` before your own props.** `<div {...rest} role="tablist">` lets the caller's `role` lose. Decide which props the component owns, and put those *after* the spread.
+
+> ⚠️ **Forgetting `type="button"`.** A `button` inside a form defaults to `submit`, and tabs inside a form submit it.
+
+> ⚠️ **Different namespace styles in one library.** If `Tabs` uses `Object.assign` and `Accordion` uses named exports, every caller must remember which is which.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** callers need layout freedom, the parts share behavior, and several call sites differ. Prefer it for UI primitives with ARIA relationships.
+
+> 🚫 **When not to.** The component is used once or always the same way, or when the "parts" are just data (a list of options and a label). A prop-driven component is easier to type, test, and refactor.
+
+## How it connects
+
+> 🔗 **Connection.** The safe-context hook is from [Chapter 54](/chapter/54); `ComponentProps` and `Omit` from [Chapter 50](/chapter/50); controlled inputs from [Chapter 42](/chapter/42). Next, [Chapter 88](/chapter/88) pushes inversion of control further, to the point where the component has no markup at all. [Chapter 89](/chapter/89) gives you the ladder for choosing between all of these.
+
+> 🌍 **Real world.** Radix UI, React Aria, and Headless UI are built from compound components with context, and the TanStack Table `flexRender` family approaches the same problem differently. HTML itself does this: `select` with `option`, `table` with `tr`, and `details` with `summary`.
+
+## Exercises
+
+### Level 1 — Recall
+
+Build `Accordion` with `Accordion.Item`, `Accordion.Trigger`, and `Accordion.Content`. `Item` takes a `value`, `Trigger` toggles it, and `Content` shows when open. Use the safe-context pattern, and render an `Accordion.Trigger` outside an `Accordion` to see your error message.
+
+### Level 2 — Application
+
+Make `Tabs` **controllable and uncontrollable**: `value` and `onValueChange` for controlled use, `defaultValue` for uncontrolled. Write two tests: one that clicks a tab in uncontrolled mode, and one that proves a controlled `Tabs` does not change until the parent updates `value`.
+
+### Level 3 — Challenge
+
+Build an accessible `Menu` compound component (`Menu`, `Menu.Button`, `Menu.Items`, `Menu.Item`) with keyboard navigation: the button opens the menu, arrows move between items, Home and End jump, Escape closes and returns focus to the button, and Enter activates.
+
+*Hint: reuse the DOM-query approach from `Tabs.List`, and put the open state in context.*
+
+### Level 4 — Real-world
+
+**Ticket TF-560: De-abstract the SettingsTabs.** Six months ago the team built `SettingsTabs` as a compound component. A review shows it is used in **one** place, always with the same four tabs in the same order, and no one has customized a single child.
+
+- Replace the compound component with one component that takes a `sections` array (or just renders the four tabs directly), keeping behavior identical.
+- All existing accessibility tests (roles, arrow keys, `aria-controls` links) must still pass without changes.
+- Write a short note in the pull request naming the signal that would justify going back to a compound component.
+
+## Key takeaways
+
+- A config object for a UI component is a mini-language you must maintain forever, and each requirement adds a field.
+- A compound component is a family of components sharing hidden state through context, so callers control markup and the parent controls behavior.
+- The safe-context pattern (`null` default plus a throwing hook) gives the family a non-null context and good error messages.
+- Namespace with `Object.assign`, static assignment, or named exports: pick one style for the whole library.
+- Support controlled and uncontrolled use with one `useControllableState` hook.
+- Accessibility is part of the contract: roles, id wiring through shared `useId`, a roving `tabIndex`, and keyboard handling in the list.
+- Reach for it when call sites differ. If every caller is identical, props are simpler.
+
+## What comes next
+
+Compound components give callers control over *markup* while the component keeps its markup. What if the component had **no markup at all**, and only supplied behavior? That is the headless component, along with render props and prop getters in [Chapter 88: Render Props, Headless Components & Inversion of Control](/chapter/88).

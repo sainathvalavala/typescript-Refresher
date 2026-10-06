@@ -1,0 +1,366 @@
+> 📖 **The problem.** A teammate shipped a "flexible" helper for the TaskFlow API client. It fetches a list, parses it, pulls out one field, and formats it, all in one call. It has five type parameters. The first person to use it wrote the obvious call and got two errors, one of which mentions a type called `never` that appears nowhere in their code. Now every call site in the codebase spells out all five type arguments by hand, and nobody is sure they're right.
+
+```ts
+declare function fetchAndTransform<TRaw, TItem, TKey extends keyof TItem, TOut, TErr = Error>(
+  url: string,
+  parse: (raw: TRaw) => TItem[],
+  key: TKey,
+  format: (value: TItem[TKey]) => TOut,
+): Promise<Result<TOut[], TErr>>;
+
+fetchAndTransform("/api/tasks", (raw) => raw.tasks, "title", (t) => t);
+// ❌ 'raw' is of type 'unknown'.
+// ❌ Argument of type '"title"' is not assignable to parameter of type 'never'.
+```
+
+Chapters 16 to 18 taught you *how* to write generics. This chapter is about writing generics that other people enjoy calling. It's a **pattern chapter**: you'll learn a design process, a handful of patterns that show up in every utility library, how to test types as well as values, how to recognize an over-generic API, and how to document one. It's also where you build [P04, the Generic Utility Library](/projects/p04).
+
+> 🧠 **Mental model.** Good generic APIs are **inference-first**: callers never write angle brackets. Complexity lives *inside* the signature, and simplicity is what the caller sees.
+
+## 19.1 Inference-first design
+
+The five-parameter helper was designed signature-first: its author listed every type that *might* vary and gave each one a parameter. Inference-first design runs the other way. **Write the call sites first, exactly as you wish they looked, and only then derive the signature that makes them work.**
+
+Here is the call we actually want. No angle brackets, no annotations on the callback, and a precise result:
+
+```ts
+const titles = await fetchList("/api/tasks", parseTaskList, (t) => t.title); // titles: string[]
+const owners = await fetchList("/api/projects", parseProjectList, (p) => p.ownerId); // owners: string[]
+```
+
+Now work backward and ask, for each type in that call, *where does it come from?*
+
+- **The item type** (`Task`, `Project`) comes from the parser's return value, so it's a type parameter, `T`, with the parser as its inference source.
+- **The result type** (`string`) comes from the callback's return value, so it's a second type parameter, `U`.
+- **The raw JSON type** comes from nowhere. Nothing the caller passes describes it, so it can't be a type parameter. It's `unknown`, and the parser's job is to turn `unknown` into `T[]`.
+- **The error type** also comes from nowhere. If the function needs a specific error type, that's a fixed design decision, not a parameter.
+
+```ts
+async function fetchList<T, U>(
+  url: string,
+  parse: (raw: unknown) => T[],
+  select: (item: T) => U,
+): Promise<U[]> {
+  const response = await fetch(url);
+  const items = parse(await response.json());
+  return items.map(select);
+}
+```
+
+Two type parameters instead of five. Each one appears at least twice, and each has an argument that teaches TypeScript what it is. A quick checklist for any signature: every type parameter must (1) appear in at least one *parameter* so it can be inferred, (2) appear at least twice in total, and (3) correspond to something the *caller* actually varies.
+
+> 💡 **Tip.** Prototype a new API's call sites in a scratch file before implementing anything: `declare function fetchList…` plus five realistic calls. Hover over each result. If any call needs angle brackets or an annotated callback, change the signature, not the call.
+
+## 19.2 Practical generic patterns
+
+A few shapes appear in almost every generic utility library. Each one below is inference-first.
+
+**Collection helpers** take an array and return something derived from it, keeping the element type. `partition` splits an array in two. An overload lets a type guard ([Chapter 14](/chapter/14)) narrow the first half:
+
+```ts
+function partition<T, S extends T>(items: readonly T[], isMatch: (item: T) => item is S): [S[], T[]];
+function partition<T>(items: readonly T[], isMatch: (item: T) => boolean): [T[], T[]];
+function partition<T>(items: readonly T[], isMatch: (item: T) => boolean): [T[], T[]] {
+  const yes: T[] = [];
+  const no: T[] = [];
+  for (const item of items) (isMatch(item) ? yes : no).push(item);
+  return [yes, no];
+}
+
+type AssignedTask = Task & { assigneeId: string };
+const isAssigned = (t: Task): t is AssignedTask => t.assigneeId !== null;
+
+const [done, notDone] = partition(taskList, (t) => t.status === "done"); // done: Task[]
+const [assigned, unassigned] = partition(taskList, isAssigned);         // assigned: AssignedTask[]
+```
+
+**Factory functions** create a configured object whose methods are all typed from a single inference at creation time. Here, a factory creates a small typed store keyed by id:
+
+```ts
+function createCollection<T extends { id: string }>(initial: readonly T[] = []) {
+  const items = new Map(initial.map((item) => [item.id, item]));
+  return {
+    get: (id: string) => items.get(id),
+    add(item: T) {
+      items.set(item.id, item);
+    },
+    all: () => [...items.values()],
+  };
+}
+
+const taskStore = createCollection(taskList);      // T is Task, inferred once
+taskStore.get("t1");                               // Task | undefined
+taskStore.add(project);                            // ❌ Argument of type 'Project' is not assignable to parameter of type 'Task'.
+
+const vague = createCollection();                  // ⚠️ T falls back to { id: string }
+const projectStore = createCollection<Project>();  // ✅ nothing to infer from, so say it
+```
+
+Notice the honest exception to "no angle brackets". When a factory is called with *no* arguments, there is nothing to infer from, and TypeScript falls back to the constraint, which here is the vague `{ id: string }`. That one call is where the type argument belongs.
+
+**`pipe`** passes a value through a series of functions, where each function's output feeds the next one's input. Typing a chain of *any* length is possible but complicated, so libraries use **bounded arity**: one overload per length, up to a sensible maximum.
+
+```ts
+function pipe<A, B>(value: A, ab: (a: A) => B): B;
+function pipe<A, B, C>(value: A, ab: (a: A) => B, bc: (b: B) => C): C;
+function pipe<A, B, C, D>(value: A, ab: (a: A) => B, bc: (b: B) => C, cd: (c: C) => D): D;
+function pipe(value: unknown, ...fns: Array<(x: unknown) => unknown>): unknown {
+  return fns.reduce((acc, fn) => fn(acc), value);
+}
+
+const summary = pipe(
+  taskList,
+  (ts) => ts.filter((t) => t.status !== "done"), // ts: Task[]
+  (open) => open.length,                         // open: Task[]
+  (n) => `${n} open tasks`,                      // n: number
+); // summary: string
+```
+
+Each overload chains its type parameters, so `B` links the first function's output to the second function's input. Callers see a perfectly typed chain. The untyped implementation is hidden behind the overloads.
+
+> 🌍 **Real world.** Functional libraries such as RxJS and Effect type `pipe` with long lists of overloads for exactly this reason. Bounded arity is a deliberate trade-off: a little repetition inside the library buys simple types and readable errors for every user.
+
+## 19.3 Typed key-value registries
+
+Many APIs map **string keys to value types**: a settings store where `"pageSize"` holds a number, a feature-flag service, an event bus where `"task:moved"` carries a move payload. The pattern is to describe the whole mapping as one object type, the **schema**, and then use `K extends keyof Schema` with `Schema[K]` from [Chapter 17](/chapter/17) on every method:
+
+```ts
+interface Settings {
+  theme: "light" | "dark";
+  pageSize: number;
+  showCompleted: boolean;
+}
+
+function createSettings<S extends object>(defaults: S) {
+  const values = { ...defaults };
+  return {
+    get<K extends keyof S>(key: K): S[K] {
+      return values[key];
+    },
+    set<K extends keyof S>(key: K, value: S[K]): void {
+      values[key] = value;
+    },
+  };
+}
+
+const settings = createSettings<Settings>({ theme: "light", pageSize: 25, showCompleted: false });
+const size = settings.get("pageSize"); // size: number
+settings.set("theme", "dark");         // ✅
+settings.set("theme", "blue");         // ❌ Argument of type '"blue"' is not assignable to parameter of type '"light" | "dark"'.
+```
+
+Here the type argument is written once, deliberately, at the **creation site**. If we let TypeScript infer `S` from the defaults, `theme` would widen to `string` and `"blue"` would be accepted. The schema is the source of truth, so we state it. After that one line, every `get` and `set` is inference-only. That's the real goal of inference-first design: no angle brackets at the *hundreds* of use sites.
+
+An event emitter is the same idea with listeners instead of values. You'll implement this fully in [P05](/projects/p05); for now, look at how much safety a two-method interface gives:
+
+```ts
+type TaskEvents = {
+  "task:created": Task;
+  "task:moved": { id: string; from: Status; to: Status };
+  "task:deleted": { id: string };
+};
+
+interface Emitter<Events> {
+  on<K extends keyof Events>(event: K, listener: (payload: Events[K]) => void): () => void;
+  emit<K extends keyof Events>(event: K, payload: Events[K]): void;
+}
+
+declare const bus: Emitter<TaskEvents>;
+bus.on("task:moved", (e) => console.log(e.from, "→", e.to)); // e: { id: string; from: Status; to: Status }
+bus.emit("task:deleted", { id: "t1" });     // ✅
+bus.emit("task:deleted", { taskId: "t1" }); // ❌ Object literal may only specify known properties, and 'taskId' does not exist in type '{ id: string; }'.
+bus.emit("task:craeted", task);             // ❌ Argument of type '"task:craeted"' is not assignable to parameter of type 'keyof TaskEvents'.
+```
+
+## 19.4 Testing generic code
+
+A generic helper makes two promises: it computes the right *values*, and it produces the right *types*. Ordinary tests check the first promise. If a refactor accidentally widens `pluck`'s return type from `Status[]` to `unknown[]`, every runtime test still passes. Only a **type test** notices.
+
+Vitest, the test runner used in this book ([Chapter 27](/chapter/27)), has both kinds built in:
+
+```ts
+import { describe, expect, expectTypeOf, it } from "vitest";
+import { pluck } from "@taskflow/utils";
+
+const tasks: Task[] = [
+  { id: "t1", title: "Write docs", status: "todo", priority: "low", projectId: "p1", assigneeId: null },
+  { id: "t2", title: "Fix login", status: "done", priority: "high", projectId: "p1", assigneeId: "u1" },
+];
+
+describe("pluck", () => {
+  it("returns the value of the key for every item", () => {
+    expect(pluck(tasks, "id")).toEqual(["t1", "t2"]);
+  });
+
+  it("is typed by the chosen key", () => {
+    expectTypeOf(pluck(tasks, "status")).toEqualTypeOf<Status[]>();
+    expectTypeOf(pluck(tasks, "assigneeId")).toEqualTypeOf<(string | null)[]>();
+  });
+
+  it("rejects keys that don't exist", () => {
+    // @ts-expect-error: "owner" is not a key of Task
+    pluck(tasks, "owner");
+  });
+});
+```
+
+`expectTypeOf(value).toEqualTypeOf<X>()` fails *type checking* unless the value's type is exactly `X`. The **`@ts-expect-error`** comment is the other half: it tells TypeScript "the next line must produce an error". If a change makes the bad call compile, the comment itself becomes the error, so it works as a test that **misuse stays rejected**:
+
+```ts
+// @ts-expect-error: this line no longer has an error, so the directive fails
+const fine = pluck(tasks, "id"); // ❌ Unused '@ts-expect-error' directive.
+```
+
+Type tests run when the type checker runs: either as part of `tsc --noEmit` in CI, or through Vitest's typecheck mode (`vitest --typecheck`), which by convention picks up files named `*.test-d.ts`.
+
+> ⚠️ **Common mistake.** Writing explicit type arguments in tests, such as `pluck<Task, "status">(tasks, "status")`, hides exactly the thing you need to test: whether *inference* works. Call your helpers in tests the way users will call them. And never use `@ts-ignore` in a type test. It silences errors without requiring one, so it can't fail.
+
+## 19.5 Over-generic smells
+
+Generics are a power tool, and the most common mistake with them is not under-use but over-use. These smells mean an API is more generic than it needs to be.
+
+**Type parameters with no inference source.** If a type parameter appears only in a callback's *parameter* (like `TRaw`) or only in the *return type* (like `TErr`), callers can't supply it except by writing angle brackets, and when they don't, it silently becomes `unknown` or the default. This is the opening example's main flaw.
+
+**Error messages about your internals.** When a caller makes a mistake and the error mentions types they never wrote (`never`, `TItem[TKey]`, a long conditional type), the abstraction is leaking. Compare the errors from these two designs for the same mistake:
+
+```ts
+// Over-generic: the caller sees an internal detail.
+fetchAndTransform("/api/tasks", parseTaskList, "titel", (t) => t);
+// ❌ Argument of type '"titel"' is not assignable to parameter of type 'keyof Task'.
+
+// Inference-first: the mistake is reported in the caller's own terms.
+fetchList("/api/tasks", parseTaskList, (t) => t.titel);
+// ❌ Property 'titel' does not exist on type 'Task'. Did you mean 'title'?
+```
+
+The first message is acceptable here, but it only gets that good when everything else in the call is correct. With five type parameters, one wrong guess cascades into several confusing errors. The second design reports problems as ordinary property errors, in the caller's own code.
+
+**Abstraction for a single caller.** A generic with one call site is speculation. It costs reading time now and buys flexibility nobody has asked for:
+
+```ts
+// Generic, for exactly one call site in the whole app:
+function formatEntityLabel<T extends { id: string }, K extends keyof T>(entity: T, labelKey: K): string {
+  return `${String(entity[labelKey])} (#${entity.id})`;
+}
+formatEntityLabel(task, "title");
+
+// What the code actually needs:
+function formatTaskLabel(task: Task): string {
+  return `${task.title} (#${task.id})`;
+}
+```
+
+**A generic where a union is clearer.** If the set of types is small and fixed (`string | number`), the output doesn't depend on which one came in, and nothing needs to be preserved, a union ([Chapter 16](/chapter/16)) is simpler.
+
+## 19.6 Documenting generic APIs
+
+A generic signature tells the compiler everything, but it can be hard for a *person* to read. Documentation closes that gap. TypeScript editors display **TSDoc** comments (the `/** … */` format with tags like `@param`) on hover, so the place to document a function is directly above it:
+
+```ts
+/**
+ * Groups items by a key computed from each item.
+ *
+ * @typeParam T - The item type. Inferred from `items`.
+ * @typeParam K - The group key. Inferred from what `keyOf` returns; must be a string, number, or symbol.
+ * @param items - The items to group. The array is not mutated.
+ * @param keyOf - Returns the group key for one item.
+ * @returns An object with one array per key that occurred. Keys with no items are absent,
+ *   which is why every group is possibly `undefined`.
+ *
+ * @example
+ * const byStatus = groupBy(tasks, (t) => t.status);
+ * byStatus.done?.length; // number | undefined
+ */
+function groupBy<T, K extends PropertyKey>(items: readonly T[], keyOf: (item: T) => K): Partial<Record<K, T[]>> {
+  const groups: Partial<Record<K, T[]>> = {};
+  for (const item of items) (groups[keyOf(item)] ??= []).push(item);
+  return groups;
+}
+```
+
+Three habits make generic docs useful. Say **where each type parameter is inferred from**, because that tells callers they don't need to write it. Explain **surprising types** in plain words, such as why groups are possibly `undefined`. And always include an **`@example`** call, because one realistic call teaches more than any signature. Good type parameter names (`TItem`, `TKey`) help too, since they appear in every hover tooltip.
+
+## Common mistakes
+
+> ⚠️ **Designing the signature before the call site.** Listing "everything that could vary" produces type parameters that callers can't infer. Start from real calls.
+
+> ⚠️ **Testing values but not types.** A helper can return the right values with a uselessly wide type. Add `expectTypeOf` checks and `@ts-expect-error` cases for the promises your types make.
+
+> ⚠️ **Explicit type arguments at use sites.** If every call to your helper needs angle brackets, the API has failed. The acceptable exceptions are creation sites with nothing to infer from (`createCollection<Project>()`, `createSettings<Settings>(…)`).
+
+> ⚠️ **Generalizing on the first use.** The generic version of a one-off function is harder to read and protects nothing extra. Wait for the second or third real caller.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** you're building code that many call sites will share: a utility library, a store, an API client, an event bus. Those are exactly where inference-first design, type tests, and documentation pay back many times over.
+
+> 🚫 **When not to.** Generalize the second time you need something, not the first. Many teams follow the **rule of three**: write it concretely once, copy it once (noticing what differs), and extract the generic version when the third copy appears, because by then you know which parts *actually* vary. A generic designed in advance usually varies the wrong things.
+
+## How it connects
+
+> 🔗 **Connection.** This chapter puts [Chapter 16](/chapter/16)'s golden rule, [Chapter 17](/chapter/17)'s `K extends keyof T`, and [Chapter 18](/chapter/18)'s generic types and overload-free inference to work. The registry pattern becomes the event emitter in [P05](/projects/p05) and returns with template literal event names in [Chapter 24](/chapter/24). Type tests get their own tooling setup in [Chapter 27](/chapter/27), and the same design principles scale up to public library APIs in [Chapter 82](/chapter/82) and [Chapter 91](/chapter/91). In React, inference-first design is why `useState(0)` needs no angle brackets ([Chapter 52](/chapter/52)).
+
+> 🌍 **Real world.** Well-designed libraries are judged by their call sites. TanStack Query infers the data type from your query function, Zod infers types from schemas, and React infers state types from initial values. Their internal types are often very complicated, and their call sites almost never contain angle brackets. That's the trade they make deliberately.
+
+## Exercises
+
+### Level 1 — Recall
+
+Which of these signatures violate the golden rule (a type parameter must appear at least twice and be inferable from an argument)? For each one that does, say what you'd write instead.
+
+```ts
+declare function a<T>(items: T[]): number;
+declare function b<T>(items: T[], index: number): T | undefined;
+declare function c<T>(json: string): T;
+declare function d<T, U>(items: T[], fn: (item: T) => U): U[];
+declare function e<T extends { id: string }>(item: T): string;
+```
+
+### Level 2 — Application
+
+Write type tests (with `expectTypeOf` and at least one `@ts-expect-error` each) for three helpers from Chapters 16 to 18, for example `first`, `getProperty`, and `groupBy`. Then deliberately break each helper's return type (change it to `unknown`) and confirm that your type tests fail while the runtime tests still pass.
+
+### Level 3 — Challenge
+
+Design a typed `createStore` for TaskFlow's UI state with `get`, `set`, and `subscribe`.
+
+- `subscribe(listener)` returns an unsubscribe function, and listeners receive the new state.
+- `set` must accept either a partial update or an updater function, and must reject unknown keys.
+- No call site except the creation site may need a type argument. Write type tests that prove it.
+
+*Hint: decide first whether `State` should be inferred from the initial value or stated explicitly, and look at what happens to literal unions like `"light" | "dark"` in each case.*
+
+### Level 4 — Real-world
+
+**PR review TF-188: "Make the list helpers flexible".** A teammate opened this PR:
+
+```ts
+export function query<TItem, TFilter extends Partial<TItem>, TSortKey extends keyof TItem, TResult = TItem[], TMeta = unknown>(
+  items: TItem[],
+  filter: TFilter,
+  sortKey: TSortKey,
+): { result: TResult; meta: TMeta } {
+  /* … */
+  return { result: items as unknown as TResult, meta: {} as TMeta };
+}
+```
+
+Write the review and propose a simpler replacement.
+
+- Identify every type parameter that can't be inferred or doesn't earn its place, and every assertion that hides a lie.
+- Propose a signature (or two smaller functions) with the same safety for the real call sites, and no angle brackets at those call sites.
+- Include type tests for the proposal.
+- Keep the review constructive: explain each problem by showing the call site it hurts.
+
+## Key takeaways
+
+- Design **call sites first**, then derive the signature. Every type parameter needs an argument to be inferred from.
+- Common inference-first patterns are collection helpers, factory functions, registries keyed by a schema type, and bounded-arity overloads like `pipe`.
+- Angle brackets belong at **creation sites** with nothing to infer from, never at every use site.
+- Test generic code twice: runtime tests for values, and type tests (`expectTypeOf`, `@ts-expect-error`) for types.
+- Over-generic smells include parameters with no inference source, errors that mention internals, and abstractions with a single caller.
+- Document type parameters with `@typeParam`, say where each is inferred from, and always include an example call.
+
+## What comes next
+
+All of this chapter's types were written *by hand*: the `Settings` interface, the `TaskEvents` map, the `"light" | "dark"` union. But TaskFlow also has *values* that describe the same things, such as the array of roles that fills a dropdown. When the value and the type are written separately, they drift. Someone adds `"auditor"` to the array, forgets the type, and the compiler can't help. [Chapter 20: Deriving Types from Values](/chapter/20) makes the value the single source of truth.

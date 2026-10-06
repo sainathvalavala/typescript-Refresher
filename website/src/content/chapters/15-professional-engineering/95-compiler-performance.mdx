@@ -1,0 +1,303 @@
+> 📖 **The problem.** TaskFlow's monorepo has grown. `tsc --noEmit` now takes 90 seconds in CI. In the editor, hovering over a variable in the reports package freezes VS Code for four seconds. Someone suggests deleting types. Someone else suggests buying faster laptops. Nobody knows what is actually slow, and the guesses are expensive. It turns out that one exported conditional type, used in 300 places, accounts for half of the time.
+
+Type-checking is **computation**: the compiler runs a program (your types) over another program (your code). Like any program it can be slow, and like any slow program the right response is to measure first, not guess. By the end of this chapter you'll know where the checker spends time, how to find the hot spot with diagnostics and traces, which patterns are expensive and which are cheap, how project structure helps, and how to keep a budget so regressions get caught.
+
+> 🧠 **Mental model.** **Type-checking is computation.** Some types are expensive to compute, especially big unions, deep recursion, and complex intersections. **Measure before optimizing**, exactly as you would with runtime code.
+
+## 95.1 Where the checker spends time
+
+The compiler works in phases, and a slowdown lives in one of them.
+
+1. **Parse.** Read files and build syntax trees. Cost grows with *files and lines*, including every `.d.ts` file from `node_modules`.
+2. **Bind.** Create symbols and scopes: what each name refers to.
+3. **Check.** Verify assignability, infer types, resolve overloads. This is usually most of the time, and it's the part you influence with type design.
+4. **Emit.** Write JavaScript and declaration files (skipped with `--noEmit`).
+
+Inside **check**, the real cost is **instantiation**: each time a generic type is applied to arguments (`Partial<Task>`, `DeepReadonly<Config>`), the compiler computes a new type. A thousand instantiations are free; ten million are not, and recursive or distributive types can multiply them quickly.
+
+```ts
+// Cheap: one lookup per use
+type TaskId = string;
+
+// Potentially expensive: instantiates a mapped type per property, recursively, per use
+type DeepReadonly<T> = { readonly [K in keyof T]: DeepReadonly<T[K]> };
+type FrozenState = DeepReadonly<AppState>; // walks the entire AppState tree
+```
+
+The compiler caches instantiations, so repeating a type is cheaper than inventing new ones. Slowness usually comes from *a huge number of distinct instantiations*, or from types that explode combinatorially.
+
+## 95.2 Measuring
+
+`--extendedDiagnostics` prints a time and count breakdown for every phase. It's the first thing to run.
+
+```sh
+tsc --noEmit --extendedDiagnostics
+```
+
+```text
+Files:                         1934
+Lines of Library:             43001
+Lines of Definitions:        412708
+Lines of TypeScript:          88112
+Identifiers:                 388102
+Symbols:                     912440
+Types:                       451093
+Instantiations:             8230417
+Memory used:                1403211K
+I/O Read time:                 0.62s
+Parse time:                    2.10s
+Bind time:                     0.70s
+Check time:                   71.40s
+Total time:                   75.1s
+```
+
+Read it like a profiler summary. Here **Check time** dominates and **Instantiations** is in the millions: the problem is type computation, not file count. If instead `Lines of Definitions` were huge, you'd suspect bloated dependencies (see `skipLibCheck` below).
+
+To find *which file or type*, generate a **trace**:
+
+```sh
+tsc --noEmit --generateTrace ./trace
+# writes trace/trace.json and trace/types.json
+```
+
+Open `trace.json` in a Chromium browser at `chrome://tracing` (or in Perfetto) to see a timeline of each file's check time. Look for the widest bars: those are the slow files. The `types.json` file maps type IDs to what they are, so you can name the culprit. The `@typescript/analyze-trace` tool automates this and prints "hot spots".
+
+```sh
+npx @typescript/analyze-trace ./trace
+```
+
+```text
+Hot Spots
+└─ Check file /packages/reports/src/buildReport.ts (38,412ms)
+   └─ Compare types 8841 and 9120 (12,004ms)
+      └─ DeepMerge<ReportConfig, Overrides>
+```
+
+Now you have a name, a file, and a number, which is a much better starting point than "types are slow".
+
+## 95.3 Expensive types
+
+Four shapes cause most trouble. Recognize them in review.
+
+**Huge unions.** Comparing or narrowing a union costs about the *square* of its size in some operations. A union of 5,000 string literals (every icon name, every route) is fine to declare, but combining it in template literals or mapped types multiplies it.
+
+**Deep or unbounded recursion.** `DeepPartial`, `Paths<T>`, and JSON-like recursive types walk the entire structure at each use.
+
+**Intersection chains.** `A & B & C & D & E` must be re-resolved in full every time it's compared, and nested generic intersections explode.
+
+**Heavy distributive conditional types.** A conditional type over a large union runs once per member, and each run may itself recurse.
+
+```ts
+// ❌ Template literal cross-product: 200 icons × 6 sizes × 4 colors = 4,800 members, every time it's used
+type IconClass = `${IconName}-${Size}-${Color}`;
+
+// ❌ Unbounded recursion on a large object type
+type Paths<T> = T extends object ? { [K in keyof T & string]: K | `${K}.${Paths<T[K]>}` }[keyof T & string] : never;
+type ConfigPath = Paths<HugeConfig>; // can hit "Type instantiation is excessively deep and possibly infinite."
+
+// ✅ Keep them bounded: limit the depth, or accept string and validate at runtime
+type Paths2<T, Depth extends unknown[] = []> = Depth["length"] extends 4 ? never : T extends object
+  ? { [K in keyof T & string]: K | `${K}.${Paths2<T[K], [...Depth, 0]>}` }[keyof T & string]
+  : never;
+```
+
+> ⚠️ **Common mistake.** Judging a type by how it *reads* rather than what it *costs*. A clever one-liner with distributive recursion over a big union can cost more than a hundred lines of plain interfaces.
+
+## 95.4 Cheaper patterns
+
+Most fixes are small changes that give the compiler less to recompute.
+
+**Interfaces over intersections for object extension.** An `interface` that `extends` another is checked and cached as a single named type. An intersection is re-flattened each time. When you're combining object shapes, prefer `extends`.
+
+```ts
+// Slower at scale: re-resolved on each comparison
+type TaskWithMeta = Task & Timestamps & Ownership;
+
+// Faster: one cached, named object type, and clearer error messages
+interface TaskWithMeta extends Task, Timestamps, Ownership {}
+```
+
+**Name your types.** An anonymous object literal type repeated in 50 signatures is re-created and compared each time. A named alias or interface is created once.
+
+**Annotate return types of exported functions.** Without an annotation, the compiler infers the return type by checking the entire body, and each caller then re-uses a possibly huge inferred type. An explicit annotation makes callers use a small, named type, and declaration emit (`isolatedDeclarations`, [Chapter 92](/chapter/92)) benefits too.
+
+```ts
+// ❌ Inferred: every caller depends on a giant structural type
+export function buildReport(tasks: readonly Task[]) {
+  return { byStatus: groupBy(tasks, "status"), byUser: groupBy(tasks, "assignee"), totals: summarize(tasks) };
+}
+
+// ✅ Annotated: callers see a named, cheap type
+export interface Report { byStatus: Map<string, Task[]>; byUser: Map<string, Task[]>; totals: TaskSummary }
+export function buildReport(tasks: readonly Task[]): Report { /* … */ }
+```
+
+**Prefer simple types at module boundaries.** Let an internal function use a clever generic, then expose a plain signature. And don't use `keyof typeof` on enormous objects in hot paths; extract a named union once.
+
+## 95.5 Project structure for speed
+
+Structure matters as much as individual types.
+
+**Project references and incremental builds** ([Chapter 94](/chapter/94)) mean a one-line edit re-checks one project and its dependents instead of the world. `incremental: true` (implied by `composite`) writes a `.tsbuildinfo` file recording what's already checked.
+
+**Exclude what you don't need.** Narrow `include` and `exclude` so the compiler doesn't parse build output, test fixtures, or other apps. `tsc --listFiles` shows exactly what's in the program, and the answer is often surprising.
+
+**Limit ambient `@types`.** By default, every package in `node_modules/@types` is included globally. Setting `types` restricts that.
+
+**`skipLibCheck`** skips type-checking of `.d.ts` files. It saves a lot of time on big dependency trees, at a cost: errors *inside* libraries (or conflicts between two libraries' declarations) go unreported. Most teams enable it for applications and accept the trade-off; library authors should consider checking their own emitted declarations with it off.
+
+```json
+{
+  "compilerOptions": {
+    "composite": true,
+    "incremental": true,
+    "skipLibCheck": true,
+    "types": ["node", "vitest/globals"]
+  },
+  "include": ["src"],
+  "exclude": ["dist", "**/*.stories.tsx"]
+}
+```
+
+```sh
+tsc --noEmit --listFiles | wc -l    # how many files are we actually checking?
+```
+
+> 🚫 **When not to.** Don't enable `skipLibCheck` blindly to hide a real error in your own `.d.ts`, because your declarations are skipped too. Fix your own declarations, and keep the flag as a deliberate trade-off.
+
+## 95.6 Editor performance
+
+The editor doesn't run `tsc`. It talks to the **language server** (`tsserver`), a long-running process that keeps the program in memory and answers hover, completion, and diagnostics requests. In large repositories it fights different problems: memory (a huge program can exceed the default limit), a monorepo opened as one giant project, and a single heavy type making every hover slow.
+
+Practical steps:
+
+- **Open the right project.** Use project references so each file belongs to a small project, rather than one `tsconfig` covering everything.
+- **Check which TypeScript the editor uses.** Use the workspace version to match CI.
+- **Read the tsserver log.** In VS Code, set `typescript.tsserver.log` to `verbose` and use "TypeScript: Open TS Server log" to see slow requests.
+- **Raise server memory** if needed with `typescript.tsserver.maxTsServerMemory`.
+- **Look for the culprit type.** If hovering a particular symbol is slow, the same type is probably appearing in your trace.
+
+```json
+{
+  "typescript.tsserver.maxTsServerMemory": 6144,
+  "typescript.tsserver.log": "verbose",
+  "typescript.preferences.autoImportFileExcludePatterns": ["**/dist/**"]
+}
+```
+
+Editor slowness and CI slowness usually share a cause (an expensive type), so the same trace helps with both.
+
+## 95.7 The native compiler
+
+TypeScript's compiler is itself written in TypeScript, running on JavaScript. The **native compiler** (shipped as TypeScript 7) is a port to a compiled language with shared-memory parallelism, and it checks code many times faster, often around an order of magnitude on large projects. The editor experience improves the same way: faster startup, hover, and project loading.
+
+What that changes: a 90-second check becomes seconds, and cases you'd have avoided because of cost become practical. What it does **not** change: the *semantics*. The same code gets the same errors. And it doesn't make exponential types free, so a type that explodes still explodes, just later. The advice in this chapter (measure, name types, bound recursion, annotate exports) remains good engineering because it reduces the *work*, not just the constant factor.
+
+```sh
+# Same project, same errors, much less waiting
+npx tsc --noEmit            # TypeScript 7: the native compiler
+```
+
+> 🆕 **Modern note.** Tooling that embeds the compiler's JavaScript API may need updates as the API changes with the native release. Check your lint, build, and editor plugins' support before upgrading everywhere at once, and keep a TypeScript version matrix in CI during the transition ([Chapter 92](/chapter/92)).
+
+## 95.8 Type performance budgets
+
+Performance regressions arrive one innocent pull request at a time. A **budget** catches them: decide an acceptable check time (and perhaps instantiation count), measure it in CI, and fail or warn when it's exceeded.
+
+```yaml
+# .github/workflows/typecheck-budget.yml
+name: Type budget
+on: [pull_request]
+jobs:
+  budget:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm ci
+      - run: npx tsc --noEmit --extendedDiagnostics | tee tsc.log
+      - run: node scripts/check-budget.mjs tsc.log
+```
+
+```js
+// scripts/check-budget.mjs
+import { readFileSync } from "node:fs";
+
+const log = readFileSync(process.argv[2], "utf8");
+const num = (label) => Number(new RegExp(`${label}:\\s+([\\d.]+)`).exec(log)?.[1] ?? NaN);
+
+const checkSeconds = num("Check time");
+const instantiations = num("Instantiations");
+const budget = { checkSeconds: 45, instantiations: 6_000_000 };
+
+if (checkSeconds > budget.checkSeconds || instantiations > budget.instantiations) {
+  console.error(`Type budget exceeded: check ${checkSeconds}s, instantiations ${instantiations}`);
+  process.exit(1);
+}
+```
+
+CI machines are noisy, so prefer **instantiation counts** (deterministic) over seconds, or compare against the main branch's number with a tolerance. Treat a failure as a conversation: fix the type, or raise the budget deliberately and record why.
+
+## Common mistakes
+
+> ⚠️ **Optimizing without measuring.** Rewriting types "to be faster" without a trace often changes nothing. Find the hot spot first.
+
+> ⚠️ **Turning off safety instead of fixing the type.** Replacing a slow type with `any` makes the build fast and the product worse. Simplify or bound the type instead.
+
+> ⚠️ **Exporting giant inferred types.** An un-annotated exported function with a large return type pushes its cost onto every consumer.
+
+> ⚠️ **One huge `tsconfig`.** Checking apps, tests, scripts, and stories as one program makes every edit expensive. Split by project.
+
+```ts
+type Json = string | number | boolean | null | Json[] | { [key: string]: Json };
+type Bad<T> = T extends Json ? DeepMerge<T, T> : never; // ❌ Type instantiation is excessively deep and possibly infinite.
+```
+
+## When to use it, and when not to
+
+> ✅ **Use it when** checks cross a threshold your team feels (tens of seconds in CI, editor stutter), or when you publish types that thousands of consumers will compile.
+
+> 🚫 **When not to.** A 6-second check on a modest app is not a problem. Don't contort readable types for speed you can't measure, and don't reach for compiler hacks before simple structure fixes (project references, narrower includes).
+
+## How it connects
+
+> 🔗 **Connection.** The expensive shapes come from [Chapter 79](/chapter/79) (conditional types), [Chapter 80](/chapter/80) (recursive types), and [Chapter 81](/chapter/81) (template literals). Project references are from [Chapter 94](/chapter/94), and the budget fits the CI practices of [Chapter 76](/chapter/76).
+
+> 🌍 **Real world.** Library maintainers use traces to find slow types before shipping them. Libraries with heavy type machinery often include type-performance benchmarks in their repositories.
+
+## Exercises
+
+### Level 1 — Recall
+
+Here is an `--extendedDiagnostics` report: `Files: 2210`, `Lines of Definitions: 1,203,445`, `Instantiations: 412,908`, `Parse time: 6.9s`, `Check time: 8.2s`. Which phase costs the most relative to what you'd expect, and what is the likely cause? What would you check first?
+
+### Level 2 — Application
+
+You're given this slow type: ``type Routes = `${Entity}/${Action}/${Id}` `` with `Entity` (40 members), `Action` (15), and `Id` (200 literal ids). Restructure it so the number of union members stays small, while keeping valid routes checked, and measure the difference with `--extendedDiagnostics`.
+
+### Level 3 — Challenge
+
+Given a provided repository with one very slow file, use `--generateTrace` and `analyze-trace` to identify the slowest file and type, fix it, and report the before and after for check time and instantiations. *Hint: look for a recursive or distributive type used from many call sites.*
+
+### Level 4 — Real-world
+
+**Ticket PLAT-31: Type-check budget for the capstone.**
+
+- CI records `Check time` and `Instantiations` on every pull request and posts them as a comment.
+- A budget file defines limits; exceeding them fails the build unless a label `type-budget-override` is present.
+- The README documents how to run a trace locally when the budget fails.
+
+## Key takeaways
+
+- Type-checking is computation; the check phase (especially **instantiation**) is usually the cost.
+- Run `--extendedDiagnostics` first, then `--generateTrace` with `analyze-trace` to find the culprit.
+- Watch for huge unions, unbounded recursion, long intersections, and heavy distributive conditionals.
+- Prefer `interface extends`, named types, and explicit return types on exports.
+- Project references, narrow `include`s, and a considered `skipLibCheck` keep programs small.
+- The native compiler makes checking much faster without changing semantics, but doesn't excuse exponential types.
+- Put a budget in CI so regressions are caught while they're small.
+
+## What comes next
+
+Everything so far has assumed a client-rendered single-page app. Many teams now move rendering, data loading, and even components to the server, which raises a new class of type questions: what can cross from server to client, and what must be validated? That's [Chapter 96: React Frameworks, Server Rendering & Server Components](/chapter/96).

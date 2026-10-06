@@ -1,0 +1,477 @@
+> 📖 **The problem.** Your TaskFlow API from [Chapter 31](/chapter/31) is deployed. The route handler says `req.body` is a `CreateTaskRequest`, the service is fully typed, the repository is fully typed. Then a mobile client with a bug sends `{ "title": 42, "priority": "urgent!!" }`. The server stores it happily. Next morning, the task list page crashes for every user, because `task.title.trim()` runs on a number. TypeScript said `CreateTaskRequest`. The network said otherwise. Nothing was standing between them.
+
+This is the most important chapter in Book One. Everything you've learned so far makes your code *consistent with its own types*. That is a real guarantee, but only about the code **you wrote**. The moment data arrives from outside your program, types stop being facts and become hopes.
+
+By the end of this chapter you'll be able to find every place in an application where untrusted data enters, make that data unusable until it has been checked, define schemas with Zod that give you the runtime check *and* the static type from one source, validate requests, environment variables, query strings, and uploaded files, and decide where validation belongs (and where it is wasted effort).
+
+> 🧠 **Mental model.** *Parse, don't validate (or cast).* At every boundary, data enters as `unknown` and becomes a trusted type **only** by passing through a parser that actually checks it. Inside the boundary, types can be trusted. Outside it, nothing can. A type annotation on outside data is not a check, it is a wish.
+
+## 32.1 What TypeScript believes vs what runtime receives
+
+TypeScript has two worlds. At **compile time** it reasons about the types in your source. At **runtime**, all those types are gone ([Chapter 3](/chapter/3)): only JavaScript values remain. A type is trustworthy exactly as far as the code that produced the value was checked by the compiler. A value that came from *outside the compiled program* has no such history.
+
+Here is the Chapter 31 handler, with the deliberate gap we left in it:
+
+```ts
+router.post("/tasks", async (req: Request<{}, TaskResponse, CreateTaskRequest>, res) => {
+  const task = await service.createTask(req.body); // TypeScript: req.body is a CreateTaskRequest
+  res.status(201).json(toTaskResponse(task));
+});
+```
+
+Now look at what the type system believes and what actually arrives, side by side:
+
+```ts
+// What TypeScript believes (CreateTaskRequest):
+//   { projectId: string; title: string; priority?: "low" | "medium" | "high"; dueDate?: string }
+
+// What the network delivered:
+const actual = { title: 42, priority: "urgent!!" }; // no projectId at all, wrong types, invalid enum
+```
+
+The `as` keyword (and the `Request` generic slot, which works the same way) is the mechanism of the lie. It tells the compiler "trust me", and the compiler obliges, because that is what `as` means.
+
+```ts
+const body = JSON.parse(text) as CreateTaskRequest; // ✅ compiles, no check whatsoever
+
+body.title.trim();   // ✅ compiles
+                     // 💥 TypeError: body.title.trim is not a function (title is the number 42)
+body.projectId.length; // ✅ compiles
+                       // 💥 TypeError: Cannot read properties of undefined (reading 'length')
+```
+
+Walk the damage end to end. The number `42` passes through the route, the service (`title.trim()` crashes, or worse, the code path doesn't trim and stores it), and into the database. Once a wrong-shaped value is *stored*, every later reader trusts a lie that now lives in your data. Bad data compounds: the bug isn't where the crash is.
+
+> ⚠️ **Common mistake.** Thinking "my types are strict, so I'm safe." Strict mode checks your code against itself. It cannot check a stranger.
+
+## 32.2 Mapping your application's boundaries
+
+A **boundary** is any place where data enters your program from something your compiler did not check. The trick to runtime safety is to stop thinking about it as "validate the request body" and start thinking about it as an *inventory*: list every entrance, and treat each one the same way.
+
+| Boundary | What you get | Typical lie |
+|---|---|---|
+| HTTP request body | Parsed JSON, shape unknown | `req.body as CreateTaskRequest` |
+| Query string and route params | Strings (or arrays of strings) | `req.query as { page: number }` |
+| Environment variables | `string \| undefined` | `process.env.PORT as string` |
+| Files (CSV, JSON uploads, config) | Text or bytes | `JSON.parse(file) as Config` |
+| Browser storage, cookies | Strings from `localStorage` | `JSON.parse(localStorage.tasks) as Task[]` |
+| Third-party APIs (and your own other services) | JSON you did not write | `fetchJson<User>(url)` |
+| Database rows (when not generated types) | Whatever the driver returns | `row as TaskRow` |
+| Message queues, webhooks | A payload someone else produced | `JSON.parse(msg) as Event` |
+
+Mark them on a diagram of your server and the pattern is clear: nearly all of them sit on the *edge*, where your process meets the outside world.
+
+```text
+ browser ──HTTP──▶ [route] ──▶ [service] ──▶ [repository] ──SQL──▶ database
+                     ▲  ▲                                             │
+   env vars ─────────┘  └─ query/params/body                          ▼
+   uploaded file ───────▶ [importer]                       rows come back
+   Stripe webhook ──────▶ [route]                  (boundary again, unless typed)
+```
+
+> 🧠 **Mental model.** Draw a line around code you control. Every arrow that crosses the line is a boundary and needs a parser at the crossing point. Arrows *inside* the line don't.
+
+Notice that "trusted" third parties are on the list. A partner API changes a field name without telling you, an old mobile app keeps sending the previous format for two years. The boundary is about *who compiled the data*, not whether you like them.
+
+## 32.3 unknown as the boundary type
+
+If the outside data's honest type is "I don't know", then say so. TypeScript has exactly that type: `unknown` ([Chapter 9](/chapter/9)). Unlike `any`, `unknown` makes the value **unusable until it's been checked**. The compiler forces the question you must answer anyway.
+
+```ts
+const parsed: unknown = JSON.parse(text); // JSON.parse returns any, so annotate it away
+
+parsed.title;        // ❌ 'parsed' is of type 'unknown'.
+parsed.title.trim(); // ❌ 'parsed' is of type 'unknown'.
+```
+
+Compare the two ways of receiving the same body. With `as`, the unsafe assumption is invisible, and everything downstream compiles. With `unknown`, the dangerous value cannot flow anywhere until you narrow it, so a missing check shows up as a red squiggle at the boundary instead of a crash in production.
+
+```ts
+// ❌ Silent: any code path that forgets to check still compiles
+function handleCreate(body: any) {
+  return createTask(body); // compiles, trusts everything
+}
+
+// ✅ Loud: you cannot pass `unknown` to something that needs a CreateTaskRequest
+function handleCreate2(body: unknown) {
+  return createTask(body); // ❌ Argument of type 'unknown' is not assignable to parameter of type 'CreateTaskRequest'.
+}
+```
+
+The practical rule: make the **first** type of any outside data `unknown`, and make the only way out of `unknown` a function that checks. Many libraries help by typing their entry points for you; in your own code, annotate explicitly.
+
+```ts
+// A tiny boundary helper: bytes in, unknown out. Never any.
+export function parseJson(text: string): unknown {
+  return JSON.parse(text); // still throws on malformed JSON; Chapter 33 handles that
+}
+```
+
+Now the question is what the "checking function" should look like.
+
+## 32.4 Hand-written validation
+
+The most direct tool is a **type guard**: a function returning `value is T` that does the checking ([Chapter 14](/chapter/14)). Here is one for `CreateTaskRequest`:
+
+```ts
+const PRIORITIES = ["low", "medium", "high"] as const;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export function isCreateTaskRequest(value: unknown): value is CreateTaskRequest {
+  if (!isRecord(value)) return false;
+  if (typeof value.projectId !== "string" || value.projectId === "") return false;
+  if (typeof value.title !== "string" || value.title.trim() === "") return false;
+  if (value.priority !== undefined && !PRIORITIES.includes(value.priority as never)) return false;
+  if (value.dueDate !== undefined && typeof value.dueDate !== "string") return false;
+  return true;
+}
+```
+
+It works, and using it narrows nicely:
+
+```ts
+const body: unknown = req.body;
+if (!isCreateTaskRequest(body)) {
+  return res.status(400).json({ error: "Invalid task" }); // but *what* was invalid?
+}
+body.title; // ✅ string
+```
+
+Then the costs show up. First, **tedium**: every field is a paragraph of checks, and nested objects multiply it. Second, **bad errors**: a boolean cannot say *which* field failed or why, so a useful message needs a second, richer function. Third, and worst, **drift**: the type `CreateTaskRequest` and the guard are two separate descriptions of the same shape. Add `assigneeId?: string` to the type, forget the guard, and everything still compiles. The guard would even return `true` for `assigneeId: 5`, because TypeScript never verifies the body of a `value is T` predicate.
+
+```ts
+export interface CreateTaskRequest {
+  projectId: string;
+  title: string;
+  priority?: Priority;
+  dueDate?: string;
+  assigneeId?: string; // ✅ added to the type…
+}
+// …but isCreateTaskRequest never learned about it. No compiler error, ever.
+```
+
+Hand-written guards are worth knowing, because every validation library is built from them, and for tiny one-off checks (a single `typeof` test) they are perfect. For anything shaped like a DTO, we want one description that produces *both* the check and the type.
+
+## 32.5 Schema validation
+
+A **schema** is a value that describes a shape, and can check data against it at runtime. This book uses [Zod](https://zod.dev) (version 4). You build the schema out of small composable pieces:
+
+```sh
+npm install zod
+```
+
+```ts
+import { z } from "zod";
+
+export const CreateTaskSchema = z.object({
+  projectId: z.string().min(1),
+  title: z.string().trim().min(1, "Title is required").max(120),
+  priority: z.enum(["low", "medium", "high"]).default("medium"),
+  dueDate: z.iso.date().optional(), // "2026-10-31"
+});
+```
+
+A schema offers two ways to run the check. **`parse`** returns the value or **throws** a `ZodError`. **`safeParse`** never throws: it returns a result object you narrow on `success`. At boundaries, `safeParse` is usually the right choice, because bad input from the network is *expected*, not exceptional ([Chapter 33](/chapter/33)).
+
+```ts
+const result = CreateTaskSchema.safeParse(req.body); // req.body is any here, and that's fine: the parser accepts unknown
+
+if (!result.success) {
+  console.log(z.prettifyError(result.error));
+  // ✖ Invalid input: expected string, received undefined
+  //   → at projectId
+  // ✖ Invalid input: expected string, received number
+  //   → at title
+  // ✖ Invalid option: expected one of "low"|"medium"|"high"
+  //   → at priority
+} else {
+  result.data; // typed, checked, defaults applied, title trimmed
+}
+```
+
+The error is a structured list of **issues**, each with a `path`, a `code`, and a `message`. `z.prettifyError` gives humans a readable block. `z.flattenError(result.error).fieldErrors` gives `{ title: ["…"], priority: ["…"] }`, which is the shape an API response or a form wants. Parsing is not just checking: it can also **transform**, so `.trim()` and `.default("medium")` above change the output. That is why the verb is "parse".
+
+> 🆕 **Modern note.** This book uses Zod 4 syntax: top-level `z.iso.date()` and `z.url()`, and `z.prettifyError`. Older tutorials show `z.string().url()` and `error.format()`, which are legacy in v4. Valibot and ArkType are alternatives built on the same idea, and Standard Schema lets libraries accept any of them.
+
+## 32.6 Types inferred from schemas
+
+Now the payoff. `z.infer` extracts the static type *from the schema itself*. There is one description of the shape, and both the runtime check and the compile-time type come from it, so they cannot drift.
+
+```ts
+export type CreateTaskRequest = z.infer<typeof CreateTaskSchema>;
+// hover: {
+//   projectId: string;
+//   title: string;
+//   priority: "low" | "medium" | "high";
+//   dueDate?: string | undefined;
+// }
+```
+
+Add `assigneeId: z.string().optional()` to the schema and the type updates instantly, everywhere. There is nothing second to forget.
+
+Notice that `priority` is *required* in the output type: the default guarantees it is present after parsing. The data **going in** and the data **coming out** can have different types, and Zod names both:
+
+```ts
+type CreateTaskInput  = z.input<typeof CreateTaskSchema>;  // priority?: "low" | "medium" | "high" | undefined
+type CreateTaskOutput = z.output<typeof CreateTaskSchema>; // priority: "low" | "medium" | "high"  (same as z.infer)
+```
+
+So the pattern is: schema first, type derived. You can still compose schemas with the same ideas as the utility types from [Chapter 21](/chapter/21):
+
+```ts
+const TaskSchema = CreateTaskSchema.extend({
+  id: z.string(),
+  status: z.enum(["todo", "doing", "done"]),
+});
+export const UpdateTaskSchema = CreateTaskSchema.pick({ title: true, priority: true }).partial();
+//   .pick ≈ Pick,  .partial() ≈ Partial,  .omit ≈ Omit,  .extend ≈ intersection with new fields
+```
+
+> ⚠️ **Common mistake.** Keeping a hand-written `interface CreateTaskRequest` next to the schema "for readability". Now you have two sources of truth again. Delete the interface and export `z.infer`.
+
+## 32.7 API validation
+
+Now close the gap in the Chapter 31 route. The handler stops claiming a type for the body and *earns* one:
+
+```ts
+router.post("/tasks", async (req, res) => {
+  const parsed = CreateTaskSchema.safeParse(req.body); // req.body is unknown to the parser
+  if (!parsed.success) {
+    return res.status(400).json({
+      error: "invalid_request",
+      fieldErrors: z.flattenError(parsed.error).fieldErrors,
+    });
+  }
+  const task = await service.createTask(parsed.data); // parsed.data: CreateTaskRequest, genuinely
+  res.status(201).json(toTaskResponse(task));
+});
+```
+
+The curl that broke production now gets a useful answer instead of corrupting the database:
+
+```sh
+curl -X POST localhost:3000/v1/tasks -H 'content-type: application/json' \
+  -d '{ "title": 42, "priority": "urgent!!" }'
+# 400 {"error":"invalid_request","fieldErrors":{"projectId":["Invalid input: expected string, received undefined"],
+#       "title":["Invalid input: expected string, received number"],"priority":["Invalid option: expected one of \"low\"|\"medium\"|\"high\""]}}
+```
+
+Since every route will do this, extract it once. A small generic helper (the "parser parameter" fix from [Chapter 16](/chapter/16)) makes the pattern one line per route:
+
+```ts
+function parseOrReply<S extends z.ZodType>(schema: S, data: unknown, res: Response): z.output<S> | undefined {
+  const result = schema.safeParse(data);
+  if (result.success) return result.data;
+  res.status(400).json({ error: "invalid_request", fieldErrors: z.flattenError(result.error).fieldErrors });
+  return undefined;
+}
+```
+
+(Chapter 33 replaces this reply-or-undefined dance with a thrown, typed error that one middleware turns into the 400.)
+
+Validate **responses** too, when they come from somewhere you don't control. This is the same lie in the other direction: `fetchJson<Weather>(url)` in [Chapter 16](/chapter/16) trusted an upstream server. Parse what comes back:
+
+```ts
+const UpstreamUserSchema = z.object({ id: z.string(), email: z.email(), name: z.string() });
+
+async function fetchUser(id: string) {
+  const res = await fetch(`https://auth.example.com/users/${id}`);
+  const json: unknown = await res.json();
+  return UpstreamUserSchema.parse(json); // throws if the partner changed their API: loud, early, near the cause
+}
+```
+
+> 🌍 **Real world.** Contract drift between services is a top cause of production incidents. A schema at the receiving end converts "mysterious `undefined` three calls later" into "upstream returned `email: null` at `/users/42`", the moment it happens.
+
+Your *own* responses need less: they're built from domain values your compiler already checked, and `Response<TaskResponse>` from Chapter 31 guards the shape.
+
+## 32.8 Environment validation
+
+Environment variables are the most overlooked boundary, because they feel like part of your code. They aren't: they are strings (or `undefined`) set by a deploy script, a teammate, or a typo. Without validation, the failure happens *later and elsewhere*:
+
+```ts
+const port = Number(process.env.PORT);        // NaN if unset or "abc": app.listen(NaN) listens on a random port
+const dbUrl = process.env.DATABASE_URL as string; // 'undefined' flows into the driver; crashes on the first query, maybe hours after boot
+```
+
+The fix is to **fail fast**: validate everything once, at startup, into one typed `config` object, and have the rest of the program import that object instead of touching `process.env`.
+
+```ts
+// src/config.ts
+import { z } from "zod";
+
+const EnvSchema = z.object({
+  NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
+  PORT: z.coerce.number().int().min(1).max(65535).default(3000),
+  DATABASE_URL: z.url(),
+  LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
+});
+
+const parsed = EnvSchema.safeParse(process.env);
+if (!parsed.success) {
+  console.error("Invalid environment:\n" + z.prettifyError(parsed.error));
+  process.exit(1); // refuse to boot rather than run misconfigured
+}
+
+export const config = parsed.data;
+// hover: { NODE_ENV: "development" | "test" | "production"; PORT: number; DATABASE_URL: string; LOG_LEVEL: ... }
+```
+
+Booting with a bad environment now produces a clear message, immediately, instead of a 3 a.m. page:
+
+```text
+Invalid environment:
+✖ Invalid input: expected number, received NaN
+  → at PORT
+✖ Invalid input: expected string, received undefined
+  → at DATABASE_URL
+```
+
+> 💡 **Tip.** Treat `process.env` like a banned import everywhere except `config.ts`. A lint rule (`no-restricted-properties`) enforces it. With Node 22 you can load a file using `node --env-file=.env`, as in [Chapter 30](/chapter/30), and the same schema validates it.
+
+## 32.9 User input and external files
+
+Query strings, CSV imports, and uploaded files share one difficulty: they're all **text**. A `?page=2` is the string `"2"`, a CSV cell `"true"` is a string, and a form field is a string. Validation here includes **coercion**: converting text to the intended type, safely.
+
+```ts
+const ListQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(20),
+  status: z.enum(["todo", "doing", "done"]).optional(),
+  includeDone: z.stringbool().optional(), // "true"/"false"/"1"/"0"/"yes"/"no"
+});
+
+ListQuerySchema.parse({ page: "2", includeDone: "true" });
+// { page: 2, pageSize: 20, includeDone: true }
+ListQuerySchema.parse({ page: "abc" }); // ❌ throws ZodError: expected number, received NaN, at page
+```
+
+Coercion has traps. `z.coerce.*` simply calls JavaScript's constructors, which are generous:
+
+```ts
+z.coerce.number().parse("");        // 0   (empty string coerces to zero!)
+z.coerce.boolean().parse("false");  // true (any non-empty string is truthy)
+```
+
+Use `z.stringbool()` for flags, and require non-empty strings before coercing numbers where `0` is not valid. The same discipline applies to files: parse the text, then validate each record, and keep a **report** instead of aborting on the first bad row.
+
+```ts
+const CsvRowSchema = z.object({
+  title: z.string().trim().min(1),
+  priority: z.enum(["low", "medium", "high"]),
+  dueDate: z.iso.date().optional().or(z.literal("").transform(() => undefined)),
+});
+
+function importRows(rows: Record<string, string>[]) {
+  const good: z.output<typeof CsvRowSchema>[] = [];
+  const bad: { line: number; problems: string[] }[] = [];
+  rows.forEach((row, i) => {
+    const r = CsvRowSchema.safeParse(row);
+    if (r.success) good.push(r.data);
+    else bad.push({ line: i + 2, problems: r.error.issues.map((x) => `${x.path.join(".")}: ${x.message}`) });
+  });
+  return { good, bad }; // the UI shows "42 imported, 3 rows need attention", with reasons
+}
+```
+
+Uploaded JSON, imported backups, and `localStorage` contents ([Chapter 35](/chapter/35)) all follow the same recipe: `unknown` in, schema in the middle, trusted type out.
+
+## 32.10 Where to validate (and where not to)
+
+Validation is not a sprinkling of `if` statements through the code. It is a **layer at the edge**. The shape is always the same:
+
+```text
+ outside world ──▶ [ BOUNDARY: parse with schema ] ──▶ trusted types everywhere inside
+     unknown                                           CreateTaskRequest, Task, config
+```
+
+Validate **once, at the edge**, and pass the parsed, typed value inward. The service from Chapter 31 should receive a `CreateTaskRequest` and trust it, because the only way to get one is through the schema:
+
+```ts
+// ✅ the service takes parsed data and trusts the type
+async createTask(input: CreateTaskRequest): Promise<Task> {
+  const open = await this.repo.countOpen(input.projectId); // no typeof checks here
+  /* … */
+}
+
+// ❌ re-validating inside business logic
+async createTask(input: CreateTaskRequest): Promise<Task> {
+  if (typeof input.title !== "string") throw new Error("bad title"); // dead code: the type already says string
+```
+
+> ⚠️ **Common mistake.** Validating deep inside business logic, scattered and partial. You end up with a few checks in a few places, and the rest of the system still unsure whether to trust anything. A boundary should be complete and obvious: *one* place per entry point.
+
+What about cost? Parsing walks the data, so it costs CPU in proportion to size. For ordinary API requests this is negligible next to a database call. For very large payloads or a hot loop, consider validating a sample or at coarser granularity, and measure before you worry. What you should *never* do is skip validation for speed on data from a stranger.
+
+## Common mistakes
+
+> ⚠️ **Validating, then casting anyway.** `schema.parse(body); const t = body as Task;` ignores the parser's output. Use the returned value, and only that.
+
+> ⚠️ **Validating deep inside business logic.** Check at the edge, then pass trusted types inward ([32.10](#3210-where-to-validate-and-where-not-to)).
+
+> ⚠️ **Duplicate types alongside schemas.** An `interface` and a schema describing the same shape will drift. Derive the type with `z.infer`.
+
+> ⚠️ **Trusting "trusted" services.** Your partner's API, your other team's microservice, and your own mobile app from two versions ago all cross a boundary. Parse their responses.
+
+> ⚠️ **Leaving `any` at the boundary.** `req.body`, `JSON.parse`, and `response.json()` all return `any`. Assign them to an `unknown` annotation first, so a missing parser is a compile error.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** data comes from a network, a file, the environment, storage, a URL, user input, or any code you don't control. The test is simply "did a compiler check how this value was produced?"
+
+> 🚫 **When not to.** Don't re-validate data that never crossed a boundary. A function that calls another function in your own typed code needs no `typeof` guards: the compiler already did that job. Likewise, don't write schemas for data that is immediately thrown away, or for trivially typed internal config. Validation is a cost; spend it at the edges.
+
+## How it connects
+
+> 🔗 **Connection.** `unknown` comes from [Chapter 9](/chapter/9) and narrowing from [Chapter 14](/chapter/14). The "lying generic" in [Chapter 16](/chapter/16) is cured here: the type is *earned* by the parser. `Result<T, E>` ([Chapter 18](/chapter/18)) is the natural return type for a hand-rolled parser, and [Chapter 33](/chapter/33) shows how failures flow up through layers. In the browser, `localStorage` and `fetch` need the same treatment ([Chapter 35](/chapter/35)), and [Chapter 61](/chapter/61) builds a typed client that validates responses. The Part VI projects [P07](/projects/p07) (API v2, validated) and [P08](/projects/p08) (typed API client) put this chapter into practice.
+
+## Exercises
+
+### Level 1 — Recall
+
+Below is a description of a TaskFlow deployment. Draw (or list) every trust boundary, and label each with the type its data should have *before* parsing:
+
+```text
+Browser SPA ──▶ Express API ──▶ SQLite
+                   ▲   │
+   .env file ──────┘   └──▶ Slack webhook (outgoing), Stripe webhook (incoming)
+   nightly CSV import from the finance team's FTP server
+```
+
+### Level 2 — Application
+
+Take the TaskFlow API from [Chapter 31](/chapter/31) and remove **every** `as` that touches outside data: request bodies, query strings, route params, and `process.env`. Replace each with a Zod schema, derive the types with `z.infer`, and return `400` with `fieldErrors` for bad input. Confirm with `curl` that `{ "title": 42 }` is rejected.
+
+### Level 3 — Challenge
+
+Write a hand-rolled `parseTask(value: unknown): Result<Task, ParseError>` (use the `Result` type from [Chapter 18](/chapter/18)) that checks `id`, `title`, `status`, and a nested `assignee`, and reports **all** problems with their paths, not just the first. Then write the Zod equivalent. Compare the two: lines of code, quality of error messages, and what happens when you add a field.
+
+*Hint: collect errors in an array as you go, rather than returning on the first failure.*
+
+### Level 4 — Real-world
+
+**Ticket TF-307: The server must refuse to boot with bad configuration.** Last week a deploy shipped with `DATABASE_URL` missing, and the API ran for four hours serving errors.
+
+- `src/config.ts` validates `NODE_ENV`, `PORT`, `DATABASE_URL`, and `LOG_LEVEL` with a schema, and exports one typed `config` object.
+- A missing or malformed `DATABASE_URL` exits the process with status `1` and a readable list of every problem.
+- No other file reads `process.env` (enforce with a lint rule or a test that greps the source).
+- A test sets up three environments (valid, missing URL, bad port) and asserts the outcomes.
+
+## Key takeaways
+
+- TypeScript guarantees consistency of *your* code. Data from outside has no such guarantee: `as` and generic slots like `Request<..., Body>` are claims, not checks.
+- Make a boundary inventory: network, query, env, files, storage, third-party APIs, webhooks. Each needs a parser at the crossing.
+- Type outside data as `unknown` so it cannot be used until checked.
+- Hand-written guards work but are tedious, give poor errors, and drift from their types.
+- A **schema** gives you the runtime check and, through `z.infer`, the static type from one source of truth. Prefer `safeParse` at boundaries and `parse` when failure is a bug.
+- Validate environment variables at startup into one typed config, and **fail fast**.
+- Parse once at the edge and pass trusted types inward. Don't re-validate what never crossed a boundary.
+
+## What comes next
+
+You can now say precisely *when* something is wrong. But the code above just replies with a 400 inline, `parse` throws, the service throws plain `Error`s, and a missing task still gives a 500 with "Something went wrong". [Chapter 33: Error Handling Across Layers](/chapter/33) sorts failures into **expected** and **unexpected**, builds typed error classes, and translates them layer by layer into a consistent HTTP error contract.
+
+

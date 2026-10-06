@@ -1,0 +1,356 @@
+> 📖 **The problem.** A TaskFlow helper called `loadConfig()` returns `any` because "the JSON could be anything". A week later, someone writes `const timeout = loadConfig().timeout * 1000`. Then `timeout` is `any`, so the next function that takes it is `any`, and the one after that. Within a month, an entire module is `any`, the compiler reports nothing, and a typo'd property name crashes production. One lazy annotation has quietly switched off type-checking for hundreds of lines.
+
+Most of TypeScript is about being precise. But some values are genuinely unknowable at compile time (parsed JSON, thrown errors, user input), and some functions genuinely return nothing or never return at all. TypeScript has special types for these edge cases: `any`, `unknown`, `null` and `undefined`, `void`, `never`, and the confusing `object`/`{}`/`Object` trio.
+
+By the end, you'll choose the right edge type deliberately, recognize `any` when it spreads, and replace `!` assertions with checks that actually protect you.
+
+> 🧠 **Mental model.** **`unknown` = "could be anything; prove it before use." `any` = "stop checking." `never` = "this cannot happen." `void` = "ignore the result."** (Chapter 10 will show these are the extremes of the "types are sets" picture.)
+
+## 9.1 any: the escape hatch
+
+`any` is a type that **turns off checking**. A value of type `any` can be assigned to anything, anything can be assigned to it, and you can read any property or call it as a function, all without errors.
+
+```ts
+const data: any = JSON.parse('{"count": 3}');
+
+data.count.toFixed();      // ✅ compiles
+data.cuont.toFixed();      // ✅ compiles (typo!), then 💥 TypeError: Cannot read properties of undefined
+data();                    // ✅ compiles, then 💥 TypeError: data is not a function
+
+const s: string = data;    // ✅ accepted, even if data is a number at runtime
+```
+
+The danger isn't just the line where `any` appears. It **spreads**. Anything derived from an `any` is itself `any`:
+
+```ts
+function loadConfig(): any {
+  return JSON.parse('{"timeout": 30}');
+}
+
+const timeout = loadConfig().timeout * 1000;   // number, but the property was never checked
+const label = loadConfig().label;              // label: any
+const upper = label.toUpperCase();             // upper: any
+export const banner = upper + "!";             // banner: any, and everything touching it too
+```
+
+Where does `any` come from? Some sources are built in: `JSON.parse` returns `any`, and `response.json()` returns `Promise<any>`. Others are *implicit*, and these are the ones you can block. With `strict` on, `noImplicitAny` makes the compiler refuse to guess:
+
+```ts
+function parseAge(raw) {        // ❌ Parameter 'raw' implicitly has an 'any' type.
+  return Number(raw);
+}
+```
+
+> ⚠️ **Common mistake.** Using `any` "just for now" to get past an error. It rarely gets replaced, and it hides every later error that depends on it.
+
+> 🕰 **Legacy note.** During a gradual migration from JavaScript ([Chapter 29](/chapter/29)), `any` is a useful temporary marker for "not yet typed". The goal is to shrink it, not accept it.
+
+## 9.2 unknown: the safe "anything"
+
+`unknown` also means "could be anything", but with the opposite rule: you can assign **anything** to it, and you can do **nothing** with it until you prove what it is.
+
+```ts
+const input: unknown = JSON.parse('{"count": 3}');   // annotate the any → unknown
+
+input.count;            // ❌ 'input' is of type 'unknown'.
+input.toFixed();        // ❌ 'input' is of type 'unknown'.
+const s: string = input; // ❌ Type 'unknown' is not assignable to type 'string'.
+```
+
+To use it, **narrow** it with a check TypeScript understands:
+
+```ts
+function describe(value: unknown): string {
+  if (typeof value === "string") return value.toUpperCase();   // value: string
+  if (typeof value === "number") return value.toFixed(1);      // value: number
+  if (Array.isArray(value)) return `list of ${value.length}`;  // value: any[]
+  return "something else";
+}
+```
+
+This is how you keep honest code around untrusted data. `unknown` is the right type for: parsed JSON, `catch` variables ([Chapter 14](/chapter/14)), message payloads, third-party responses, and form input. Inside the function, you check; outside it, callers get a trustworthy result.
+
+```ts
+function parseTitle(json: string): string | undefined {
+  const parsed: unknown = JSON.parse(json);
+  if (typeof parsed === "object" && parsed !== null && "title" in parsed) {
+    const title = (parsed as { title: unknown }).title;
+    return typeof title === "string" ? title : undefined;
+  }
+  return undefined;
+}
+```
+
+Checking every field by hand gets tedious, and [Chapter 14](/chapter/14) gives you type guards to package it, while [Chapter 32](/chapter/32) shows runtime validation libraries. The principle stays: **`unknown` forces the proof; `any` waives it.**
+
+> 💡 **Tip.** Whenever you are about to write `any`, try `unknown` first. If the compiler complains, that complaint is the checking you needed.
+
+## 9.3 null and undefined
+
+JavaScript has two "no value" values. `undefined` means "not set yet" (a missing property, an unassigned variable, a function with no return). `null` means "intentionally empty". Under **`strictNullChecks`** (part of `strict`), TypeScript treats them as their own types, and **no other type includes them**:
+
+```ts
+let title: string = "Docs";
+title = null;                  // ❌ Type 'null' is not assignable to type 'string'.
+title = undefined;             // ❌ Type 'undefined' is not assignable to type 'string'.
+
+let maybeTitle: string | null = null;   // ✅ you opted in to null, explicitly
+```
+
+This is the compiler preventing the most common JavaScript crash, "cannot read properties of null". Wherever a value might be absent, the type says so, and you must handle it before using it:
+
+```ts
+function findTask(tasks: Task[], id: string): Task | undefined {
+  return tasks.find((t) => t.id === id);
+}
+
+const task = findTask(tasks, "t1");
+task.title;                       // ❌ 'task' is possibly 'undefined'.
+if (task) { task.title; }         // ✅ narrowed
+```
+
+Two operators make absent values pleasant to handle:
+
+```ts
+const dueLabel = task?.dueDate?.toUpperCase();    // optional chaining: stops at null/undefined
+// dueLabel: string | undefined
+
+const pageSize = settings.pageSize ?? 20;         // nullish coalescing: default ONLY for null/undefined
+const count = input.count || 10;                  // ⚠️ || also replaces 0 and "": a different meaning!
+```
+
+`??` falls back only when the left side is `null` or `undefined`. `||` falls back for *any falsy value*, including `0`, `""`, and `false`, so `0 || 10` gives `10`. When `0` is a valid value, use `??`.
+
+> ⚠️ **Common mistake.** Turning `strictNullChecks` off "to reduce noise". It disables the single most valuable check in the language.
+
+## 9.4 The non-null assertion (!)
+
+Sometimes you *know* a value isn't null, but TypeScript can't prove it. The **non-null assertion** operator `!`, written after an expression, tells the compiler: "trust me, this is not `null` or `undefined`."
+
+```ts
+const input = document.getElementById("title");   // HTMLElement | null
+input.focus();                                     // ❌ 'input' is possibly 'null'.
+input!.focus();                                    // ✅ compiles: you promised it exists
+```
+
+`!` is **erased**. It generates no runtime check, so if your promise is wrong, you get the very crash that `strictNullChecks` was built to prevent:
+
+```ts
+const missing = document.getElementById("nope");
+missing!.focus();   // 💥 TypeError: Cannot read properties of null (reading 'focus')
+```
+
+That's why `!` is a code smell. It is a *lie the compiler can't verify*. It is acceptable in a few narrow cases: tests, or the line right after a check that TypeScript can't follow. Everywhere else, replace it with a real check, which costs one line:
+
+```ts
+// ✅ Handle it
+const input = document.getElementById("title");
+if (input) input.focus();
+
+// ✅ Or fail loudly, with a useful message, if it's a bug when missing
+function assertDefined<T>(value: T | null | undefined, message: string): T {
+  if (value === null || value === undefined) throw new Error(message);
+  return value;
+}
+const field = assertDefined(document.getElementById("title"), "#title missing from page");
+field.focus();
+```
+
+The second version crashes too if the element is missing, but with a clear message, at the right place. [Chapter 14](/chapter/14) shows how to write `assertDefined` so TypeScript narrows automatically.
+
+> ⚠️ **Common mistake.** Sprinkling `!` to silence nullability errors. Each one is a runtime crash you've promised won't happen.
+
+## 9.5 void
+
+`void` is the return type of a function that **doesn't return a useful value**. Callers aren't meant to use the result.
+
+```ts
+function logTask(task: Task): void {
+  console.log(task.title);       // no return statement
+}
+
+const result = logTask(task);    // result: void  (it's undefined at runtime; don't use it)
+```
+
+`void` is most interesting in **callback types**. A callback declared as returning `void` may actually return something, and the value is simply ignored. This is deliberate, because it lets you pass any function where a "do something" callback is expected:
+
+```ts
+type Handler = (task: Task) => void;
+
+const handler: Handler = (task) => tasks.push(task);   // ✅ push returns a number, which is ignored
+
+[1, 2, 3].forEach((n) => results.push(n * 2));         // ✅ forEach's callback is typed to return void
+```
+
+But declaring the function *itself* with `: void` is strict. It must not return a value:
+
+```ts
+function save(task: Task): void {
+  return 5;   // ❌ Type 'number' is not assignable to type 'void'.
+}
+```
+
+`void` and `undefined` aren't the same: `void` says "don't rely on this", while `undefined` is one specific value.
+
+> 💡 **Tip.** For a function that never produces a value, write `: void` (or let it be inferred). For a callback parameter type, `() => void` accepts the widest variety of functions.
+
+## 9.6 never
+
+`never` is the type with **no values at all**. It describes code that can't produce a value, in two situations.
+
+**A function that never returns:** it always throws or loops forever.
+
+```ts
+function fail(message: string): never {
+  throw new Error(message);
+}
+
+function parsePositive(n: number): number {
+  if (n <= 0) fail("must be positive");
+  return n;                // TypeScript knows execution can't pass a call to fail()
+}
+```
+
+**An impossible branch:** after you've handled every case of a union, nothing is left, so the remaining type is `never`. This enables an **exhaustiveness check**:
+
+```ts
+type Status = "todo" | "doing" | "done";
+
+function label(status: Status): string {
+  switch (status) {
+    case "todo": return "To do";
+    case "doing": return "In progress";
+    case "done": return "Done";
+    default: {
+      const unreachable: never = status;   // ✅ status is never here: all cases handled
+      return unreachable;
+    }
+  }
+}
+```
+
+Now someone adds `"blocked"` to `Status` and forgets this function. The compiler reports it right at the `default` branch:
+
+```ts
+// type Status = "todo" | "doing" | "done" | "blocked";
+//   const unreachable: never = status;
+//   ❌ Type '"blocked"' is not assignable to type 'never'.
+```
+
+That's a preview. [Chapter 14](/chapter/14) turns this into a reusable `assertNever`, and [Chapter 55](/chapter/55) uses it for reducers.
+
+## 9.7 object, {} and Object
+
+Three similar-looking types mean three different things, and the middle one is a common trap.
+
+```ts
+let a: object = { id: 1 };    // ✅ any non-primitive: objects, arrays, functions
+a = [1, 2];                   // ✅
+a = 5;                        // ❌ Type 'number' is not assignable to type 'object'.
+
+let b: {} = 5;                // ✅ !!! {} means "any value that is not null or undefined"
+b = "text";                   // ✅ strings and numbers are allowed
+b = null;                     // ❌ Type 'null' is not assignable to type '{}'.
+
+let c: Object = 5;            // ✅ the wrapper-type interface; avoid it (like String in Ch 6)
+```
+
+Because `{}` accepts the number `5` and the string `"text"`, writing `{}` to mean "an object" is a bug waiting to happen. It describes *anything except `null`/`undefined`*. And `Object` is the wrapper type, which you shouldn't use.
+
+Use these instead, depending on what you mean:
+
+```ts
+function keysOf(value: object): string[] {              // any non-primitive
+  return Object.keys(value);
+}
+
+const settings: Record<string, unknown> = {};           // "an object with string keys, unknown values"
+settings.theme = "dark";
+
+function printAnything(value: unknown): void {          // truly anything, checked before use
+  console.log(value);
+}
+```
+
+A good default: name the exact shape. If you can't, use `Record<string, unknown>` for "some object with string keys" or `unknown` for "anything", and narrow.
+
+> ⚠️ **Common mistake.** Writing `{}` meaning "an object". It also accepts numbers, strings, and booleans.
+
+## Common mistakes
+
+> ⚠️ **`any` for convenience.** Each `any` weakens everything downstream. Use `unknown` and narrow, or write the real type.
+
+> ⚠️ **`!` to silence nullability.** It's a promise with no enforcement. Handle the null case or assert with a useful error.
+
+> ⚠️ **`{}` meaning "an object".** It matches primitives too. Use `object`, `Record<string, unknown>`, or a real shape.
+
+> ⚠️ **`||` where `??` is meant.** `count || 10` replaces a legitimate `0`. Use `??` for "default only when missing".
+
+> ⚠️ **Forgetting where `any` comes from.** `JSON.parse` and `response.json()` return `any`. Assign them to an `unknown` or a validated type immediately.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** the value is genuinely not knowable at compile time: `unknown` for input and errors, `void` for callbacks whose result is ignored, `never` for unreachable code and exhaustiveness, `null`/`undefined` (explicitly in a union) for things that may be absent.
+
+> 🚫 **When not to.** `any` is almost never right in new code. The exception is a deliberate, commented escape in a hard-to-type corner (for example, interop with an untyped library), kept as small as possible. And skip `!` unless a check TypeScript can't follow comes right before it.
+
+## How it connects
+
+> 🔗 **Connection.** `unknown` leads to **narrowing** ([Chapter 14](/chapter/14)) and then to **runtime validation** ([Chapter 32](/chapter/32)). `never` leads to exhaustiveness ([Chapter 14](/chapter/14), [Chapter 55](/chapter/55)). In [Chapter 10](/chapter/10), `unknown` and `never` become the top and bottom of the whole type system.
+
+> 🌍 **Real world.** Mature codebases enforce this with lint rules (`no-explicit-any`, `no-non-null-assertion`) and review comments like "can this be `unknown`?". Many standard-library signatures still return `any` for history's sake, which is why you wrap them at the boundary.
+
+## Exercises
+
+### Level 1 — Recall
+
+Label the best type for each value or function, and say why:
+
+```ts
+const a = JSON.parse(text);              // parse result
+const b = alert("Saved");                // return value of alert()
+function crash(msg: string) { throw new Error(msg); }   // return type
+function onClick(handler: ???) {}        // a callback whose result is ignored
+const c = document.querySelector("#app"); // result type
+const d = caughtError;                    // the variable in catch (e)
+```
+
+### Level 2 — Application
+
+Replace every `any` in this small module with `unknown` plus checks, or with real types. The module must compile under `strict` with no `any` left.
+
+```ts
+function parseUser(json: any): any {
+  const data = JSON.parse(json);
+  return { name: data.name, age: data.age };
+}
+
+function describe(value: any) {
+  return value.toString().toUpperCase();
+}
+```
+
+### Level 3 — Challenge
+
+Demonstrate how a single `any` disables type-checking **three function calls away**. Write `a()` returning `any`, then `b(x)` and `c(x)` and `d(x)` that each pass the value on. Show that a clearly wrong use in `d` compiles, then change one annotation in `a` to `unknown` and show where the first error appears. Explain in two sentences why the error shows up where it does.
+
+### Level 4 — Real-world
+
+**Ticket TF-009: Audit a real file.** Choose an open-source TypeScript file of at least 150 lines (a utility module in a project you use).
+
+- List every `any` and every `!` in it, with line numbers.
+- For each one, propose a safer alternative (`unknown` and a check, a real type, or an explicit error) and write it as a mock pull-request review comment.
+- Say which ones you would *leave* and justify each in one sentence.
+- Summarize: how many could be removed without changing behavior?
+
+## Key takeaways
+
+- `any` turns checking off and **spreads** through everything it touches. `unknown` is the safe alternative: assign anything, use nothing until you narrow.
+- With `strictNullChecks`, `null` and `undefined` are separate types; handle them with narrowing, `?.`, and `??`.
+- `!` is an unchecked promise that is erased at runtime; prefer a check or an assertion that throws a clear error.
+- `void` means "ignore the result"; `never` means "cannot happen" and powers exhaustiveness checks.
+- `{}` means "any non-nullish value", not "an object". Use `object`, `Record<string, unknown>`, or a real shape.
+
+## What comes next
+
+You now have the vocabulary: primitives, arrays, objects, literals, and the edge types. But when you see `unknown` as "everything" and `never` as "nothing", a bigger picture is forming. [Chapter 10: Understanding the Type System](/chapter/10) pulls it together: types as sets, assignability, structural typing, and how TypeScript decides whether one type fits into another.

@@ -1,0 +1,413 @@
+> 📖 **The problem.** A form library you've been using has a function `register("address.street")`. Type `register("address.stret")` and the editor underlines it immediately: that path doesn't exist. Better still, hover over the result of `getValue("address.geo.lat")` and it says `number`. The library cannot possibly know your form's shape in advance, and yet it checks **string paths into your nested objects** and tells you the type at the other end. How?
+
+The answer is two tools you already own, used together: **mapped types** ([Chapter 22](/chapter/22)) that rebuild an object type key by key, and **recursion** ([Chapter 79](/chapter/79)) that lets that rebuilding descend into nested objects. This chapter shows how to filter keys by the *type of their value*, how mapping behaves on **unions** of objects, how to write `DeepPartial` and `DeepReadonly` without breaking on arrays, functions, and dates, and how to build `Paths<T>` and `PathValue<T, P>`. It also shows where all of this stops working, and when a deep type is the wrong tool.
+
+> 🧠 **Mental model.** **Mapped types transform shapes; recursion lets the transformation descend into nested shapes.** Together they can describe every path through an object. But each level of descent has a cost, so use them where the payoff is large and keep an exit.
+
+> ⏭ **Safe to skip.** Sections 80.5 and 80.6 are specialist techniques, mostly for library authors. Sections 80.1, 80.2, and 80.4 are useful in everyday application code.
+
+## 80.1 Key remapping in depth
+
+[Chapter 22](/chapter/22) showed the `as` clause that renames keys inside a mapped type. The same clause can **drop** keys: if the `as` expression evaluates to `never`, that key is left out. That makes it a filter, and a filter on the *value type* is one of the most useful tricks in the toolbox.
+
+```ts
+interface Task {
+  id: string;
+  title: string;
+  estimate: number;
+  priority: number;
+  done: boolean;
+  due: Date | null;
+}
+
+type PickByType<T, V> = {
+  [K in keyof T as T[K] extends V ? K : never]: T[K];
+};
+
+type TextFields = PickByType<Task, string>;
+// { id: string; title: string }
+type NumberFields = PickByType<Task, number>;
+// { estimate: number; priority: number }
+```
+
+Often you don't want the filtered *object*, only the *key names*. For that, map each key to either itself or `never`, then index with `keyof T` to collect the values into a union:
+
+```ts
+type KeysOfType<T, V> = {
+  [K in keyof T]-?: Required<T>[K] extends V ? K : never;
+}[keyof T];
+
+type NumericKeys = KeysOfType<Task, number>; // "estimate" | "priority"
+```
+
+Two details matter. The `-?` removes optionality so `undefined` doesn't leak into the key union. And `Required<T>[K]` stops an **optional** property such as `estimate?: number` (really `number | undefined`) from failing the `extends number` test and vanishing. Without those, `KeysOfType<{ a?: number }, number>` quietly returns `never` or `undefined`.
+
+The payoff is an API whose parameters are checked against the *kind* of key:
+
+```ts
+function sortBy<T, K extends KeysOfType<T, number>>(items: T[], key: K): T[] {
+  return [...items].sort((a, b) => (a[key] as number) - (b[key] as number));
+}
+
+sortBy(tasks, "estimate"); // ✅
+sortBy(tasks, "title");    // ❌ Argument of type '"title"' is not assignable to parameter of type 'KeysOfType<Task, number>'.
+```
+
+> 🚫 **When not to.** For a hand-written module with three sortable fields, an explicit union (`"estimate" | "priority"`) is clearer than a clever type. Reach for `KeysOfType` when the object shape is *generic* or changes often.
+
+## 80.2 Mapping over unions of objects
+
+Mapped types treat unions in two different ways depending on how they're written. The distinction matters whenever you model events, actions, or API responses as a **discriminated union**.
+
+```ts
+type TaskEvent =
+  | { type: "created"; task: Task }
+  | { type: "deleted"; id: string }
+  | { type: "moved"; id: string; to: "todo" | "doing" | "done" };
+```
+
+The first way: a mapped type that is **homomorphic** (it iterates `keyof T` over a type parameter) automatically **distributes** over a union. It transforms each member separately and unions the results:
+
+```ts
+type Nullable<T> = { [K in keyof T]: T[K] | null };
+
+type N = Nullable<{ type: "a"; x: 1 } | { type: "b"; y: 2 }>;
+// { type: "a" | null; x: 1 | null } | { type: "b" | null; y: 2 | null }
+```
+
+The second way: `keyof` applied to a union gives only the keys **common to every member**, which is rarely what you want, and non-homomorphic forms like `Record<keyof U, string>` collapse the union into one object:
+
+```ts
+type Common = keyof TaskEvent;                          // "type"  (only the shared key)
+type Bad<U> = Record<keyof U, string>;
+type B = Bad<TaskEvent>;                                // { type: string }  (the rest is lost)
+
+type AllKeys<U> = U extends unknown ? keyof U : never;  // distribute first, then take keys
+type Every = AllKeys<TaskEvent>;                        // "type" | "task" | "id" | "to"
+```
+
+The most useful pattern for unions is to **key by the discriminant** using `as`. It builds a handler table where each event name maps to a function that receives exactly that event:
+
+```ts
+type Handlers = {
+  [E in TaskEvent as E["type"]]: (event: E) => void;
+};
+// {
+//   created: (event: { type: "created"; task: Task }) => void;
+//   deleted: (event: { type: "deleted"; id: string }) => void;
+//   moved:   (event: { type: "moved"; id: string; to: … }) => void;
+// }
+
+const handlers: Handlers = {
+  created: (e) => addToBoard(e.task),    // e is the "created" member
+  deleted: (e) => removeFromBoard(e.id),
+  moved: (e) => moveOnBoard(e.id, e.to),
+};
+```
+
+Add a fourth event to the union and `handlers` stops compiling until you handle it. That is the benefit of deriving a table from the union instead of writing it by hand.
+
+## 80.3 Recursive types revisited
+
+A type can refer to itself, as long as the reference sits inside an object, array, or function type, where TypeScript can delay evaluating it. [Chapter 23](/chapter/23) and your work with trees already used this. Three shapes show up constantly.
+
+**Trees**, where each node contains more nodes of the same kind:
+
+```ts
+interface TreeNode<T> {
+  value: T;
+  children: TreeNode<T>[];
+}
+
+const board: TreeNode<string> = {
+  value: "TaskFlow",
+  children: [
+    { value: "Frontend", children: [{ value: "Fix modal", children: [] }] },
+    { value: "Backend", children: [] },
+  ],
+};
+```
+
+**JSON**, the type of any value that can come out of `JSON.parse`:
+
+```ts
+type Json = string | number | boolean | null | Json[] | { [key: string]: Json };
+
+const payload: Json = { tasks: [{ id: "t1", done: false }], total: 1 };
+const bad: Json = { when: new Date() }; // ❌ Type 'Date' is not assignable to type 'Json'.
+```
+
+**Nested configuration**, like route trees where every route can have child routes:
+
+```ts
+type RouteConfig = {
+  path: string;
+  title?: string;
+  children?: RouteConfig[];
+};
+
+const routes: RouteConfig[] = [
+  { path: "/", children: [{ path: "projects", children: [{ path: ":projectId" }] }] },
+];
+```
+
+Each of these is **data whose shape is itself recursive**. The type mirrors the data, and a recursive function ([Chapter 11](/chapter/11)) usually walks it at runtime. Where the structure comes from outside your program, validate at the boundary ([Chapter 32](/chapter/32)); the type alone doesn't prove the data matches.
+
+## 80.4 Recursive utility types
+
+The built-in `Partial<T>` and `Readonly<T>` are **shallow**: they change only the top level. Updating a nested field with a patch object is a common need, so people reach for `DeepPartial`. The obvious version is a one-liner, and it is subtly broken:
+
+```ts
+type DeepPartialNaive<T> = { [K in keyof T]?: DeepPartialNaive<T[K]> };
+
+interface Project {
+  name: string;
+  owner: { name: string; tags: string[] };
+  due: Date;
+  onSave: () => void;
+}
+
+const a: DeepPartialNaive<Project> = { due: {} };            // ✅ compiles. A "Date" that isn't a Date.
+const b: DeepPartialNaive<Project> = { due: "yesterday" };   // ✅ compiles too: strings have toString, which Date's optional members overlap
+const c: DeepPartialNaive<Project> = { onSave: {} };         // ✅ compiles. The function became an object type.
+```
+
+The problem is that "everything that isn't a primitive" is not the same as "a plain object". `Date`, `RegExp`, `Map`, and functions all have members, so the recursion rebuilds them as **all-optional** copies. For arrays the naive version also adds `undefined` to each element (`tags` becomes `(string | undefined)[]`), because the `?` modifier applies to array elements as well.
+
+The fix is to decide, case by case, what to descend into and what to leave alone:
+
+```ts
+type Builtin =
+  | Date | RegExp | Error | Map<any, any> | Set<any> | Promise<any>
+  | ((...args: any[]) => unknown);
+
+type DeepPartial<T> =
+  T extends Builtin ? T                                            // leave whole values alone
+  : T extends readonly unknown[] ? { [K in keyof T]: DeepPartial<T[K]> } // arrays and tuples: no "?"
+  : T extends object ? { [K in keyof T]?: DeepPartial<T[K]> }      // plain objects: descend, optional
+  : T;                                                              // primitives
+
+type Patch = DeepPartial<Project>;
+// {
+//   name?: string;
+//   owner?: { name?: string; tags?: string[] };
+//   due?: Date;
+//   onSave?: () => void;
+// }
+```
+
+The same three-way split gives `DeepReadonly` and `DeepRequired`, with `{ readonly [K in keyof T]: … }` and `-?` in place of `?`:
+
+```ts
+type DeepReadonly<T> =
+  T extends Builtin ? T
+  : T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> }
+  : T;
+
+type Frozen = DeepReadonly<{ tags: string[]; steps: [string, number] }>;
+// { readonly tags: readonly string[]; readonly steps: readonly [string, number] }
+```
+
+Mapped types over a *type parameter* automatically preserve array and tuple structure, so `string[]` stays an array (now `readonly string[]`). That is why the array branch for `DeepReadonly` is unnecessary. Test your utilities with arrays, tuples, `Date`, functions, `null`, and optional properties. Those are exactly the cases where deep types break.
+
+> ⚠️ **Common mistake.** Using a deep utility on a type from a library that contains class instances (a `Map`, an ORM entity, a DOM node). Recursion into them produces enormous, wrong types. Add them to `Builtin`, or don't use a deep type there.
+
+## 80.5 Path types
+
+> ⏭ **Safe to skip.** This is the technique behind typed form libraries and lodash-style `get`. Valuable if you build such a library, optional otherwise.
+
+Back to the opening problem. We want a type `Paths<T>` that is the union of every dotted path into `T`, so `"address.stret"` fails. The idea is recursion plus a template literal ([Chapter 24](/chapter/24)): for every key `K`, a path is either `K` itself, or `K` followed by `.` and a path into `T[K]`.
+
+```ts
+type Leaf = string | number | boolean | bigint | symbol | null | undefined
+  | Date | readonly unknown[] | ((...args: any[]) => unknown);
+
+type Paths<T> = T extends Leaf ? never : {
+  [K in keyof T & string]: T[K] extends Leaf ? K : K | `${K}.${Paths<T[K]>}`;
+}[keyof T & string];
+
+interface Form {
+  title: string;
+  due: Date;
+  tags: string[];
+  address: { street: string; geo: { lat: number; lng: number } };
+  owner?: { name: string };
+}
+
+type FormPath = Paths<Form>;
+// "title" | "due" | "tags" | "address" | "address.street" | "address.geo"
+// | "address.geo.lat" | "address.geo.lng" | "owner" | "owner.name"
+```
+
+`keyof T & string` keeps only string keys, which template literals can use. The trailing `[keyof T & string]` collects the mapped type's values into one union, as in `KeysOfType`. Arrays, dates, and functions are treated as leaves, so we don't generate paths like `tags.map`.
+
+Now the second half, `PathValue<T, P>`, walks the path with `infer`, splitting at the first dot:
+
+```ts
+type PathValue<T, P extends string> =
+  P extends `${infer Head}.${infer Rest}`
+    ? Head extends keyof T ? PathValue<NonNullable<T[Head]>, Rest> : never
+    : P extends keyof T ? T[P] : never;
+
+type Lat = PathValue<Form, "address.geo.lat">; // number
+type OwnerName = PathValue<Form, "owner.name">; // string (NonNullable skips past the optional owner)
+type Owner = PathValue<Form, "owner">;          // { name: string } | undefined
+```
+
+Put them together and the opening function exists:
+
+```ts
+declare function get<T, P extends Paths<T>>(obj: T, path: P): PathValue<T, P>;
+
+declare const form: Form;
+const lat = get(form, "address.geo.lat"); // lat: number
+get(form, "address.stret"); // ❌ Argument of type '"address.stret"' is not assignable to parameter of type '"address" | "address.geo" | "address.geo.lat" | …'.
+```
+
+Editors also use the `Paths<T>` union to offer **autocomplete** for the string, which is half of why these APIs feel so good.
+
+## 80.6 Recursion limits and performance
+
+> ⏭ **Safe to skip.** Come back to this section when a deep type makes your editor slow or the compiler complains.
+
+Recursion has two failure modes. First, a type that refers to itself through **data that is itself recursive** never bottoms out. Our `Paths` on a type with a back-reference fails right away:
+
+```ts
+interface Category { name: string; parent: Category | null }
+
+type P = Paths<Category>;
+// ❌ Type of property 'parent' circularly references itself in mapped type
+//    '{ [K in "name" | "parent"]: … }'.
+```
+
+(A tail-recursive variation of the same idea reports `Type instantiation is excessively deep and possibly infinite`, the message [Chapter 79](/chapter/79) described.) The cure is a **depth counter**: a tuple that maps each number to the one below it, with `never` at the bottom, so the recursion stops after a fixed number of levels.
+
+```ts
+type Prev = [never, 0, 1, 2, 3, 4];
+
+type PathsD<T, D extends number = 3> = [D] extends [never] ? never
+  : T extends Leaf ? never
+  : {
+      [K in keyof T & string]: T[K] extends Leaf ? K : K | `${K}.${PathsD<NonNullable<T[K]>, Prev[D]>}`;
+    }[keyof T & string];
+
+type CategoryPath = PathsD<Category>;
+// "name" | "parent" | "parent.name" | "parent.parent" | "parent.parent.name" | "parent.parent.parent.parent"  (and then stops)
+```
+
+Second, even finite recursion can produce **huge unions**: a type with 30 fields, each holding objects with 30 fields, makes thousands of paths, and every use must be checked against that union. Symptoms are a laggy editor and slow `tsc`.
+
+Practical steps when that happens:
+
+- **Limit depth** with a counter as above. Few forms need more than four levels.
+- **Stop at leaves early**: treat arrays, dates, and branded or class values as leaves.
+- **Name intermediate types** with aliases. TypeScript caches aliases, so repeating the same instantiation is cheap.
+- **Measure** rather than guess: `tsc --extendedDiagnostics` reports instantiation counts and check time, and `tsc --generateTrace out` produces a trace you can open in a performance viewer.
+
+```sh
+npx tsc --noEmit --extendedDiagnostics   # look at "Instantiations" and "Check time"
+```
+
+## 80.7 When deep types are a smell
+
+Deep recursive types are impressive, which is exactly why they're overused. Before you write one, ask what problem it solves, and whether the *data* is the real problem.
+
+```ts
+// A deeply nested state shape...
+interface AppState {
+  workspace: { projects: { byId: { tasks: { items: { assignee: { profile: { name: string } } }[] } } } };
+}
+// ...invites DeepPartial<AppState> for updates, Paths<AppState> for selectors,
+// and a lot of types that exist only to survive the nesting.
+```
+
+Compare with **flattened, normalized** data, which most state libraries and databases use:
+
+```ts
+interface AppState {
+  projects: Record<ProjectId, Project>;
+  tasks: Record<TaskId, Task>;        // each task stores projectId and assigneeId
+  users: Record<UserId, User>;
+}
+
+function renameUser(state: AppState, id: UserId, name: string): AppState {
+  return { ...state, users: { ...state.users, [id]: { ...state.users[id], name } } };
+}
+```
+
+Updates are shallow, selectors take an ID, and plain `Partial<User>` is enough. No deep utility types are needed, and the code is easier for people to read, test, and change.
+
+Warning signs that a deep type is the wrong tool:
+
+- **It exists to support an awkward data shape** that you could flatten.
+- **It breaks on ordinary inputs** (class instances, optional properties, `null`) and needs a growing exception list.
+- **Its error messages are unreadable** to the teammates who must use it.
+- **It slows the editor** down when applied to the app's real types.
+- **A runtime schema would be simpler.** A Zod schema gives you validation *and* the inferred type in one place.
+
+> ✅ **Use it when** the payoff is wide: a form kit or API client used by dozens of screens, where one typed-path helper replaces many unchecked strings. In that case the complexity lives in one library module and the callers just get autocomplete.
+
+> 🚫 **When not to.** Don't write `DeepPartial` for a three-field patch you could type with an explicit interface. Don't expose `Paths<T>` where plain keys would do. And never let a deep type become something every contributor must understand to change a screen.
+
+## Common mistakes
+
+> ⚠️ **Shallow-copy bugs hidden by deep types.** A `DeepReadonly<T>` stops compile-time mutation only. At runtime the objects are still mutable, so a library that ignores your types can change them. Use `Object.freeze` when it matters.
+
+> ⚠️ **Forgetting `-?` and `Required<T>`** in `KeysOfType`. Optional properties include `undefined`, so they silently fail the `extends` test and disappear.
+
+> ⚠️ **Using `keyof` on a union.** It yields only the keys shared by every member. Distribute first (`U extends unknown ? keyof U : never`) to get all keys.
+
+> ⚠️ **Letting recursion run into built-ins.** `Date`, `Map`, functions, and class instances need to be listed as leaves, or the type rebuilds them wrongly.
+
+> ⚠️ **Recursing with no exit.** Types that refer to themselves through data (`parent`, `replies`) need a depth counter, or they fail with `circularly references itself` or `excessively deep`.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** one well-tested helper type removes a whole class of unchecked strings or repetitive hand-written types: typed paths for form fields, handler tables derived from an event union, `KeysOfType` for a generic `sortBy`.
+
+> 🚫 **When not to.** When the data could be flattened, when the type needs a long list of exceptions, when error messages become unreadable, or when the cost is felt in the editor. A hand-written interface for three fields is almost always the better answer.
+
+## How it connects
+
+> 🔗 **Connection.** This chapter combines mapped types ([Chapter 22](/chapter/22)), conditional types and `infer` ([Chapter 23](/chapter/23), [Chapter 79](/chapter/79)), and template literal types ([Chapter 24](/chapter/24)). [Chapter 81](/chapter/81) takes template-literal parsing much further (route parameters and typed navigation). In React, [P13](/projects/p13) uses typed field paths for forms.
+
+> 🌍 **Real world.** React Hook Form's `Path<T>` and `PathValue<T, P>`, lodash's typed `get`, Redux Toolkit's `PayloadAction` maps, and type-fest's `PartialDeep` and `ReadonlyDeep` are all these techniques, with the edge cases already handled.
+
+## Exercises
+
+### Level 1 — Recall
+
+Write `DeepReadonly<T>` that handles plain objects, arrays, and tuples, and leaves functions and `Date` alone. Show with `@ts-expect-error` comments that you can't push to a nested array or assign to a nested property.
+
+### Level 2 — Application
+
+Write `KeysOfType<T, V>`, then use it to type a `sortBy(items, key)` that accepts only keys whose values are numbers. Show that the optional property `estimate?: number` is accepted, and that a string key is rejected.
+
+### Level 3 — Challenge
+
+Implement `Paths<T>` and `PathValue<T, P>` for nested objects, treating arrays and dates as leaves. Write at least six type-level tests (use an `Equal` helper), including optional properties and `null`. Then add a depth limit so your types survive a self-referential `Category` interface.
+
+*Hint: for `PathValue`, split with `${infer Head}.${infer Rest}` and remember `NonNullable` for optional links.*
+
+### Level 4 — Real-world
+
+**Ticket TF-355: Typed field names in the form kit.** The form kit from [P13](/projects/p13) accepts `name: string` for every field, so typos in `"address.stret"` are only caught in QA.
+
+- `register`, `getValue`, and `setValue` accept only paths into the form's value type, with autocomplete.
+- `getValue("address.geo.lat")` returns `number`, and `setValue` rejects a value of the wrong type.
+- Measure type-check time with `tsc --extendedDiagnostics` before and after, on the largest real form.
+- If the cost is too high, add a depth limit and document it in the kit's README.
+
+## Key takeaways
+
+- An `as` clause that evaluates to `never` **drops** a key, which makes it a filter. `KeysOfType<T, V>` filters by value type, and needs `-?` and `Required<T>` for optional properties.
+- Homomorphic mapped types **distribute** over unions of objects. `keyof` on a union gives only the shared keys.
+- Keying a mapped type by a union's discriminant (`as E["type"]`) derives handler tables that stay in sync with the union.
+- `DeepPartial` and friends must decide what to descend into. Leave dates, functions, maps, and class instances alone, and don't add `undefined` to array elements.
+- `Paths<T>` plus `PathValue<T, P>` give typed string paths with autocomplete, built from recursion, template literals, and `infer`.
+- Recursion needs an exit: arrays and dates as leaves, and a depth counter for self-referential data. Measure with `--extendedDiagnostics`.
+- When a deep type feels necessary, check whether flattening the data removes the need.
+
+## What comes next
+
+You've now used template literal types as ingredients, to build paths and to name handlers. [Chapter 81](/chapter/81) treats them as the main subject: parsing route strings, extracting parameters, and building typed APIs out of string formats.

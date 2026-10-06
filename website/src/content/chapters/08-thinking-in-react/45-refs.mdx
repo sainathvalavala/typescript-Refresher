@@ -1,0 +1,355 @@
+> 📖 **The problem.** You're adding a time tracker to TaskFlow: a stopwatch on each task with Start and Stop buttons. Start calls `setInterval`, and Stop needs that interval's ID to call `clearInterval`. You store the ID in a local variable, and Stop does nothing: by the time you click it, the component has re-rendered and the variable is gone. You move the ID into state, and now it works, but every Start triggers an extra render for a number nobody ever sees. Neither tool fits.
+
+React gives a component two kinds of memory. You know the first: **state**, which is for values that affect what's on screen, and changing it re-renders. This chapter is about the second: **refs**, for values the component needs to *keep* but that don't affect the output. Timer IDs, the previous value of a prop, a handle to a DOM element you want to focus: all of these need to survive re-renders, and none of them should cause one.
+
+By the end, you'll know when to reach for a ref instead of state, how to use refs to focus, scroll, and measure DOM elements, how to manage focus accessibly, which ref habits make components unpredictable, and how to pass a ref into your own components with React 19's `ref` prop.
+
+> 🧠 **Mental model.** A ref is a **mutable box that survives renders but doesn't trigger them**. React gives you the *same box* on every render. You can put anything in its `current` field, at any time, and React won't notice.
+
+## 45.1 Refs vs state
+
+Here's the stopwatch's first attempt, with the ID in a plain variable:
+
+```tsx
+function TaskTimer() {
+  const [elapsed, setElapsed] = useState(0);
+  let intervalId: number | undefined; // ❌ a fresh, empty variable on every render
+
+  function handleStart() {
+    intervalId = window.setInterval(() => setElapsed((s) => s + 1), 1000);
+  }
+  function handleStop() {
+    clearInterval(intervalId); // ❌ undefined: this render's variable, not Start's
+  }
+  return <TimerDisplay seconds={elapsed} onStart={handleStart} onStop={handleStop} />;
+}
+```
+
+Each render runs the function again and creates a new `intervalId`. The value written in `handleStart` belonged to an earlier render, which is gone. A ref fixes this because React keeps it in a hook slot ([Chapter 43](/chapter/43)), just like state, but changing it doesn't schedule a render:
+
+```tsx
+import { useRef, useState } from "react";
+
+function TaskTimer() {
+  const [elapsed, setElapsed] = useState(0);              // shown on screen: state
+  const intervalRef = useRef<number | null>(null);        // never shown: a ref
+
+  function handleStart() {
+    if (intervalRef.current !== null) return;             // already running
+    intervalRef.current = window.setInterval(() => setElapsed((s) => s + 1), 1000);
+  }
+  function handleStop() {
+    if (intervalRef.current !== null) clearInterval(intervalRef.current);
+    intervalRef.current = null;                           // no re-render: nothing visible changed
+  }
+  return <TimerDisplay seconds={elapsed} onStart={handleStart} onStop={handleStop} />;
+}
+```
+
+`useRef(initialValue)` returns an object shaped like `{ current: initialValue }`. In React 19 the initial value is **required**; pass `null` when there's nothing yet. One way to picture it: a ref is a piece of state whose setter you never call, so React never re-renders for it.
+
+| | State | Ref |
+|---|---|---|
+| Changing it re-renders? | Yes | No |
+| How you change it | Call the setter; the new value appears next render | Assign `ref.current` directly; it changes immediately |
+| Read it during render? | Yes, that's its purpose | No (see 45.5) |
+| Good for | Anything that affects the output | Timer IDs, DOM nodes, values used only in handlers and effects |
+
+The decision rule is one question: **does this value affect what's shown?** If yes, it's state. If no, and you still need it across renders, it's a ref.
+
+## 45.2 Storing values across renders
+
+Refs shine for "bookkeeping" values that event handlers and effects need. Three patterns cover most of them.
+
+**Timer IDs.** TaskFlow autosaves a task's description one second after the user stops typing. Each keystroke cancels the previous pending save, so the handler needs the last timer's ID:
+
+```tsx
+function DescriptionEditor({ task }: { task: Task }) {
+  const [text, setText] = useState(task.description);
+  const saveTimerRef = useRef<number | null>(null);
+
+  function handleChange(next: string) {
+    setText(next);
+    if (saveTimerRef.current !== null) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = window.setTimeout(() => saveDescription(task.id, next), 1000);
+  }
+
+  return <textarea value={text} onChange={(e) => handleChange(e.target.value)} />;
+}
+```
+
+**Previous values.** To react to a *transition* ("the task just became done"), an effect compares the current value with the one from last time, and remembers the new one for next time:
+
+```tsx
+const prevStatusRef = useRef(task.status);
+
+useEffect(() => {
+  if (prevStatusRef.current !== "done" && task.status === "done") {
+    playCompletionSound(); // only on the todo/doing → done transition
+  }
+  prevStatusRef.current = task.status; // remember for the next comparison
+}, [task.status]);
+```
+
+**Instance counters.** Some numbers matter to your code but not to the user, such as how many times someone retried a failed sync before giving up. Handlers update them; nothing renders them:
+
+```tsx
+const retriesRef = useRef(0);
+
+function handleRetry() {
+  retriesRef.current += 1;
+  if (retriesRef.current >= 3) reportSyncProblem(task.id, retriesRef.current);
+  else syncTask(task.id);
+}
+```
+
+Notice where every read and write happens: in an event handler or an effect, never in the component body that produces JSX.
+
+## 45.3 Referencing DOM elements
+
+Most of the time React manages the DOM for you. Occasionally you need the real element: to focus an input, scroll something into view, or measure its size. These are actions the browser offers as methods on DOM nodes, and there's no JSX prop for them. A ref is how you get the node.
+
+Create a ref with `null`, and pass it as the `ref` attribute of a JSX element. After React commits the element to the DOM, it sets `ref.current` to the node; when the element is removed, it sets it back to `null`.
+
+```tsx
+function QuickAdd() {
+  const inputRef = useRef<HTMLInputElement>(null); // inputRef: RefObject<HTMLInputElement | null>
+
+  return (
+    <>
+      <input ref={inputRef} placeholder="New task…" />
+      <button onClick={() => inputRef.current?.focus()}>Focus input</button>
+    </>
+  );
+}
+```
+
+The `?.` matters: TypeScript knows `current` can be `null` (before mounting, or after unmounting), and it makes you handle it. The same pattern covers scrolling and measuring. Scrolling runs in a handler; measuring needs the layout to exist, so it runs after commit, in an effect:
+
+```tsx
+function TaskColumn({ tasks }: { tasks: Task[] }) {
+  const todayRef = useRef<HTMLHeadingElement>(null);
+  const listRef = useRef<HTMLUListElement>(null);
+  const [isTall, setIsTall] = useState(false);
+
+  useEffect(() => {
+    const height = listRef.current?.getBoundingClientRect().height ?? 0;
+    setIsTall(height > 600); // e.g. show a "back to top" button for long columns
+  }, [tasks]);
+
+  return (
+    <section>
+      <button onClick={() => todayRef.current?.scrollIntoView({ behavior: "smooth" })}>
+        Jump to today
+      </button>
+      <ul ref={listRef}>{/* ...task items... */}</ul>
+      <h2 ref={todayRef}>Due today</h2>
+      {isTall && <BackToTop />}
+    </section>
+  );
+}
+```
+
+> 💡 **Tip.** Before reaching for a DOM ref, check whether there's a declarative option. Showing, hiding, styling, and disabling should all be props and state. Refs are for the imperative leftovers: focus, scroll, measure, media playback, and third-party widgets.
+
+## 45.4 Managing focus
+
+**Focus** decides where keyboard input goes and where a screen reader is "reading". When the UI changes, focus should go somewhere sensible, or keyboard users get lost. Refs are how React apps move focus on purpose. Three TaskFlow situations show the common patterns.
+
+**Return focus to an input after an action.** Clicking an "Add" button moves focus to the button. To let the user keep typing tasks, send focus back to the input:
+
+```tsx
+function handleAdd() {
+  addTask(title);
+  setTitle("");
+  inputRef.current?.focus(); // the input already exists, so focusing in the handler is fine
+}
+```
+
+**Focus an element that appears.** Clicking "Rename" swaps the title for an input, but that input doesn't exist until the next commit, so a ref to it is still `null` inside the click handler. For an element that should be focused when it first mounts, the simplest correct tool is `autoFocus`, which React applies on mount:
+
+```tsx
+{isRenaming ? (
+  <input autoFocus value={draft} onChange={(e) => setDraft(e.target.value)} />
+) : (
+  <button onClick={() => setIsRenaming(true)}>{task.title}</button>
+)}
+```
+
+**Don't drop focus when something disappears.** Delete a task and its focused Delete button vanishes; focus falls back to the page body, and a screen-reader user is suddenly at the top of the page. Move focus to something stable, such as the list's heading made focusable with `tabIndex={-1}`:
+
+```tsx
+const headingRef = useRef<HTMLHeadingElement>(null);
+
+function handleDelete(id: string) {
+  setTasks((prev) => prev.filter((t) => t.id !== id));
+  headingRef.current?.focus(); // the heading stays on screen, so it's safe to focus now
+}
+
+return <h2 ref={headingRef} tabIndex={-1}>Tasks</h2>;
+```
+
+> 🔗 **Connection.** These are the basics. Focus traps for dialogs, roving focus in menus, and announcing changes with live regions are covered in [Chapter 73](/chapter/73).
+
+## 45.5 Ref pitfalls
+
+Refs are an **escape hatch**: they step outside React's "UI = f(state)" model. Used in handlers and effects, they're safe. Used during render, they make components unpredictable. Four pitfalls cover almost every ref bug.
+
+**Reading a ref during render** gives you a value React doesn't track, so the screen goes stale. Here the count changes, but nothing re-renders to show it:
+
+```tsx
+function RetryButton() {
+  const clicksRef = useRef(0);
+  return (
+    <button onClick={() => { clicksRef.current += 1; }}>
+      Retried {clicksRef.current} times {/* ❌ stuck at 0: changing a ref doesn't re-render */}
+    </button>
+  );
+}
+// ✅ If it's shown, it's state: const [clicks, setClicks] = useState(0);
+```
+
+**Writing a ref during render** makes render impure. Strict Mode calls your component twice in development ([Chapter 37](/chapter/37)), so a "render counter" double-counts, and other React features may render without committing:
+
+```tsx
+function TaskRow({ task }: { task: Task }) {
+  const renders = useRef(0);
+  renders.current += 1; // ❌ side effect during render: the number is meaningless
+  return <li>{task.title}</li>;
+}
+```
+
+The one accepted exception is **lazy initialization**: creating an expensive object once, the first time it's needed. `useRef(new TaskIndex(tasks))` would build a new index on *every* render and throw it away; this builds it once:
+
+```tsx
+const indexRef = useRef<TaskIndex | null>(null);
+if (indexRef.current === null) {
+  indexRef.current = new TaskIndex(tasks); // ✅ runs once; same result every time
+}
+```
+
+**Forgetting that DOM refs start empty.** `current` is `null` during the first render and after unmount. Always use `?.` or a null check, and only touch DOM refs in handlers and effects.
+
+**Using `ref.current` as a dependency.** `useEffect(..., [inputRef.current])` doesn't re-run when the ref changes, because changing a ref doesn't cause a render that would compare dependencies. If the effect needs to respond to a change, that value should be state.
+
+> ⚠️ **Common mistake.** Calling `useRef()` with no argument. React 19's types require an initial value: `useRef()` gives `❌ Expected 1 arguments, but got 0.` Pass `null` (or `undefined`) explicitly.
+
+## 45.6 Refs as props
+
+Often the element you want to focus lives inside one of *your* components. TaskFlow's form uses a reusable `TextField`, and the form wants to focus its input after adding a task. In React 19, function components can accept `ref` as a regular prop and pass it down to the DOM element they render:
+
+```tsx
+import type { Ref } from "react";
+
+type TextFieldProps = {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  ref?: Ref<HTMLInputElement>; // typed properly in Chapter 53
+};
+
+function TextField({ label, value, onChange, ref }: TextFieldProps) {
+  return (
+    <label>
+      {label}
+      <input ref={ref} value={value} onChange={(e) => onChange(e.target.value)} />
+    </label>
+  );
+}
+```
+
+The parent uses it exactly like a built-in element:
+
+```tsx
+function NewTaskForm({ onAdd }: { onAdd: (title: string) => void }) {
+  const [title, setTitle] = useState("");
+  const titleRef = useRef<HTMLInputElement>(null);
+
+  function handleSubmit(e: React.SubmitEvent<HTMLFormElement>) {
+    e.preventDefault();
+    onAdd(title);
+    setTitle("");
+    titleRef.current?.focus();
+  }
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <TextField ref={titleRef} label="Title" value={title} onChange={setTitle} />
+      <button type="submit">Add task</button>
+    </form>
+  );
+}
+```
+
+Exposing the ref is a deliberate API choice: the parent can now do *anything* to that input. For reusable inputs and buttons, that's expected. For bigger components, prefer props (`autoFocus`, `onSubmitted`) over handing out DOM nodes.
+
+> 🕰 **Legacy note.** Before React 19, a function component couldn't receive `ref` as a prop; you had to wrap it in `forwardRef((props, ref) => ...)`. You'll still see `forwardRef` in older code and libraries. It works, but new code doesn't need it.
+
+> 🆕 **Modern note.** A ref can also be a function, called with the node when it mounts. In React 19, that **ref callback** may return a cleanup function, which runs when the node is removed: `ref={(node) => { observer.observe(node); return () => observer.unobserve(node); }}`.
+
+## Common mistakes
+
+> ⚠️ **Storing displayed data in a ref.** If the value appears in JSX, changing a ref won't update the screen. Use state.
+
+> ⚠️ **Reading or writing refs during render.** It makes the output depend on something React doesn't track. Keep ref reads and writes in event handlers and effects (lazy initialization is the one exception).
+
+> ⚠️ **Using a ref to dodge the dependency linter.** Stashing a value in a ref so an effect "doesn't need" it usually recreates the stale-value bug the linter was warning about. Reach for `useEffectEvent` ([Chapter 44](/chapter/44)) instead.
+
+> ⚠️ **Mutating DOM that React owns.** Focusing, scrolling, and measuring are fine. Removing children or changing text content with a ref fights React's own updates and causes crashes.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** you need to keep a value across renders that doesn't affect the output (timer IDs, previous values for comparison, retry counts), or when you need an imperative DOM action (focus, scroll, measure, play media, or integrate a non-React widget).
+
+> 🚫 **When not to.** If it's shown on screen, it's state. If a declarative prop can do it (`disabled`, `hidden`, `autoFocus`, a `className`), prefer the prop. Don't use refs to "optimize away" re-renders of values that should cause them.
+
+## How it connects
+
+> 🔗 **Connection.** Refs live in hook slots like state ([Chapter 43](/chapter/43)), and are read and written mostly in effects ([Chapter 44](/chapter/44)) and event handlers ([Chapter 41](/chapter/41)). [Chapter 48](/chapter/48) uses refs inside custom hooks. [Chapter 53](/chapter/53) types refs precisely, including `Ref`, `RefObject`, and ref callbacks, and [Chapter 73](/chapter/73) builds full focus management.
+
+> 🌍 **Real world.** Component libraries forward refs on almost every primitive (inputs, buttons, dialogs) because forms, tooltips, and focus managers need DOM nodes. Positioning libraries such as Floating UI are built on measuring refs.
+
+## Exercises
+
+### Level 1 — Recall
+
+For each value, choose **state** or **ref** and give a one-line reason:
+
+1. The text in the "new task" input.
+2. The ID of a `setTimeout` that hides a toast.
+3. The DOM node of a search box you want to focus with the "/" key.
+4. Whether the task's details panel is expanded.
+5. The `status` value from the previous render, compared inside an effect.
+6. The number of tasks completed today, shown in the header.
+
+### Level 2 — Application
+
+In TaskFlow's new-task form, keep focus in the title input after a task is added, whether the user pressed Enter or clicked the **Add** button. Use a ref passed through your `TextField` component as a regular `ref` prop (no `forwardRef`). Confirm with the keyboard alone that you can add five tasks in a row without touching the mouse.
+
+### Level 3 — Challenge
+
+Build `usePrevious(value)`, which returns the value from the previous render, using a ref and an effect. Then explain its timing precisely: on the render where `value` changes, what does it return, and when does the ref update? Finally, compare it with the alternative of storing the previous value in state and updating it during render when it differs, and explain which one the React docs recommend and why the ref version reads a ref during render.
+
+*Hint: write down the order of "render", "commit", and "effect" for two consecutive renders.*
+
+### Level 4 — Real-world
+
+**Ticket TF-327: Task time tracking.** Add a stopwatch to the task details panel.
+
+- Start, Stop, Lap, and Reset buttons; laps are listed with their split times.
+- Only displayed values live in state; the interval ID and start timestamp live in refs, and the component re-renders only when the visible time or the lap list changes.
+- The interval is cleared on Stop, on Reset, and when the panel unmounts (verify with Strict Mode on).
+- Time is computed from `Date.now()` differences, not by counting ticks, so it stays accurate if the tab is throttled.
+
+## Key takeaways
+
+- A ref is a mutable box (`{ current }`) that React keeps across renders. Changing it never re-renders.
+- Ask "does this affect what's shown?" Yes means state; no (but must persist) means ref.
+- DOM refs give you the real element for focus, scroll, and measurement. `current` is `null` until commit, so use `?.`.
+- Move focus deliberately after actions that add, reveal, or remove focused elements.
+- Don't read or write refs during render, except for lazy initialization.
+- In React 19, `ref` is a regular prop on function components; `forwardRef` is legacy.
+
+## What comes next
+
+So far, data reaches a component one way: through props, from its parent. When a value such as the theme or the signed-in user is needed six levels down, that means threading it through every component in between. [Chapter 46: useContext: Sharing Data Through the Tree](/chapter/46) offers a way to broadcast it instead, and explains why you shouldn't broadcast everything.

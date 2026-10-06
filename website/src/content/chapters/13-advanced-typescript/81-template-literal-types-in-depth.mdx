@@ -1,0 +1,314 @@
+> 📖 **The problem.** TaskFlow Web has a `navigate` helper, and everyone calls it with hand-built strings: `navigate("/projects/" + projectId + "/tasks/" + taskId)`. Last sprint someone refactored the route from `/projects/:projectId/tasks/:taskId` to `/p/:projectId/t/:taskId`, and nine call sites kept building the old URL. They all compiled. What you want is `navigate("/projects/:projectId/tasks/:taskId", { projectId })` to fail at compile time because `taskId` is missing.
+
+Strings look unstructured to TypeScript, but your app treats many of them as structured data: routes, event names, CSS values, translation keys. In [Chapter 24](/chapter/24) you met template literal types as a way to build string unions. Here we go deeper: composing them, then *parsing* them with `infer`, so the compiler can read the structure inside a string. By the end you'll be able to extract route parameters, type event names with wildcards, type design tokens, and, just as important, tell when this machinery has stopped paying for itself.
+
+> 🧠 **Mental model.** Template literal types plus `infer` turn string formats into structured types: **the type checker can parse the strings your app relies on.** Composition builds strings from parts; `infer` takes them apart again.
+
+## 81.1 Review and composition
+
+A template literal type uses the same backtick syntax as a JavaScript template string, but in a type position. When a placeholder is a **union**, TypeScript produces every combination (a cross product):
+
+```ts
+type Entity = "task" | "project" | "user";
+type Action = "created" | "updated" | "deleted" | "archived";
+
+type EventName = `${Entity}:${Action}`; // 3 × 4 = 12 members
+const ok: EventName = "task:created";            // ✅
+const typo: EventName = "task:deleted2";         // ❌ Type '"task:deleted2"' is not assignable to type '"project:archived" | … | "user:updated"'. Did you mean '"task:deleted"'?
+const wrong: EventName = "tsk:created";          // ❌ Type '"tsk:created"' is not assignable to type '"project:archived" | … | "user:updated"'. Did you mean '"task:created"'?
+```
+
+You never typed the twelve strings. Add a fourth entity and you get four more automatically.
+
+Four **intrinsic string types** transform a string type: `Uppercase`, `Lowercase`, `Capitalize`, and `Uncapitalize`. They are built into the compiler and exist mainly to be used inside templates:
+
+```ts
+type Field = "title" | "status";
+type Setter = `set${Capitalize<Field>}`; // "setTitle" | "setStatus"
+type Header = Uppercase<"todo" | "doing">; // "TODO" | "DOING"
+
+const s: Setter = "setTitle"; // ✅
+const h: Header = "todo";     // ❌ Type '"todo"' is not assignable to type '"DOING" | "TODO"'. Did you mean '"TODO"'?
+```
+
+A placeholder doesn't have to be a literal. `${string}`, `${number}` and `${boolean}` describe *families* of strings, which we use heavily later in this chapter.
+
+> ⚠️ **Common mistake.** Cross products multiply. Three unions of ten members each make 1,000 strings. We'll hit the ceiling in section 81.6.
+
+## 81.2 Parsing strings with infer
+
+> ⏭ **Safe to skip.** This section is the engine behind the rest of the chapter, and the later sections will make sense if you only read the two tiny examples. Skip the recursive ones on a first read.
+
+Composition goes from parts to a string. `infer` goes the other way. In a conditional type, a template pattern with `infer` placeholders asks: "does this string match this shape, and if so, what were the pieces?"
+
+```ts
+type DomainOf<E extends string> = E extends `${string}@${infer Domain}` ? Domain : never;
+
+type D = DomainOf<"ana@taskflow.dev">; // "taskflow.dev"
+type N = DomainOf<"not-an-email">;     // never
+```
+
+Each `infer X` placeholder captures the shortest match up to the next literal text, except the last, which takes the rest. With recursion we can **trim**, **split**, and **replace**, all at the type level:
+
+```ts
+type Trim<S extends string> =
+  S extends ` ${infer R}` | `${infer R} ` ? Trim<R> : S;
+
+type Split<S extends string, D extends string> =
+  S extends `${infer Head}${D}${infer Rest}`
+    ? [Head, ...Split<Rest, D>]
+    : S extends "" ? [] : [S];
+
+type ReplaceAll<S extends string, From extends string, To extends string> =
+  S extends `${infer A}${From}${infer B}` ? `${A}${To}${ReplaceAll<B, From, To>}` : S;
+
+type T1 = Trim<"  hi  ">;                     // "hi"
+type T2 = Split<"a/b/c", "/">;                // ["a", "b", "c"]
+type T3 = ReplaceAll<"due_date_utc", "_", "-">; // "due-date-utc"
+```
+
+The pattern is always the same: *match one piece off the front, then recurse on the rest*. If the pattern doesn't match, the conditional falls through to the base case.
+
+## 81.3 Typed routes
+
+Now the opening problem. A route pattern like `/projects/:projectId/tasks/:taskId` has structure: literal segments and `:name` parameters. We want a type that extracts the parameter names, and a function that demands exactly those parameters.
+
+```ts
+type ExtractParams<R extends string> =
+  R extends `${string}:${infer P}/${infer Rest}` ? P | ExtractParams<`/${Rest}`>
+  : R extends `${string}:${infer P}` ? P
+  : never;
+
+type RouteParams<R extends string> = { [K in ExtractParams<R>]: string };
+
+type A = ExtractParams<"/users/:id/posts/:postId">; // "id" | "postId"
+type B = RouteParams<"/users/:id/posts/:postId">;   // { id: string; postId: string }
+type C = RouteParams<"/tasks">;                     // {}
+```
+
+The first branch finds a `:` followed later by a `/`: the captured `P` is the name, and we recurse on what remains (putting the slash back so the pattern can match again). The second branch handles a final parameter with no slash after it.
+
+Now `href`. A route with no parameters should take no second argument, and a route with parameters should require them. A conditional **rest-tuple** does that:
+
+```ts
+const routes = [
+  "/tasks",
+  "/projects/:projectId",
+  "/projects/:projectId/tasks/:taskId",
+] as const;
+type Route = (typeof routes)[number];
+
+type Args<R extends Route> = [ExtractParams<R>] extends [never]
+  ? []
+  : [params: RouteParams<R>];
+
+function href<R extends Route>(route: R, ...args: Args<R>): string {
+  const params = (args[0] ?? {}) as Record<string, string>;
+  return route.replace(/:(\w+)/g, (_, key: string) => encodeURIComponent(params[key] ?? ""));
+}
+
+href("/tasks");                                              // ✅
+href("/projects/:projectId", { projectId: "p1" });           // ✅
+href("/projects/:projectId/tasks/:taskId", { projectId: "p1" }); // ❌ Property 'taskId' is missing in type '{ projectId: string; }' but required in type 'RouteParams<"/projects/:projectId/tasks/:taskId">'.
+href("/projects/:projectId", { projectId: "p1", extra: 1 }); // ❌ Object literal may only specify known properties, and 'extra' does not exist in type 'RouteParams<"/projects/:projectId">'.
+href("/projects/:projectId");                                // ❌ Expected 2 arguments, but got 1.
+href("/tasks", { a: "1" });                                  // ❌ Expected 1 arguments, but got 2.
+```
+
+The `[X] extends [never]` wrapper stops the conditional from distributing over `never` ([Chapter 79](/chapter/79) covers why). The one `as` cast inside is the usual deal: the implementation can't be checked against a computed type, but every *call site* can.
+
+> 💡 **Tip.** The error message for a bad *route string*, such as `href("/nope")`, is weaker: TypeScript can't pick `R`, falls back to the whole union, and reports an argument-count error instead of "unknown route". Check the messages your teammates will actually see (this is Level 4 below).
+
+## 81.4 Typed event and message names
+
+This is the event emitter from [P05](/projects/p05), revisited. Event names follow a `namespace:action` convention, so we can type a **wildcard subscription** that receives the union of every payload in that namespace.
+
+```ts
+type Events = {
+  "task:created": { task: Task };
+  "task:deleted": { id: string };
+  "user:invited": { user: User };
+};
+
+type NamespaceOf<K> = K extends `${infer N}:${string}` ? N : never;
+type Pattern = keyof Events | `${NamespaceOf<keyof Events>}:*`;
+// "task:created" | "task:deleted" | "user:invited" | "task:*" | "user:*"
+
+type Payload<P extends Pattern> = P extends keyof Events
+  ? Events[P]
+  : P extends `${infer N}:*`
+    ? Events[Extract<keyof Events, `${N}:${string}`>]
+    : never;
+
+declare function on<P extends Pattern>(pattern: P, handler: (payload: Payload<P>) => void): void;
+
+on("task:created", (p) => p.task.title); // p: { task: Task }
+on("task:*", (p) => p);                  // p: { task: Task } | { id: string }
+on("user:*", (p) => p.user.name);        // p: { user: User }
+on("task:*", (p) => p.task);             // ❌ Property 'task' does not exist on type '{ task: Task; } | { id: string; }'.
+on("order:*", () => {});                 // ❌ Argument of type '"order:*"' is not assignable to parameter of type 'Pattern'.
+```
+
+Two things to notice. `NamespaceOf` is *distributive* (it maps over each key), so it yields `"task" | "user"`. And the wildcard handler honestly receives a **union**, so the compiler makes you narrow before using `p.task`. That's the correct behavior, not a limitation.
+
+> 🔗 **Connection.** The same trick types analytics events (`"checkout:started"`), WebSocket message tags, and feature-flag keys. If you already have a payload map, let the *map's keys* drive everything.
+
+## 81.5 CSS and design-token strings
+
+Families of strings are where `${number}` and `${string}` shine. Say a theme accepts lengths only in pixels, or hex colors only:
+
+```ts
+type Px = `${number}px`;
+type Hex = `#${string}`;
+
+const w: Px = "12px";    // ✅
+const f: Px = "1.5px";   // ✅
+const bad1: Px = "12em"; // ❌ Type '"12em"' is not assignable to type '`${number}px`'.
+const bad2: Px = "px";   // ❌ Type '"px"' is not assignable to type '`${number}px`'.
+const c: Hex = "#fff";   // ✅
+const bad3: Hex = "fff"; // ❌ Type '"fff"' is not assignable to type '`#${string}`'.
+```
+
+`Hex` only checks the prefix. `"#hello"` passes, because `${string}` matches anything. Template literal types validate *shape*, not *meaning*.
+
+Combine a literal scale with a template for utility-class-style names, and use a recursive type to turn a nested token object into dotted **token paths**:
+
+```ts
+type Spacing = 0 | 4 | 8 | 16;
+type Pad = `p-${Spacing}`; // "p-0" | "p-4" | "p-8" | "p-16"
+
+const tokens = {
+  color: { brand: { 500: "#4f46e5", 600: "#4338ca" }, text: "#111827" },
+  space: { sm: "4px" },
+} as const;
+
+type Paths<T> = {
+  [K in keyof T & (string | number)]: T[K] extends string ? `${K}` : `${K}.${Paths<T[K]>}`;
+}[keyof T & (string | number)];
+
+type TokenPath = Paths<typeof tokens>;
+// "color.brand.500" | "color.brand.600" | "color.text" | "space.sm"
+
+declare function token(path: TokenPath): string;
+token("color.brand.500"); // ✅
+token("color.brand");     // ❌ Argument of type '"color.brand"' is not assignable to parameter of type 'TokenPath'.
+```
+
+Because `Paths` is derived from `typeof tokens`, renaming a token in the object updates every call site's autocomplete. (We built a fuller `Paths` in [Chapter 80](/chapter/80).)
+
+## 81.6 Limits
+
+> ⏭ **Safe to skip.** This is about where the compiler pushes back. Read it once so the error messages aren't a surprise, then move on.
+
+Template literal types have three practical limits.
+
+**1. Union size.** The cross product is computed eagerly. TypeScript refuses to build a union larger than about 100,000 members:
+
+```ts
+type Digit = "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9";
+type Big = `${Digit}${Digit}${Digit}${Digit}${Digit}${Digit}`; // 1,000,000 strings
+
+const b: Big = "000000"; // ❌ Expression produces a union type that is too complex to represent.
+```
+
+**2. Recursion depth.** Recursive types that are written in a *tail-recursive* shape (the recursive call is the whole result) can go roughly 1,000 levels deep. Otherwise the limit is far lower (around 50 to 100 levels), and exceeding it fails:
+
+```ts
+type Rep<S extends string, N extends number, A extends string[] = []> =
+  A["length"] extends N ? A : Rep<S, N, [...A, S]>; // tail position: OK up to ~1000
+
+type Ok = Rep<"a", 900>;
+type TooDeep = Rep<"a", 2000>; // ❌ Type instantiation is excessively deep and possibly infinite.
+```
+
+**3. Error readability.** When a deeply computed type fails, the message prints the *computed* shape or the alias, not your intent. `Argument of type '"order:*"' is not assignable to parameter of type 'Pattern'` is fine. A failure inside a five-level recursive type often isn't.
+
+Also remember that every type-level parse runs in the compiler on every keystroke in the editor. A route table of 40 entries is nothing; a recursive parser applied to a thousand-member union is felt.
+
+> 🔗 **Connection.** [Chapter 95](/chapter/95) shows how to measure where the compiler spends its time, so you can find out whether a clever type is the culprit.
+
+## 81.7 When to stop
+
+Template literal types are most valuable when the string format **already exists** and you can't change it: URLs, event names from a protocol, CSS values. They're least valuable when you can restructure the data so no parsing is needed.
+
+Compare two designs for routes:
+
+```ts
+// Parsing a string at the type level:
+href("/projects/:projectId/tasks/:taskId", { projectId, taskId });
+
+// A plain object map. No parsing, trivially simple types:
+const paths = {
+  tasks: () => "/tasks",
+  project: (p: { projectId: string }) => `/projects/${p.projectId}`,
+  task: (p: { projectId: string; taskId: string }) => `/projects/${p.projectId}/tasks/${p.taskId}`,
+} as const;
+
+paths.task({ projectId, taskId }); // ✅ every route is just a typed function
+```
+
+The map has better error messages, instant "go to definition", and zero compile-time cost. The string version wins only when the pattern string is *also* the thing your router consumes, so you don't want to say it twice.
+
+> 🚫 **When not to.** If a **code generator** can produce the types from the real source (an OpenAPI spec, a router config, a translations file), generate them. The output is plain types, so the compiler never parses anything and a teammate can read the result. Reach for template parsing when the source of truth is a string literal in your own code and a generator would be heavier than the problem.
+
+A good rule: if you find yourself writing a template-literal type longer than about ten lines, or one that someone will need a diagram to understand, stop and ask whether a map, a generator, or a runtime check at the boundary is simpler.
+
+## Common mistakes
+
+> ⚠️ **Expecting validation of meaning.** `` `#${string}` `` accepts `"#hello"`, and `` `${number}px` `` accepts `"1e3px"`. These types check shape, not content. Validate at runtime where it matters.
+
+> ⚠️ **Forgetting `as const`.** A route table declared without it widens to `string[]`, and every parsed type collapses to `string`. Derive `Route` from an `as const` tuple or object.
+
+> ⚠️ **Cross products that sneak up.** Three templated unions multiplied together can explode. Count the members before you ship a type like `` `${A}-${B}-${C}` ``.
+
+> ⚠️ **Forgetting the empty tuple/`never` case.** `ExtractParams` of a route with no params is `never`, and a naive `keyof`-based conditional will distribute over it. Wrap in `[X] extends [never]`.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** the string format is a real contract used in many places (routes, event names, token paths, CSS lengths), and a typo would otherwise show up only at runtime.
+
+> 🚫 **When not to.** The format is used once or twice, a plain object map would do, a generator could emit the types, or the parsing would make error messages unreadable. Prefer boring and obvious.
+
+## How it connects
+
+> 🔗 **Connection.** This builds on [Chapter 24](/chapter/24) (template literals), [Chapter 23](/chapter/23) and [Chapter 79](/chapter/79) (`infer` and distribution), and [Chapter 80](/chapter/80) (recursive types). Typed routing in an app is in [Chapter 59](/chapter/59). Next, [Chapter 82](/chapter/82) is about designing generic APIs so that inference produces these types without callers writing any type arguments.
+
+> 🌍 **Real world.** TanStack Router and Hono infer path params from route strings with exactly this kind of recursive template type. i18n libraries derive translation-key unions from nested message objects. Both pay for it in compile time and in hard-to-read errors.
+
+## Exercises
+
+### Level 1 — Recall
+
+Write ``type EventName = `${Entity}:${Action}` `` for three entities and four actions of your own. Then write down how many members the union has, and check by hovering.
+
+### Level 2 — Application
+
+Write `RouteParams<"/users/:id/posts/:postId">` so it produces `{ id: string; postId: string }`. Test it against `"/tasks"` (no params) and `"/a/:x"` (one param) using assignments that should and should not compile.
+
+### Level 3 — Challenge
+
+Build a typed `href(route, params)` helper that rejects both **missing** and **extra** params, and takes no second argument for parameterless routes.
+
+*Hint: a conditional type on the rest arguments, `...args: Args<R>`.*
+
+### Level 4 — Real-world
+
+**Ticket TF-481: Template-literal route types.** Replace TaskFlow Web's route helper from [Chapter 59](/chapter/59) with template-literal-powered types.
+
+- Route patterns are declared once, in one `as const` table, and `href` and `navigate` both derive from it.
+- Missing and extra params are compile errors, and parameterless routes take no params argument.
+- Write down the error message you get for a missing param, an extra param, and an unknown route, then compare each with the old helper's messages. Which are better, and which are worse?
+- Measure type-check time before and after (`tsc --extendedDiagnostics`) and report the difference.
+
+## Key takeaways
+
+- Unions inside template literal types multiply into cross products, and the four intrinsic types (`Uppercase`, `Lowercase`, `Capitalize`, `Uncapitalize`) reshape the pieces.
+- `infer` inside a template pattern **parses** strings: match one piece, recurse on the rest.
+- `RouteParams` plus a conditional rest tuple gives you an `href` that rejects missing and extra parameters.
+- `` `${number}px` `` and `` `#${string}` `` describe string families, but they check shape, not meaning.
+- Limits are real: union size (about 100,000), recursion depth, and poor error messages.
+- If a generator or a plain object map solves it, prefer that.
+
+## What comes next
+
+Parsing a route string works because we designed `href`'s signature around the call site. That skill, designing the *call site first* and letting inference do the rest, is a discipline of its own. [Chapter 82: Advanced Generic Patterns & API Type Design](/chapter/82) is about `const` type parameters, `NoInfer`, builders, and a typed query DSL.

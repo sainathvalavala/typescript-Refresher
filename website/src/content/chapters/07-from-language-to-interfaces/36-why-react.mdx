@@ -1,0 +1,382 @@
+> 📖 **The problem.** Open your pain log from [Chapter 35](/chapter/35). Read the entries aloud. *"Counter wrong after delete."* *"Empty state shown with 2 items."* *"Filter tab not highlighted after reload."* You didn't write bad code: you wrote careful, type-checked code, and every one of those bugs still got through. Each fix was a one-liner, and each took twenty minutes to *find*. Now imagine the app has thirty features and four developers.
+
+This is a story chapter, and you're the main character. It doesn't teach new syntax. It takes the pain you just felt and traces it to a single root cause, then shows the idea (older than React, but made practical by it) that removes that cause. By the end you'll be able to explain, from your own experience and not from a slogan, what problem React solves, what it costs, and when it isn't the right tool.
+
+> 🧠 **Mental model.** *UI = f(state).* Stop writing instructions for **changing** the screen. Write a description of what the screen **should be** for any given state, and let React work out the changes.
+
+## 36.1 Traditional DOM manipulation
+
+Here is the style you used in P09, boiled down to the one feature that started it all: a task list with a counter. Each time something happens, you find the affected elements and **patch them**, step by step:
+
+```ts
+function addTask(title: string) {
+  tasks.push({ id: crypto.randomUUID(), title, done: false });
+
+  const li = document.createElement("li");   // 1. create the node
+  li.textContent = title;
+  list.appendChild(li);                       // 2. insert it in the right place
+  counter.textContent = `${remaining()} left`; // 3. update the counter
+  emptyState.hidden = true;                    // 4. hide the empty message
+  saveToStorage();                             // 5. persist
+}
+```
+
+This style is called **imperative**: the code is a sequence of *instructions* for transforming the screen from how it looks now to how it should look next. The programmer is the choreographer. The browser has no idea what the list "means" and only does what it's told.
+
+It works well when the page is small, and it's very direct: no framework, no magic, you control every step. But look at what the function *must know*: which elements exist, which facts they display, and what the screen currently looks like. The function isn't really "adding a task". It's updating **five different views of one fact**.
+
+```ts
+function removeTask(id: string) {
+  tasks = tasks.filter((t) => t.id !== id);
+  list.querySelector(`[data-id="${id}"]`)?.remove(); // remove the node
+  counter.textContent = `${remaining()} left`;       // recompute the counter
+  emptyState.hidden = tasks.length > 0;              // …and the empty state
+  saveToStorage();                                   // …and persist
+  // 💥 forgot to update the "clear completed" button's visibility
+}
+```
+
+Every operation on the data must remember the full list of places that display it. Forget one, and you have a bug that no compiler can see.
+
+## 36.2 When UIs get complex
+
+Count the pieces. A modest task app has a handful of independent facts that change over time (the **state**): the list of tasks, which filter is active, whether the user is editing a title, the text in the new-task box. And it has a handful of **places that display** those facts: the list, the counter, the empty message, the filter tabs, the "clear completed" button, the page title.
+
+Every fact affects several displays, and every display depends on several facts. Draw it:
+
+```text
+ facts (state)               displays (DOM)
+ ─────────────               ──────────────
+ tasks         ──────────▶   list items
+ tasks         ──────────▶   "N left" counter
+ tasks         ──────────▶   empty-state message
+ tasks         ──────────▶   "clear completed" button
+ filter        ──────────▶   list items (which to show)
+ filter        ──────────▶   tab highlight
+ filter        ──────────▶   empty-state message ("no completed tasks" vs "no tasks")
+ editingId     ──────────▶   one list item (input instead of text)
+```
+
+With `n` pieces of state and `m` displays, the number of update paths you must keep consistent can grow as **n × m**. Add feature number thirty-one and you don't add *one* thing: you add the new display, and then you go back and teach every existing mutation about it. The work grows with the *product* of the two, so complexity compounds faster than the app does.
+
+```ts
+// Each new display means touching every handler that changes any fact it shows:
+addTask(…);      // + new "overdue" badge
+toggleTask(…);   // + new "overdue" badge
+removeTask(…);   // + new "overdue" badge
+editTask(…);     // + new "overdue" badge
+clearDone(…);    // + new "overdue" badge
+setFilter(…);    // + (no, this one doesn't affect overdue, but did you check?)
+```
+
+> 🔗 **Connection.** This is the same pressure that motivated types in [Chapter 2](/chapter/2): not that any one change is hard, but that nobody can hold all the connections in their head.
+
+## 36.3 What UI state is
+
+Before fixing the problem, name the thing. **State** is *data that changes over time and affects what's shown.* That sentence has three parts, and each filters out something:
+
+- **Data**: a value, such as a list of tasks or the string `"done"`.
+- **Changes over time**: a constant like the maximum title length isn't state.
+- **Affects what's shown**: a timer ID you only need to cancel later isn't UI state.
+
+```ts
+const MAX_TITLE = 120;                       // not state: never changes
+let tasks: Task[] = [];                      // state: changes, drives the list
+let filter: "all" | "active" | "done" = "all"; // state: changes, drives the list and the tabs
+let draft = "";                              // state: changes as the user types
+const remainingCount = tasks.filter(t => !t.done).length; // NOT state: computable from tasks
+```
+
+The last line deserves attention, and it's the key to the rest of the chapter. `remainingCount` is a **fact derived from other facts**. It isn't independent, it can always be recomputed, and storing it separately creates a second copy that can disagree with the first. State that duplicates other state is exactly what the pain log is full of.
+
+```ts
+// Two copies of the same truth: the array and the counter's text.
+tasks.length;                // 2   (the data)
+counter.textContent;         // "3 left"  (what the DOM *remembers*: stale!)
+```
+
+In fact, the DOM itself is the worst offender: it's a second place where your data lives, and it quietly retains whatever you last told it.
+
+## 36.4 Synchronizing state with the DOM
+
+Now we can say precisely what the pain log was recording. **Keeping the DOM in step with your data is synchronization, and it fails in three characteristic ways.**
+
+**Duplicated truth.** The data says one thing and the screen says another, because the screen is a second copy that you update by hand:
+
+```ts
+tasks = tasks.filter((t) => t.id !== id);   // data: now 2 tasks
+// forgot: counter.textContent = …           // screen: still says "3 left"
+```
+
+**Stale displays.** The screen shows the *old* state because an update never ran, usually when a feature takes a path you hadn't considered (undo, reload, editing while filtered):
+
+```ts
+// Toggle a task while the "done" filter is active. The toggle code updates the checkbox,
+// but nothing re-applies the filter, so the task you just un-did stays visible. 
+li.classList.toggle("done");
+```
+
+**Ordering bugs.** Updates that depend on each other must run in the right order, and nothing enforces it:
+
+```ts
+counter.textContent = `${remaining()} left`; // reads the data...
+tasks.push(newTask);                              // ...but the data changes one line later: off by one
+// Swap two lines, and the counter is wrong only after an add, only sometimes.
+```
+
+What these have in common: they're all **bugs of omission and order**, caused by the same design decision. The programmer is responsible for turning *every change in the data* into the *right sequence of edits* on the screen. The compiler can check each edit is well-typed. It can't check you made all of them.
+
+> ⚠️ **Common mistake.** Blaming each bug individually ("I forgot the counter"). Fix the next one, and the one after, and you'll never run out. The pain log has *one* underlying cause, not twelve.
+
+You might think discipline fixes it: a single `updateEverything()` function called after every change. That's an excellent instinct, and it's the first step toward the idea in the next section. Hold that thought.
+
+## 36.5 Declarative UI
+
+There are two ways to tell someone how to get a room painted. **Imperative**: "Go to the store, buy two gallons of blue, tape the edges, apply the first coat, wait four hours, apply the second." **Declarative**: "I want the room blue." The first is a procedure, and the second is an outcome. When the room is already half painted, the first set of instructions is wrong; the second still works.
+
+The spreadsheet is the best programming example. In cell `C1` you type `=A1 + B1`. You never write "when `A1` changes, find `C1` and update it". You describe the *relationship*, and the spreadsheet keeps it true no matter what you change.
+
+```text
+        A      B      C
+  1     3      4      =A1+B1   →  7
+  
+  Change A1 to 10 → C1 becomes 14.  You wrote no update code.
+```
+
+Apply that to UI. A **declarative** UI is a function from state to screen: you describe, for *any* state, exactly what the page looks like. Revisit the P09 render step, but write it as a function with no knowledge of "what's currently on screen":
+
+```tsx
+function TaskApp({ tasks, filter }: { tasks: Task[]; filter: Filter }) {
+  const visible = tasks.filter((t) => filter === "all" || (filter === "done") === t.done);
+  const remaining = tasks.filter((t) => !t.done).length;
+
+  return (
+    <main>
+      {visible.length === 0 ? <p>Nothing here.</p> : (
+        <ul>{visible.map((t) => <li key={t.id}>{t.title}</li>)}</ul>
+      )}
+      <p>{remaining} left</p>
+      <FilterTabs active={filter} />
+    </main>
+  );
+}
+```
+
+Read it top to bottom: it never says "remove the empty message" or "update the counter". It says *what the screen is*. The empty state, the list, the counter, and the highlighted tab are all computed from `tasks` and `filter`, **in one place**. There's no second copy to go stale.
+
+Compare the two approaches side by side:
+
+```ts
+// Imperative: describe the CHANGE
+function onDelete(id: string) {
+  tasks = tasks.filter((t) => t.id !== id);
+  item(id)?.remove();
+  counter.textContent = `${remaining()} left`;
+  emptyState.hidden = tasks.length > 0;
+}
+
+// Declarative: describe the RESULT. Deleting is just a data change.
+function onDelete(id: string) {
+  setTasks(tasks.filter((t) => t.id !== id)); // …and the screen follows from the description
+}
+```
+
+## 36.6 Component-based thinking
+
+Once the UI is a function, a second idea follows naturally: functions can call functions. Break a big screen into smaller pieces, each responsible for one part of the display, and compose them. These pieces are **components**.
+
+```tsx
+function App({ tasks, filter }: AppProps) {
+  return (
+    <>
+      <Header remaining={countRemaining(tasks)} />
+      <FilterTabs active={filter} />
+      <TaskList tasks={visibleTasks(tasks, filter)} />
+    </>
+  );
+}
+```
+
+Components bring three practical benefits, each of which you've already met under other names. **Decomposition**: a screen too big to hold in your head becomes a tree of pieces that each fit. **Encapsulation**: `FilterTabs` owns its own markup and styling, so changing the highlight colour can't break `TaskList`. **Reuse**: one `TaskRow` serves every list, and fixing a bug there fixes it everywhere.
+
+Mapping it to the book's story, it's functions and modules again ([Chapter 11](/chapter/11), [Chapter 25](/chapter/25)):
+
+| Programming idea | In UI terms |
+|---|---|
+| A function with parameters | A component with **props** |
+| Calling a function | Using a component in JSX |
+| Return value | A description of what to display |
+| A module | A component file |
+
+The data flows **one way**: down. `App` owns the tasks and passes pieces of them to children as props. Children don't reach up and mutate the parent's data. They're given callbacks (`onToggle`) to *ask* for a change. This "props down, events up" shape is why a bug in the counter has only a few possible origins, not thirty.
+
+## 36.7 React's core idea
+
+If the UI is a function of state, then every time the state changes you'd just call the function again to get a new description. Why not do exactly that, for the whole screen? Because rebuilding every DOM node on every keystroke would be slow (and would wreck focus, scroll positions, and animations). React's trick is to bridge the two:
+
+1. **Render.** Call your component functions with the current state. The result is a lightweight JavaScript description of the UI: a tree of plain objects, not real DOM nodes.
+2. **Compare.** Compare this new description with the one from the last render.
+3. **Update.** Make only the *minimal* real DOM changes needed to match.
+
+```tsx
+// State is {count: 0}. React renders and gets a description:
+<button>Clicked 0 times</button>
+
+// You click. State becomes {count: 1}. React renders again and gets:
+<button>Clicked 1 times</button>
+
+// React compares: same <button>, different text.
+// Real DOM change: button.firstChild.data = "Clicked 1 times" // nothing else touched
+```
+
+So you get to write code *as if* you rebuild the entire screen on every change (simple to reason about), while React performs only the edits you'd have written by hand (fast). The word usually used for step 2 is **reconciliation**, and the lightweight description is called the **virtual DOM**. The exact algorithm matters much less than the contract: *you describe, React reconciles*.
+
+> 🧠 **Mental model.** A flip book. Each state is a complete page of the book. Your job is to draw the page for a given state. React's job is flipping from one page to the next, and doing it without redrawing the parts that didn't change.
+
+You are not giving up control, you are moving it. Your effort shifts from "how do I transform this screen?" to "what should this screen look like?" And that second question has a much smaller surface area for mistakes.
+
+## 36.8 Components, props, state, and rendering
+
+Four words carry most of React. This is a first conceptual pass, and the next five chapters of [Part VIII](/part/viii) take each one slowly. Here they are in one small, complete app:
+
+```tsx
+import { useState } from "react";
+
+interface TaskRowProps {            // PROPS: the inputs a parent passes in (read-only)
+  title: string;
+  done: boolean;
+  onToggle: () => void;
+}
+
+function TaskRow({ title, done, onToggle }: TaskRowProps) {  // COMPONENT: a function from props to UI
+  return (
+    <li onClick={onToggle} style={{ textDecoration: done ? "line-through" : "none" }}>
+      {title}
+    </li>
+  );
+}
+
+export function App() {
+  const [tasks, setTasks] = useState<Task[]>([]);             // STATE: data React remembers between renders
+
+  return (                                                    // RENDERING: React calls App, gets this description
+    <ul>
+      {tasks.map((t) => (
+        <TaskRow
+          key={t.id}
+          title={t.title}
+          done={t.done}
+          onToggle={() => setTasks(tasks.map((x) => (x.id === t.id ? { ...x, done: !x.done } : x)))}
+        />
+      ))}
+    </ul>
+  );
+}
+```
+
+**Components** are the functions. **Props** are their inputs: read-only, passed down from the parent. **State** is memory that belongs to a component, which React preserves across renders; calling the *setter* (`setTasks`) is how you tell React "the data changed, please render again". **Rendering** is React calling your components to get a description of the UI.
+
+The whole cycle fits in one sentence: *an event calls a setter, the setter schedules a render, React calls your components with the new state, and the screen is updated to match.* The forgetful `removeTask` of 36.1 has no counterpart here, since there's nothing to forget: the counter, the list, and the empty state are all re-derived on each render.
+
+> 🔗 **Connection.** Notice how this mirrors the Chapter 34 bridge: a component is a function, props are a parameter object, and `useState<Task[]>([])` is a generic call. Nothing in this app is exotic TypeScript.
+
+## 36.9 Why React became popular
+
+React didn't win because it was the first or the only way to build UIs. It won because several of its choices turned out to be durable, and because of the ecosystem that grew around them.
+
+- **Composition.** Everything is a component and components compose, so there is one idea to learn rather than five.
+- **One-way data flow.** Data goes down through props, and changes come back up through callbacks. When something looks wrong, you know which direction to look.
+- **Ecosystem.** Routing, data fetching, forms, animation, component libraries, testing tools, and hiring pools. Most problems you hit already have a well-trodden answer.
+- **React Native.** The same model drives mobile apps, so skills transfer.
+- **Longevity and backing.** A decade of production use, a large community, and an API that evolves carefully (hooks, concurrent rendering, the React Compiler).
+
+It's also honest to list the **trade-offs**. React is a library you must pair with others (routing, data), so you make more decisions than in a batteries-included framework. Its rules (hooks must follow a pattern, renders must be pure) take time to internalize. And rendering costs are your responsibility when lists get large ([Chapter 47](/chapter/47)). The alternatives are good, and they share the declarative idea:
+
+| Option | What's different |
+|---|---|
+| **Vue** | Template-based, with a built-in reactivity system and a gentler learning curve |
+| **Svelte** | A compiler: components turn into minimal direct DOM updates, with almost no runtime |
+| **Solid** | JSX like React, but fine-grained reactivity instead of re-rendering components |
+| **Angular** | A full framework with opinions about everything, and TypeScript at its core |
+
+The shared idea is easy to see in a counter written two ways. The syntax differs a little and the declarative shape is the same:
+
+```tsx
+// React: the component function re-runs on each state change
+function Counter() {
+  const [count, setCount] = useState(0);
+  return <button onClick={() => setCount(count + 1)}>Clicked {count} times</button>;
+}
+
+// Solid: the component runs once, and only the {count()} expression updates
+function Counter() {
+  const [count, setCount] = createSignal(0);
+  return <button onClick={() => setCount(count() + 1)}>Clicked {count()} times</button>;
+}
+```
+
+> 🌍 **Real world.** Technology choice is mostly about people and ecosystem, not benchmarks. A team that already knows React, hiring in a market full of React developers, building something that may later need a mobile app: React is the low-risk path. A small marketing site with a few interactive widgets: plain HTML plus a sprinkle of JavaScript, or Svelte or Astro, may well be better.
+
+> 🚫 **When not to.** A mostly static page (blog, documentation, landing page) doesn't need a UI runtime. A tiny script that adds one dropdown doesn't need a build step. React earns its keep when **state changes drive many parts of the screen**, which is exactly the condition your pain log recorded.
+
+## 36.10 Why TypeScript + React
+
+If React is "UI as a function of state", then **types are the contract at every joint**. Every component takes props, produces UI, and talks to its neighbours through a typed interface. TypeScript makes each of those joints checkable.
+
+```tsx
+interface TaskRowProps {
+  title: string;
+  done: boolean;
+  onToggle: () => void;
+}
+
+<TaskRow title="Write docs" done onToggle={() => {}} />;     // ✅
+<TaskRow title="Write docs" onToggle={() => {}} />;          // ❌ Property 'done' is missing in type '{ title: string; onToggle: () => void; }' but required in type 'TaskRowProps'.
+<TaskRow title={42} done onToggle={() => {}} />;             // ❌ Type 'number' is not assignable to type 'string'.
+```
+
+Three payoffs show up immediately, matching the advantages from [Chapter 2](/chapter/2). **Refactoring** becomes safe: rename a prop and the compiler lists every caller that breaks. **Autocomplete** teaches you the API of every component, including your teammates'. And **states are unions**, so the loading/error/ready logic of [Chapter 34](/chapter/34) can't hide an impossible combination.
+
+The honest summary of the book's arc: **React removes the synchronization bugs, and TypeScript removes the interface bugs.** What remains is the logic that's genuinely yours.
+
+## How it connects
+
+> 🔗 **Connection.** Everything in [Part VIII](/part/viii) builds on this chapter's idea. [Chapter 37](/chapter/37) formalises the render cycle, [Chapter 41](/chapter/41) gives you events and state, and [Chapter 42](/chapter/42) shows how to structure state so the "duplicated truth" of 36.3 can't occur. [P09](/projects/p09) is the vanilla app whose pain log started this argument, and rebuilding it in React is a satisfying early project.
+
+## Exercises
+
+### Level 1 — Recall
+
+Explain **declarative vs imperative** to a non-programmer, using an analogy that is not painting a room or a spreadsheet (a restaurant order, a GPS, a recipe vs a photo of the dish). Then label each of these as imperative or declarative: a SQL `SELECT`, a `for` loop that fills an array, a CSS rule, a function body that calls `appendChild`.
+
+### Level 2 — Application
+
+Sketch the **component tree** for P09's UI: draw the boxes, name each component, and note which state each one owns or receives. For each arrow, label what's passed (props down) and what callbacks flow back up.
+
+### Level 3 — Challenge
+
+Pick three bugs from your pain log. For each, explain in two or three sentences why that bug **cannot occur** when the UI is derived from state, and be specific: which duplicated piece of truth disappears? Then find one bug in your log that React would *not* remove, and say what category it belongs to.
+
+### Level 4 — Real-world
+
+**Ticket TF-420: Technology decision record for TaskFlow Web.** The team must decide how to build the web frontend.
+
+- Write a one-page decision record titled "React for TaskFlow Web": context, decision, alternatives considered (at least two from 36.9), and consequences.
+- Reference evidence from your own pain log, and state at least two *costs* of choosing React.
+- Say what would make you revisit the decision in two years.
+
+## Key takeaways
+
+- Imperative DOM code makes *you* responsible for turning every data change into the right edits, and bugs are the forgotten edits.
+- With `n` facts and `m` displays, update paths can grow as `n × m`. Complexity compounds.
+- **State** is data that changes over time and affects what's shown. **Derived** facts should be computed, never stored twice.
+- **Declarative UI** is `UI = f(state)`: describe the result, and let the framework make the changes.
+- React renders a description, compares it with the last one, and updates only the DOM that differs.
+- Components, props, state, and rendering are the four ideas to hold; TypeScript turns each joint into a checked contract.
+- React isn't always the answer: static content and tiny scripts don't need it.
+
+## What comes next
+
+You know *why*. Now the book builds the *how*, starting with the foundations of the render cycle: what a component is, how JSX works, and how React decides when to run your functions. [Chapter 37: The React Mental Model](/chapter/37) begins [Part VIII](/part/viii), and the first project is rebuilding P09 so that none of the entries in your pain log can ever happen again.
+
+

@@ -1,0 +1,498 @@
+> 📖 **The problem.** TaskFlow's board state lives in a reducer with nine action types: `taskAdded`, `taskRenamed`, `taskMoved`, `taskCompleted`, `taskReopened`, `taskRemoved`, `filterChanged`, `selectionChanged`, and `boardReset`. It has zero tests, so nobody dares to touch it. Next to it sits `useDebouncedValue`, the hook behind the search box. It passes every manual check. It only misbehaves when someone types, pauses for a fraction of a second, and types again: two timers overlap, the older one fires late, and the list briefly filters by a search the user already abandoned.
+
+Both problems have the same shape: important logic that's hard to exercise by clicking around. The reducer has dozens of state-and-action combinations, and the hook's bug needs a timing coincidence you'll never hit on purpose. Unit tests are how you exercise logic like this directly, quickly, and deterministically.
+
+This chapter shows you how to make logic *testable* and then test it: pure functions first, then reducers with table-driven tests, then hooks rendered in a small harness, hooks that need context, code that waits on timers, typed mocks, test data factories, and finally tests for the *types* your code exposes. By the end, the reducer and the hook from the opening will both have tests you trust.
+
+> 🧠 **Mental model.** *Pure functions are the easiest things to test, so push logic into them.* A pure function needs no setup, no rendering, and no mocks: call it, check the result. *Hooks are tested by rendering them in a tiny harness*, a throwaway component whose only job is to call your hook and show you what it returned.
+
+## 67.1 Testing pure logic
+
+A **pure function** returns a result that depends only on its arguments, and it changes nothing outside itself: no network, no storage, no reading the clock. That makes it the ideal thing to test. There's nothing to set up and nothing to clean up, and the same input gives the same output every single time, so a failure always means a real bug.
+
+The best way to get more pure functions is to move logic out of components. Domain rules ("is this task overdue?"), **mappers** (turning an API DTO into a domain object, as in [Chapter 61](/chapter/61)), and **formatters** ("due tomorrow") all belong in plain modules. One trick makes a surprising amount of code pure: instead of calling `new Date()` inside the function, take `now` as a parameter.
+
+```ts
+// src/features/tasks/domain/isOverdue.ts
+export function isOverdue(task: Task, now: Date): boolean {
+  return task.status !== "done" && task.dueDate !== null && task.dueDate < now;
+}
+```
+
+Each test follows the same three beats, often called *arrange, act, assert*: build the input, call the function, check the output. (`buildTask` creates a valid `Task` and lets you override fields; we'll build it properly in 67.7.)
+
+```ts
+import { describe, expect, it } from "vitest";
+import { isOverdue } from "./isOverdue";
+import { toTask } from "../api/mappers";
+
+const now = new Date("2026-03-10T09:00:00Z");
+const yesterday = new Date("2026-03-09T09:00:00Z");
+
+describe("isOverdue", () => {
+  it("flags open tasks whose due date has passed", () => {
+    expect(isOverdue(buildTask({ status: "todo", dueDate: yesterday }), now)).toBe(true);
+  });
+  it("never flags done tasks", () => {
+    expect(isOverdue(buildTask({ status: "done", dueDate: yesterday }), now)).toBe(false);
+  });
+  it("never flags tasks without a due date", () => {
+    expect(isOverdue(buildTask({ dueDate: null }), now)).toBe(false);
+  });
+});
+
+describe("toTask", () => {
+  it("turns the ISO date string into a Date", () => {
+    const dto = buildTaskDto({ dueDate: "2026-03-12T00:00:00.000Z" });
+    expect(toTask(dto).dueDate).toEqual(new Date("2026-03-12T00:00:00.000Z"));
+  });
+});
+```
+
+Use `toBe` for primitives and identity, and `toEqual` for deep structural equality of objects, arrays, and dates. Name each test after the *rule* it protects ("never flags done tasks"), so a failure message reads like a broken requirement.
+
+## 67.2 Testing reducers
+
+A reducer is a pure function `(state, action) => newState` ([Chapter 55](/chapter/55)), so everything from 67.1 applies. What's special is the *shape* of the input: a discriminated union of actions, each with its own payload. Writing a separate `it` block with its own setup for each combination quickly turns into hundreds of near-identical lines.
+
+A **table-driven test** puts the scenarios in a typed array and runs one test body over every row. Typing the table as `ReducerCase[]` means every `action` in it must be a valid member of the union, with the right payload, so the table can't drift from the reducer.
+
+```ts
+interface ReducerCase {
+  name: string;
+  state: BoardState;
+  action: BoardAction;
+  expected: BoardState;
+}
+
+const t1 = buildTask({ id: "t1" });
+const t2 = buildTask({ id: "t2" });
+const t3 = buildTask({ id: "t3" });
+const base: BoardState = { tasks: [t1, t2], filter: "all", selectedId: null };
+
+const cases: ReducerCase[] = [
+  { name: "taskAdded appends the task", state: base,
+    action: { type: "taskAdded", task: t3 }, expected: { ...base, tasks: [t1, t2, t3] } },
+  { name: "taskCompleted marks only that task done", state: base,
+    action: { type: "taskCompleted", id: "t2" }, expected: { ...base, tasks: [t1, { ...t2, status: "done" }] } },
+  { name: "taskCompleted ignores unknown ids", state: base,
+    action: { type: "taskCompleted", id: "nope" }, expected: base },
+  { name: "taskRemoved clears a selection that pointed at it", state: { ...base, selectedId: "t1" },
+    action: { type: "taskRemoved", id: "t1" }, expected: { ...base, tasks: [t2], selectedId: null } },
+  { name: "filterChanged keeps the tasks", state: base,
+    action: { type: "filterChanged", filter: "done" }, expected: { ...base, filter: "done" } },
+];
+
+describe("boardReducer", () => {
+  it.each(cases)("$name", ({ state, action, expected }) => {
+    expect(boardReducer(state, action)).toEqual(expected);
+  });
+
+  it.each(cases)("does not mutate the state ($name)", ({ state, action }) => {
+    const before = structuredClone(state);
+    boardReducer(state, action);
+    expect(state).toEqual(before);
+  });
+});
+```
+
+When `it.each` receives objects, it passes each row as one argument, and `$name` in the title is replaced by the row's `name`. The second block checks a rule every reducer must follow: return new objects, never edit the old ones.
+
+How do you know every action type has at least one row? Combine a compile-time list with a runtime check. The `satisfies` clause makes the compiler reject the list the moment someone adds a tenth action without adding it here:
+
+```ts
+const allActionTypes = Object.keys({
+  taskAdded: 0, taskCompleted: 0, taskRemoved: 0, filterChanged: 0,
+} satisfies Record<BoardAction["type"], 0>);
+// ❌ after adding "boardReset" to BoardAction: Property 'boardReset' is missing in type '{ taskAdded: number; … }' …
+
+it("has at least one case for every action type", () => {
+  const tested = new Set(cases.map((c) => c.action.type));
+  expect([...tested].sort()).toEqual(allActionTypes.sort());
+});
+```
+
+## 67.3 Testing custom hooks
+
+A custom hook can only be called while React is rendering a component, so you can't just call `useTaskFilter(tasks)` in a test. **`renderHook`** from React Testing Library solves this: it renders a tiny invisible component that calls your hook, and exposes the hook's latest return value as `result.current`. Two companions complete the toolkit. **`act`** wraps anything that updates state, so React finishes processing the update before your next line runs. **`rerender`** renders the harness again with new props, which simulates a parent component passing new arguments to the hook.
+
+Hook and component tests need a DOM, so the test environment must be `jsdom` (or `happy-dom`):
+
+```ts
+// vitest.config.ts
+import react from "@vitejs/plugin-react";
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  plugins: [react()],
+  test: { environment: "jsdom", setupFiles: ["./test/setup.ts"] },
+});
+```
+
+Here is a small hook and its tests. The first test drives the hook through its own setter; the second changes the hook's *arguments* with `rerender`:
+
+```ts
+// useTaskFilter.ts: returns the visible tasks for the chosen status filter
+export function useTaskFilter(tasks: Task[]) {
+  const [filter, setFilter] = useState<StatusFilter>("all");
+  const visible = filter === "all" ? tasks : tasks.filter((t) => t.status === filter);
+  return { filter, setFilter, visible };
+}
+
+// useTaskFilter.test.ts
+it("narrows the list when a filter is chosen", () => {
+  const tasks = [buildTask({ status: "todo" }), buildTask({ status: "done" })];
+  const { result } = renderHook(() => useTaskFilter(tasks));
+  expect(result.current.visible).toHaveLength(2);
+
+  act(() => result.current.setFilter("done"));
+
+  expect(result.current.filter).toBe("done");
+  expect(result.current.visible).toEqual([tasks[1]]);
+});
+
+it("re-filters when new tasks arrive", () => {
+  const { result, rerender } = renderHook(({ tasks }) => useTaskFilter(tasks), {
+    initialProps: { tasks: [buildTask({ status: "todo" })] }, // props type inferred from here
+  });
+  act(() => result.current.setFilter("todo"));
+
+  rerender({ tasks: [buildTask({ status: "todo" }), buildTask({ status: "todo" })] });
+
+  expect(result.current.visible).toHaveLength(2);
+});
+```
+
+> ⚠️ **Common mistake.** Don't destructure `result.current` at the top of a test. `const { visible } = result.current` captures the value from *that* render, and it never updates. After an `act`, read `result.current.visible` again to see the new render.
+
+## 67.4 Hooks that need context
+
+Many hooks read context: `useAuth()` reads the auth state, `useCan("task:delete")` checks permissions through it, and anything built on TanStack Query needs a `QueryClient`. Rendered on their own, these hooks either crash or (with the safe-context pattern from [Chapter 54](/chapter/54)) throw a deliberate "must be used inside a provider" error. `renderHook` accepts a **`wrapper`**: a component that wraps the harness, which is exactly where providers go.
+
+Rather than writing an inline wrapper in every test, write small typed **wrapper factories**. Each one takes exactly the state a test needs to control and returns a component. The parameter types make it impossible to set up an auth state that can't exist in the app.
+
+```tsx
+// test/wrappers.tsx
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { ReactNode } from "react";
+
+type WrapperProps = { children: ReactNode };
+
+export function withAuth(state: AuthState) {
+  return function AuthWrapper({ children }: WrapperProps) {
+    return <AuthContext value={state}>{children}</AuthContext>; // React 19: the context is the provider
+  };
+}
+
+export function withQueryClient() {
+  // A fresh client per test: no cached data leaks from one test into the next.
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return function QueryWrapper({ children }: WrapperProps) {
+    return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+  };
+}
+```
+
+```tsx
+it("lets admins delete tasks", () => {
+  const admin = buildUser({ role: "admin" });
+  const { result } = renderHook(() => useCan("task:delete"), {
+    wrapper: withAuth({ status: "authenticated", user: admin }),
+  });
+  expect(result.current).toBe(true);
+});
+
+it("does not let viewers delete tasks", () => {
+  const viewer = buildUser({ role: "viewer" });
+  const { result } = renderHook(() => useCan("task:delete"), {
+    wrapper: withAuth({ status: "authenticated", user: viewer }),
+  });
+  expect(result.current).toBe(false);
+});
+
+it("explains the mistake when used outside AuthProvider", () => {
+  vi.spyOn(console, "error").mockImplementation(() => {}); // React logs the thrown error; keep output clean
+  expect(() => renderHook(() => useCan("task:delete"))).toThrow("useAuth must be used inside <AuthProvider>");
+});
+```
+
+Turning off `retry` in the test client matters more than it looks. TanStack Query retries failed queries three times by default, with delays, so a test of an error state would wait several seconds and then likely time out. [Section 68.2](/chapter/68) combines these wrappers into one custom `render` for components.
+
+## 67.5 Fake timers and async logic
+
+Code that *waits* is hard to test with a real clock. A 300 ms debounce makes every test 300 ms slower, a retry with backoff can take seconds, and timing-dependent assertions turn flaky on a busy CI machine. **Fake timers** replace `setTimeout`, `setInterval`, and `Date` with a clock you control. After `vi.useFakeTimers()`, no time passes until you say so: `vi.advanceTimersByTime(ms)` jumps forward instantly and runs every callback that became due. Always switch back with `vi.useRealTimers()` after each test.
+
+Here is the debounce hook from the opening. Its bug is a missing cleanup, so every keystroke starts a timer that's never cancelled:
+
+```ts
+export function useDebouncedValue<T>(value: T, delayMs: number): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const id = setTimeout(() => setDebounced(value), delayMs);
+    return () => clearTimeout(id); // ✅ the fix: a newer value cancels the pending timer
+  }, [value, delayMs]);
+  return debounced;
+}
+```
+
+With fake timers, you can stage the exact coincidence that's nearly impossible to hit by hand: two timers alive at the same moment. Without the cleanup line, the first assertion fails because the stale `"de"` timer fires at 300 ms.
+
+```ts
+describe("useDebouncedValue", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it("publishes only the latest value once typing pauses", () => {
+    const { result, rerender } = renderHook(({ value }) => useDebouncedValue(value, 300), {
+      initialProps: { value: "d" },
+    });
+
+    rerender({ value: "de" });                          // t = 0: a timer starts
+    act(() => { vi.advanceTimersByTime(200); });
+    rerender({ value: "des" });                         // t = 200: a second timer, overlapping the first
+    act(() => { vi.advanceTimersByTime(100); });        // t = 300: the first timer's deadline
+    expect(result.current).toBe("d");                   // the buggy hook shows "de" here
+
+    act(() => { vi.advanceTimersByTime(200); });        // t = 500: the second timer's deadline
+    expect(result.current).toBe("des");
+  });
+});
+```
+
+Time and **promises** need one more tool. A retry helper waits with `setTimeout` *and* awaits promises between attempts, so time must advance while promise callbacks get a chance to run. The `Async` variants (`vi.advanceTimersByTimeAsync`, `vi.runAllTimersAsync`) do exactly that:
+
+```ts
+it("succeeds after a transient failure", async () => {
+  const load = vi.fn<() => Promise<Task[]>>()
+    .mockRejectedValueOnce(new Error("503"))
+    .mockResolvedValueOnce([buildTask()]);
+
+  const promise = retry(load, { attempts: 3, delayMs: 1000 });
+  await vi.advanceTimersByTimeAsync(1000);
+
+  await expect(promise).resolves.toHaveLength(1);
+  expect(load).toHaveBeenCalledTimes(2);
+});
+
+it("rethrows the last error when every attempt fails", async () => {
+  const load = vi.fn<() => Promise<Task[]>>().mockRejectedValue(new Error("503"));
+  const promise = retry(load, { attempts: 3, delayMs: 1000 });
+  const assertion = expect(promise).rejects.toThrow("503"); // attach before time moves, so no rejection goes unhandled
+
+  await vi.runAllTimersAsync();
+
+  await assertion;
+  expect(load).toHaveBeenCalledTimes(3);
+});
+```
+
+Polling works the same way, and it's worth testing the cleanup as well as the interval:
+
+```ts
+it("polls every 5 seconds and stops on unmount", () => {
+  const refresh = vi.fn<() => void>();
+  const { unmount } = renderHook(() => usePolling(refresh, 5_000));
+
+  act(() => { vi.advanceTimersByTime(15_000); });
+  expect(refresh).toHaveBeenCalledTimes(3);
+
+  unmount();
+  act(() => { vi.advanceTimersByTime(15_000); });
+  expect(refresh).toHaveBeenCalledTimes(3); // ✅ no calls after unmount
+});
+```
+
+> 💡 **Tip.** Under fake timers, `vi.setSystemTime(new Date("2026-03-10T09:00:00Z"))` also pins what `new Date()` and `Date.now()` return. Use it for code that reads the clock directly and can't take `now` as a parameter.
+
+## 67.6 Type-safe mocks
+
+A **mock** (or *test double*) stands in for a real dependency: it records how it was called and returns whatever you tell it to. A bare `vi.fn()` has the type "any arguments, any return value", which is precisely the problem. The mock can accept calls and return values the real function never would, and when the real signature changes, the tests keep passing against an imaginary function.
+
+Give the mock the real function's type with **`vi.fn<typeof fn>()`**, and every configuration call is checked against it:
+
+```ts
+const untyped = vi.fn();
+untyped.mockResolvedValue({ id: 1 });   // compiles, but the real saveTask never resolves to this
+
+const save = vi.fn<typeof saveTask>();  // (input: SaveTaskInput) => Promise<Task>
+save.mockResolvedValue(buildTask());    // ✅
+save.mockResolvedValue({ id: 1 });      // ❌ Argument of type '{ id: number; }' is not assignable to parameter of type 'Task'.
+
+const onComplete = vi.fn<TaskRowProps["onComplete"]>(); // typed from the prop it replaces
+```
+
+**Module mocks** need one more step. `vi.mock("../api/tasks")` replaces every export of that module with a mock at runtime (the call is hoisted above the imports), but TypeScript still sees the original types. **`vi.mocked(fn)`** re-types an imported function as the mock it has become, so the mock methods exist and stay typed:
+
+```ts
+import { fetchTasks } from "../api/tasks";
+
+vi.mock("../api/tasks");
+
+it("shows the loaded task count", async () => {
+  vi.mocked(fetchTasks).mockResolvedValue([buildTask(), buildTask()]); // ✅ typed as Task[]
+  fetchTasks.mockResolvedValue([]); // ❌ Property 'mockResolvedValue' does not exist on type '(projectId: string) => Promise<Task[]>'.
+  // …
+});
+```
+
+`vi.mocked` only changes the *type*. If you forget the `vi.mock` call, it hands you the real function with a mock's type, and you'll get a confusing runtime error. For your own code, passing dependencies as parameters or props (an `onSubmit` callback, a `load` function) is usually simpler than module mocking. For network calls, [Chapter 69](/chapter/69) mocks the network itself instead.
+
+Finally, **fixtures**: hand-written sample objects. Use `satisfies` to check a fixture against its type while keeping its narrow literal types. Never use `as`, which turns a missing field into a silent lie:
+
+```ts
+const overdue = {
+  id: "t9", projectId: "p1", title: "File taxes", status: "todo",
+  priority: "high", dueDate: new Date("2026-03-01"), assigneeId: null,
+} satisfies Task;              // ✅ checked; overdue.status stays "todo"
+
+const broken = { id: "t1" } as Task; // compiles. Every other field is undefined at runtime.
+```
+
+## 67.7 Test data factories
+
+Writing full objects in every test causes two problems. The first is noise: when a test is about an overdue task, the one field that matters (`dueDate`) hides among six that don't. The second is fragility: the day `Task` gains a required `createdAt` field, 140 test files stop compiling, even though none of them care about `createdAt`.
+
+A **test data factory** is one function that returns a complete, valid object with sensible defaults, and lets each test override only what it's about. The signature says it all: `buildTask(overrides?: Partial<Task>): Task`. The overrides are checked against `Task`, and the result is always a full `Task`.
+
+```ts
+// test/factories.ts
+let sequence = 0;
+const nextId = (prefix: string) => `${prefix}-${++sequence}`;
+
+export function buildTask(overrides?: Partial<Task>): Task {
+  return {
+    id: nextId("task"),
+    projectId: "project-1",
+    title: "Write the quarterly report",
+    status: "todo",
+    priority: "medium",
+    dueDate: null,
+    assigneeId: null,
+    ...overrides,
+  };
+}
+
+export function buildUser(overrides?: Partial<User>): User {
+  return { id: nextId("user"), name: "Ada Lovelace", email: "ada@example.com", role: "member", ...overrides };
+}
+```
+
+```ts
+const late = buildTask({ dueDate: new Date("2026-03-01") }); // the test says only what it's about
+const mine = buildTask({ assigneeId: buildUser({ id: "u1" }).id });
+
+buildTask({ status: "archived" }); // ❌ Type '"archived"' is not assignable to type 'TaskStatus | undefined'.
+buildTask({ titel: "Oops" });      // ❌ Object literal may only specify known properties, but 'titel' does not exist in type 'Partial<Task>'. Did you mean to write 'title'?
+```
+
+When `Task` gains `createdAt`, you add one default line to `buildTask`, and every test keeps compiling. A few rules keep factories trustworthy. Defaults must be **valid** (a default task passes every schema). They must be **deterministic**: no unseeded random data and no `new Date()` defaults, because a failure you can't reproduce is a failure you can't fix. And tests shouldn't depend on generated IDs: if a test asserts on an ID, it passes that ID in explicitly.
+
+> ⏭ **Safe to skip.** Without `exactOptionalPropertyTypes`, `Partial<Task>` also accepts `buildTask({ dueDate: undefined })`, and the spread then puts `undefined` where `Task` promises `Date | null`. Turning on `exactOptionalPropertyTypes` in `tsconfig` makes that call a compile error.
+
+## 67.8 Type tests for app code
+
+Some code's most important behavior *is its type*. `useToggle` must return a tuple, not an array, or destructuring falls apart ([Chapter 56](/chapter/56)). `groupByStatus` must return `Record<TaskStatus, Task[]>`, so callers can rely on every key. A refactor can quietly loosen any of these, to `any`, to a wider union, or from a tuple to an array, without breaking a single runtime test.
+
+A **type test** locks a public type in place. Vitest's `expectTypeOf` makes assertions that are checked by the type checker rather than at runtime, and `@ts-expect-error` asserts that a line must *fail* to compile (if the line ever starts compiling, the directive itself becomes an error). Notice that the tests below never call the hooks: they only inspect their types, so the rules of hooks don't apply.
+
+```ts
+// src/shared/hooks/hooks.test-d.ts
+import { expectTypeOf } from "vitest";
+import { useToggle } from "./useToggle";
+import { useTaskFilter } from "@/features/tasks/hooks/useTaskFilter";
+import { groupByStatus } from "@/features/tasks/domain/groupByStatus";
+
+expectTypeOf(useToggle).parameter(0).toEqualTypeOf<boolean | undefined>();
+expectTypeOf(useToggle).returns.toEqualTypeOf<readonly [boolean, () => void]>();
+expectTypeOf(useTaskFilter).returns.toHaveProperty("visible").toEqualTypeOf<Task[]>();
+expectTypeOf(groupByStatus).returns.toEqualTypeOf<Record<TaskStatus, Task[]>>();
+
+// @ts-expect-error: "archived" is not a TaskStatus, and must never become one by accident
+buildTask({ status: "archived" });
+```
+
+Files ending in `.test-d.ts` are picked up by Vitest's type-checking mode, which runs the type checker over them instead of executing them. Enable it in the config, or run `vitest --typecheck`. Since they're ordinary TypeScript files, `tsc --noEmit` in CI checks them too.
+
+```ts
+// vitest.config.ts (inside defineConfig)
+test: {
+  environment: "jsdom",
+  typecheck: { enabled: true, include: ["src/**/*.test-d.ts"] },
+},
+```
+
+Reserve type tests for types that other code depends on: shared hooks, domain utilities, factories, and anything generic. A component used in one place doesn't need its prop types locked.
+
+## Common mistakes
+
+> ⚠️ **Reading a stale `result.current`.** Destructuring it once captures one render. Read `result.current` again after every `act`.
+
+> ⚠️ **Advancing time without `act`.** If advancing timers causes a state update, wrap it: `act(() => { vi.advanceTimersByTime(300); })`. Otherwise React warns that an update wasn't wrapped in `act(...)`, and your assertion may run before the update.
+
+> ⚠️ **Leaving fake timers on.** A test that forgets `vi.useRealTimers()` makes the *next* test hang on a promise that waits for time that never passes. Put it in `afterEach`.
+
+> ⚠️ **Untyped `vi.fn()` and `as` fixtures.** Both let tests pass against functions and data that can't exist. Use `vi.fn<typeof fn>()` and `satisfies`.
+
+> ⚠️ **Shared mutable fixtures.** If one test edits a fixture defined at the top of the file, the next test sees the edit. Build fresh data per test with factories.
+
+> ⚠️ **Random data in factories.** A test that fails one run in fifty, with values you can't reproduce, costs more than it ever saves.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** logic has rules, branches, or edge cases: domain functions, mappers, formatters, reducers, and hooks with real behavior of their own (timers, state machines, caching). Unit tests are the cheapest way to cover twelve edge cases of a date rule.
+
+> 🚫 **When not to.** Don't unit-test one-line pass-throughs, or a hook that only glues `useQuery` to a selector: a component test of the screen that uses it covers more for less. Don't test private helpers directly; test the public function that uses them, so you can refactor freely. And don't move logic out of a component *only* to unit-test it if a component test would check the same behavior just as well.
+
+## How it connects
+
+> 🔗 **Connection.** Vitest, `describe`/`it`/`expect`, and `expectTypeOf` first appeared in [Chapter 19](/chapter/19) and [Chapter 27](/chapter/27). The reducer and its action union come from [Chapter 55](/chapter/55); custom hooks and their public types from [Chapter 48](/chapter/48) and [Chapter 56](/chapter/56); safe context from [Chapter 54](/chapter/54); DTO mappers from [Chapter 61](/chapter/61). Next, [Chapter 68](/chapter/68) turns the wrappers from 67.4 into a custom `render` for components, and [Chapter 69](/chapter/69) replaces module mocks of the API with network-level mocks.
+
+> 🌍 **Real world.** Most React codebases with healthy test suites have a `test/` folder with exactly the pieces from this chapter: a factories module, wrapper or render helpers, and a setup file. Libraries like `@mswjs/data` or `fishery` offer more elaborate factories, but a typed function with `Partial` overrides covers most apps.
+
+## Exercises
+
+### Level 1 — Recall
+
+TaskFlow's filter panel uses this reducer. Write a table-driven test for it with at least two rows per action type, typed so that an invalid action can't appear in the table:
+
+```ts
+type FilterState = { statuses: TaskStatus[]; search: string };
+type FilterAction =
+  | { type: "statusToggled"; status: TaskStatus }
+  | { type: "searchChanged"; search: string }
+  | { type: "filtersCleared" };
+```
+
+### Level 2 — Application
+
+Write a complete test file for `useDebouncedValue` using fake timers. Cover: the initial value is returned immediately; a new value appears only after the delay; overlapping changes publish only the last value; changing `delayMs` restarts the wait; and unmounting cancels a pending update (no React warning, no late call).
+
+### Level 3 — Challenge
+
+Build a typed factory library for TaskFlow in `test/factories.ts`: `buildTask`, `buildProject`, `buildUser`, and the DTO versions `buildTaskDto` and `buildProjectDto`. Defaults must be valid and deterministic, IDs must be unique, and it must be impossible to pass an override field that doesn't exist. Add a generic `buildMany` that makes a list of anything.
+
+*Hint: `buildMany<T>(count: number, build: (index: number) => T): T[]` lets each item vary by index without any casts.*
+
+### Level 4 — Real-world
+
+**Ticket TF-318: Meaningful coverage for TaskFlow Web's logic.** Coverage of `src/features/*/domain` and `src/features/*/hooks` in P14 is at 41%, and most of it comes from component tests that happen to run the code.
+
+- Domain and hook coverage reaches 90%, with every test named after a rule or a behavior.
+- Every reducer has a table-driven test plus a check that every action type has a case.
+- Every timer-based hook is tested with fake timers, including its cleanup.
+- No untyped `vi.fn()`, no `as` in fixtures, and every test builds its data through factories.
+
+## Key takeaways
+
+- **Pure functions are the cheapest code to test.** Move rules, mappers, and formatters out of components, and pass `now` in instead of reading the clock.
+- Test reducers with **typed, table-driven** cases, and check that every action type is covered.
+- `renderHook` runs a hook in a **tiny harness**; `act` flushes updates; `rerender` changes the hook's arguments. Always read `result.current` fresh.
+- Provide context with **typed wrapper factories**, and give every test a fresh `QueryClient` with retries off.
+- **Fake timers** make waiting instant and deterministic; use the `Async` variants when promises are involved, and always restore real timers.
+- Type your mocks with `vi.fn<typeof fn>()` and `vi.mocked`, and check fixtures with `satisfies`, never `as`.
+- **Factories** (`buildTask(overrides?: Partial<Task>)`) keep tests short, focused, and immune to new fields.
+- **Type tests** lock the public types of shared hooks and utilities that runtime tests can't see.
+
+## What comes next
+
+Unit tests prove the logic underneath the UI. But users never call `boardReducer`; they click buttons, type into fields, and read what's on screen. And a test suite that inspects a component's DOM structure will break the first time a `div` becomes a `section`. [Chapter 68: Component Testing with Testing Library](/chapter/68) shows how to test components the way users actually use them.

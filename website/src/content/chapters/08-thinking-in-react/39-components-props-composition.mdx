@@ -1,0 +1,414 @@
+> 📖 **The problem.** Your first React TaskFlow works, and all of it lives in `App.tsx`: 300 lines. The header, the search box, the new-task form, the filter tabs, every task row with its checkbox and edit mode and delete button, the footer counter. You want to reuse the task row on a new "Today" screen, but it's tangled into the middle of a giant `return`. A teammate changes the form and accidentally breaks the filter tabs, because everything shares the same scope. It's P09's `render.ts` all over again, just written in JSX.
+
+React's answer is the **component**: a small function with a clear job and a clear interface. This chapter is about drawing the boundaries well. You'll learn how to define components, give them inputs (props), nest UI inside them (children), let children talk back to parents (callbacks), and split a screen into a sensible tree.
+
+By the end, you'll be able to take a mockup, decompose it into components, and wire data down and events up without either side reaching into the other.
+
+> 🧠 **Mental model.** **Components are functions; props are their arguments; `children` is a special argument that holds nested UI.** Data flows **down** through props. Events flow **up** through callback props.
+
+## 39.1 Defining components
+
+A component is a function with three properties: its name starts with a **capital letter** (so JSX treats it as a component, as you saw in [Chapter 38](/chapter/38)), it takes a single **props object**, and it returns something renderable, usually JSX, sometimes `null`. That's the entire definition. There is no base class to extend and nothing to register.
+
+```tsx
+// src/components/TaskRow.tsx
+type TaskRowProps = { title: string; done: boolean };
+
+export function TaskRow({ title, done }: TaskRowProps) {
+  return <li className={done ? "task task--done" : "task"}>{title}</li>;
+}
+```
+
+```tsx
+// src/components/TaskList.tsx
+import { TaskRow } from "./TaskRow";
+
+export function TaskList() {
+  return (
+    <ul>
+      <TaskRow title="Write docs" done={false} />
+      <TaskRow title="Fix login bug" done />
+    </ul>
+  );
+}
+```
+
+Name components with **nouns** that describe what they show (`TaskRow`, `FilterTabs`, `EmptyState`), not what they do. Aim for **one concept per component**: if you need "and" to describe it ("the task list and the counter"), it's probably two components. The usual convention is one exported component per file, named after the file, with small private helpers allowed alongside it. Named exports (`export function TaskRow`) keep names consistent across imports and in DevTools.
+
+There's one rule that will save you a confusing bug later: **define components at the top level of a module, never inside another component.**
+
+```tsx
+function TaskList({ tasks }: TaskListProps) {
+  function Row({ task }: RowProps) {   // ❌ a brand-new component type on every render
+    return <li><input defaultValue={task.title} /></li>;
+  }
+  return <ul>{tasks.map((t) => <Row key={t.id} task={t} />)}</ul>;
+}
+```
+
+Each render of `TaskList` creates a *new* `Row` function. React compares element types by identity, sees a different component, and throws away the old rows with their DOM and state, so the input loses focus after every keystroke. Move `Row` outside and the problem disappears. [Chapter 42](/chapter/42) explains the underlying rule.
+
+## 39.2 Props as parameters
+
+Props are how a parent configures a child, exactly like arguments configure a function. JSX attributes on `<Badge label="Late" tone="warning" />` become the object `{ label: "Late", tone: "warning" }`, and the component receives it as its one parameter. You already know the idiom from [Chapter 12](/chapter/12): **destructure the parameter object** and describe it with a small type alias.
+
+```tsx
+type BadgeProps = {
+  label: string;
+  tone?: "neutral" | "warning" | "success"; // optional: the caller may leave it out
+};
+
+export function Badge({ label, tone = "neutral" }: BadgeProps) {
+  // tone: "neutral" | "warning" | "success"  (the default removes undefined)
+  return <span className={`badge badge--${tone}`}>{label}</span>;
+}
+```
+
+The `= "neutral"` is an ordinary destructuring **default**, and it's the modern way to give a prop a default value. Inside the component, TypeScript knows `tone` can no longer be `undefined`. The props type is the component's public contract, so TypeScript checks every place it's used:
+
+```tsx
+<Badge label="Late" tone="warning" />; // ✅
+<Badge label="Done" />;                // ✅ tone defaults to "neutral"
+<Badge tone="success" />;              // ❌ Property 'label' is missing in type '{ tone: "success"; }' but required in type 'BadgeProps'.
+<Badge label="Late" tone="danger" />;  // ❌ Type '"danger"' is not assignable to type '"neutral" | "warning" | "success" | undefined'.
+```
+
+One rule matters more than any syntax: **props are read-only.** They belong to the parent; the child only borrows them for this render. Reassigning or mutating a prop is the purity violation from [Chapter 37](/chapter/37). If a child needs a value to change, it must ask the parent (39.5).
+
+> 🕰 **Legacy note.** Older code sets `Badge.defaultProps = { tone: "neutral" }` or types components as `React.FC<BadgeProps>`. React 19 no longer supports `defaultProps` on function components, and `React.FC` adds nothing over a typed parameter. Use destructuring defaults and a plain function.
+
+## 39.3 Children
+
+Some components exist to *wrap* other UI: a card, a panel, a modal, a page layout. They don't know in advance what goes inside them, and they shouldn't need to. JSX handles this with a special prop: whatever you nest between a component's opening and closing tags arrives as **`children`**.
+
+```tsx
+import type { ReactNode } from "react";
+
+type PanelProps = { title: string; children: ReactNode };
+
+export function Panel({ title, children }: PanelProps) {
+  return (
+    <section className="panel">
+      <h2 className="panel__title">{title}</h2>
+      <div className="panel__body">{children}</div>
+    </section>
+  );
+}
+```
+
+`ReactNode` is the type from [Chapter 38](/chapter/38)'s "what renders" table: text, numbers, elements, arrays, `null`, and so on. Now `Panel` can wrap anything, and the parent decides what that is:
+
+```tsx
+<Panel title="Today">
+  <TaskList tasks={todayTasks} />
+</Panel>
+
+<Panel title="Stats">
+  <p>{doneCount} done this week</p>
+  <ProgressBar percent={72} />
+</Panel>
+```
+
+`children` is not magic; it's an ordinary prop with a special syntax. Writing `<Panel title="Today" children={<TaskList />} />` would do the same thing (but nobody writes it that way). The value of children is the inversion of control: `Panel` owns the frame, and the parent owns the content. That idea grows into the next section.
+
+## 39.4 Composition over configuration
+
+Every reusable component eventually faces a choice. When a new screen needs a slight variation, you can add a **configuration prop** ("pass `showAssignee` to show the avatar"), or you can make the component **composable** ("put whatever you want in the header"). Configuration feels easier the first few times. Here's where it ends up:
+
+```tsx
+type TaskCardProps = {
+  task: Task;
+  showCheckbox?: boolean;
+  showAssignee?: boolean;
+  showMenu?: boolean;
+  compact?: boolean;
+  highlighted?: boolean;
+  headerText?: string;
+  footerText?: string;
+  // …and every new screen adds another flag
+};
+```
+
+Seven booleans means 128 combinations, most of which nobody has ever rendered. Inside, the component is a thicket of `if (showX)` checks, and the next variation (an avatar on the *left* this time) needs yet another prop. The component's author has to anticipate every use.
+
+The alternative is to build **small pieces that fit together**, and let the parent arrange them:
+
+```tsx
+type SlotProps = { children: ReactNode };
+type CardProps = { children: ReactNode; tone?: "default" | "highlight" };
+
+export function Card({ children, tone = "default" }: CardProps) {
+  return <article className={`card card--${tone}`}>{children}</article>;
+}
+export function CardHeader({ children }: SlotProps) {
+  return <header className="card__header">{children}</header>;
+}
+export function CardFooter({ children }: SlotProps) {
+  return <footer className="card__footer">{children}</footer>;
+}
+```
+
+```tsx
+<Card tone="highlight">
+  <CardHeader>
+    <input type="checkbox" checked={task.done} onChange={() => onToggle(task.id)} />
+    {task.title}
+  </CardHeader>
+  <p>Assigned to Priya</p>
+  <CardFooter>
+    <Badge label="Due today" tone="warning" />
+  </CardFooter>
+</Card>
+```
+
+No flags at all. A new screen that wants an avatar on the left just puts one there. Configuration props still have a place: a small, closed set of *variants* (`tone`, `size`) is clearer as a prop than as composition. The warning sign is a growing list of booleans that each switch a piece of UI on or off.
+
+> 💡 **Tip.** A prop that accepts `ReactNode` (often called a **slot**) is a middle ground: `<PageHeader title="Tasks" actions={<NewTaskButton />} />`. The component controls *where* the actions go; the parent controls *what* they are.
+
+## 39.5 Passing callbacks
+
+Props flow from parent to child. So how does a child tell its parent that something happened, like "the user checked this task"? The parent passes a **function** as a prop, and the child calls it. Functions are values in JavaScript, so this is just another argument:
+
+```tsx
+type TaskRowProps = {
+  task: Task;
+  onToggle: (id: string) => void;
+  onDelete: (id: string) => void;
+};
+
+export function TaskRow({ task, onToggle, onDelete }: TaskRowProps) {
+  return (
+    <li className={task.done ? "task task--done" : "task"}>
+      <input type="checkbox" checked={task.done} onChange={() => onToggle(task.id)} />
+      <span>{task.title}</span>
+      <button onClick={() => onDelete(task.id)} aria-label={`Delete ${task.title}`}>×</button>
+    </li>
+  );
+}
+```
+
+The parent owns the data and decides what each event *means*. Here `App` keeps the task list in state ([Chapter 41](/chapter/41) explains `useState`; for now, `setTasks` replaces the list and triggers a render):
+
+```tsx
+export default function App() {
+  const [tasks, setTasks] = useState(initialTasks);
+
+  function handleToggle(id: string) {
+    setTasks(tasks.map((t) => (t.id === id ? { ...t, done: !t.done } : t)));
+  }
+  function handleDelete(id: string) {
+    setTasks(tasks.filter((t) => t.id !== id));
+  }
+
+  return <TaskList tasks={tasks} onToggle={handleToggle} onDelete={handleDelete} />;
+}
+```
+
+Two conventions make callback code easy to read. Props that accept callbacks are named **`onSomething`** (`onToggle`, `onDelete`), like the built-in `onClick`. The functions that implement them are named **`handleSomething`**. And a good callback speaks the language of your domain, not the DOM: `onToggle(task.id)` says "toggle this task", which is far more useful to a parent than "a checkbox changed somewhere".
+
+## 39.6 One-way data flow
+
+Put 39.2 and 39.5 together and you get React's central rule of communication. **Data flows down** from owner to children as props. **Events flow up** from children to the owner as callback calls. The owner changes its data, React re-renders, and the new data flows down again.
+
+```txt
+App          owns `tasks`; defines handleToggle
+ │  ↓ tasks, onToggle
+TaskList
+ │  ↓ task, onToggle
+TaskRow      user clicks the checkbox
+ │  ↑ onToggle("t2")
+App          setTasks(...)  →  re-render  →  new `tasks` flow down
+```
+
+The tempting shortcut is for the child to change the data itself. It has the object right there:
+
+```tsx
+function TaskRow({ task }: TaskRowProps) {
+  function handleChange() {
+    task.done = !task.done; // ❌ mutates App's data behind its back
+  }
+  return <input type="checkbox" checked={task.done} onChange={handleChange} />;
+}
+// Nothing re-renders, because no state was set. The checkbox, the counter,
+// and the filter all disagree until some unrelated render happens to catch up.
+```
+
+That's P09's bug class returning: two places that think they own the same data. One-way flow is a constraint that buys you something valuable. For any value on screen, there is **exactly one place** that can change it, and you find it by walking *up* the tree to the component that owns it. Debugging becomes a search with a direction.
+
+> 🔗 **Connection.** TypeScript doesn't stop the mutation above, because `task` isn't marked read-only. Marking props `readonly` ([Chapter 7](/chapter/7)) turns this mistake into a compile error, and [Chapter 50](/chapter/50) designs props types properly.
+
+## 39.7 Splitting a UI into components
+
+The React team's classic guide, "Thinking in React", starts here: **step 1 is to break the UI into a component hierarchy.** Take the mockup, draw a box around every piece, and name each box. Then nest the boxes. A few heuristics help you decide where to draw:
+
+- **Single responsibility.** A component should do one thing. If it grows, split it.
+- **Follow the data.** UI tends to mirror the shape of the data model. One task becomes one `TaskRow`; the list of tasks becomes a `TaskList`.
+- **Repetition.** Anything that appears more than once, like rows, tabs, and badges, is a component.
+- **Different reasons to change.** The form changes when the product team redesigns input; the footer changes when the counter logic does. Separate them.
+
+Here's the TaskFlow screen boxed up, and the hierarchy that falls out:
+
+```txt
+┌ App ─────────────────────────────────────────┐
+│ ┌ AppHeader ──────────────────────────────┐  │
+│ │ TaskFlow                  [ search… ]   │  │
+│ └─────────────────────────────────────────┘  │
+│ ┌ NewTaskForm ────────────────────────────┐  │
+│ │ [ What needs doing?        ] [ Add ]    │  │
+│ └─────────────────────────────────────────┘  │
+│ ┌ FilterTabs ┐  All · Active · Done           │
+│ ┌ TaskList ───────────────────────────────┐  │
+│ │ ┌ TaskRow ┐ ☐ Write docs            ×   │  │
+│ │ ┌ TaskRow ┐ ☑ Fix login bug         ×   │  │
+│ └─────────────────────────────────────────┘  │
+│ ┌ TaskFooter ┐  1 left · Clear completed     │
+└──────────────────────────────────────────────┘
+```
+
+And the 300-line `App` from the opening becomes a table of contents:
+
+```tsx
+export default function App() {
+  return (
+    <div className="app">
+      <AppHeader />
+      <NewTaskForm />
+      <FilterTabs />
+      <TaskList />
+      <TaskFooter />
+    </div>
+  );
+}
+```
+
+There is no single correct split. You can also go too far: a component for every `span`, or `TaskTitleText` wrapping a single string, adds files and indirection with nothing to show for it. A useful test is whether the component has a name a teammate would understand without opening the file. Data and state come next, in [Chapter 42](/chapter/42)'s remaining steps of "Thinking in React".
+
+## 39.8 Styling components (orientation)
+
+Components raise an old CSS question in a new form: how do you keep one component's styles from leaking into another's? This book doesn't pick a single answer yet; [Chapter 58](/chapter/58) makes the decision for TaskFlow and [Chapter 93](/chapter/93) revisits it for design systems. For now, you should recognize the three approaches you'll meet.
+
+**CSS Modules** (built into Vite) scope class names to one file. Name the file `*.module.css`, and Vite turns each class into a unique name and hands you an object to look them up:
+
+```css
+/* TaskRow.module.css */
+.row { display: flex; gap: 8px; align-items: center; }
+.done { text-decoration: line-through; opacity: 0.6; }
+```
+
+```tsx
+import styles from "./TaskRow.module.css";
+
+export function TaskRow({ title, done }: TaskRowProps) {
+  return <li className={done ? `${styles.row} ${styles.done}` : styles.row}>{title}</li>;
+}
+```
+
+**Utility CSS** (such as Tailwind) skips writing CSS files and composes small single-purpose classes in `className`: `className="flex gap-2 items-center"`. **Inline styles** use the `style` object from [Chapter 38](/chapter/38). They're the right tool for values that are computed at runtime, and the wrong tool for everything else (no hover states, no media queries):
+
+```tsx
+type ProgressBarProps = { percent: number };
+
+export function ProgressBar({ percent }: ProgressBarProps) {
+  return (
+    <div className="progress">
+      <div className="progress__fill" style={{ width: `${percent}%` }} />
+    </div>
+  );
+}
+```
+
+> 💡 **Tip.** Whichever approach you use, styling is part of a component's encapsulation. A parent that reaches in with `.task-list li span { ... }` is the CSS version of mutating props.
+
+## Common mistakes
+
+> ⚠️ **Components that are too big or too small.** A 300-line component hides structure; a component per element hides logic behind indirection. Split along responsibilities and data, and stop when names stop being meaningful.
+
+> ⚠️ **Copying props into state.** It looks like a way to "make a prop editable", but the copy is taken once and never updates when the prop changes. You now have two sources of truth. [Chapter 42](/chapter/42) explains when (rarely) this is what you want.
+
+```tsx
+function TaskTitle({ title }: TaskTitleProps) {
+  const [text, setText] = useState(title); // ❌ ignores every later change to `title`
+  return <h3>{text}</h3>;
+}
+```
+
+> ⚠️ **Boolean-prop explosion.** `<Button isPrimary isLarge isRounded isOutline isDanger />` invites impossible combinations (primary *and* danger?). Use one `variant` prop with a union of values, and composition for structural differences.
+
+> ⚠️ **Defining a component inside another.** It creates a new component type every render and resets its whole subtree. Always define components at module level.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** a piece of UI repeats, has its own clear responsibility, or changes for different reasons than its surroundings. Reach for **composition** (children and slots) when callers need to vary the structure, and for **configuration props** when they choose from a small, fixed set of variants.
+
+> 🚫 **When not to.** Don't extract a component for five lines of JSX used once and unlikely to change; a well-named variable or a blank line may be enough. Don't build a "flexible" component for a second use case you're only imagining. Wait until the second real use, then extract what they genuinely share.
+
+## How it connects
+
+> 🔗 **Connection.** Components are the functions of [Chapter 11](/chapter/11), and props are the parameter objects of [Chapter 12](/chapter/12). Callback props are the reason you'll lift state up in [Chapter 42](/chapter/42). When passing props through many layers gets painful, [Chapter 46](/chapter/46) introduces context, and shows that composition (passing JSX as children) often fixes the problem first. In Part IX, [Chapter 50](/chapter/50) designs props types properly, and [Chapter 87](/chapter/87) turns `Card` and `CardHeader` into true compound components.
+
+> 🌍 **Real world.** Component libraries such as Radix and shadcn/ui are built almost entirely on composition: a `Dialog` is `Dialog.Trigger`, `Dialog.Content`, `Dialog.Title`, and so on, rather than one component with forty props. **Project [P10](/projects/p10), the Component Gallery, starts here**: build its `Button`, `Badge`, and `Card` with the ideas from this chapter.
+
+## Exercises
+
+### Level 1 — Recall
+
+Extract three components from this page. Name each one, write its props type, and rewrite `SettingsPage` to use them:
+
+```tsx
+export function SettingsPage() {
+  return (
+    <main>
+      <div className="setting"><label>Dark mode</label><input type="checkbox" /></div>
+      <div className="setting"><label>Email reminders</label><input type="checkbox" /></div>
+      <div className="setting"><label>Weekly summary</label><input type="checkbox" /></div>
+      <section className="danger-zone">
+        <h2>Danger zone</h2>
+        <p>Deleting your account removes all projects and tasks.</p>
+        <button className="btn btn--danger">Delete account</button>
+      </section>
+      <footer><small>TaskFlow v2.4 · Settings saved automatically</small></footer>
+    </main>
+  );
+}
+```
+
+### Level 2 — Application
+
+Build a `Card` family for P10: `Card`, `CardHeader`, `CardBody`, and `CardFooter`, each accepting `children`. `CardHeader` should also accept an optional `actions` slot rendered on the right. Use it to render a task card and a project card that look different without adding a single boolean prop.
+
+### Level 3 — Challenge
+
+This component has twelve props. Refactor it into composable pieces so that every current use can still be expressed, and so that a new variation (an avatar on the left, a second badge) needs no change to the components themselves:
+
+```tsx
+type TaskItemProps = {
+  task: Task; showCheckbox: boolean; showDelete: boolean; showEdit: boolean;
+  showAvatar: boolean; avatarUrl?: string; showBadge: boolean; badgeText?: string;
+  compact: boolean; highlighted: boolean; onToggle?: (id: string) => void; onDelete?: (id: string) => void;
+};
+```
+
+*Hint: list the existing call sites first, and notice which props are really "which pieces appear, and where".*
+
+### Level 4 — Real-world
+
+**Ticket TF-230: Component plan for the inbox screen.** Before building TaskFlow's new "Inbox" (an email-client-style screen with a folder sidebar, a message list, and a reading pane), the team wants a component plan.
+
+- Draw the component tree for the screen, at least four levels deep, with a one-line responsibility for each component.
+- Mark every arrow of data flowing down (props) and every event flowing up (callbacks), and name the callback props.
+- Identify at least one place where composition (children or a slot) is better than a configuration prop, and justify it.
+- Flag any component you considered and rejected as "too small", with your reason.
+
+## Key takeaways
+
+- A component is a **capitalized function** that takes one props object and returns UI. Define it at module level.
+- **Props are parameters**: destructure them, describe them with a small type alias, and give defaults with destructuring defaults.
+- Props are **read-only**. Children never change their parent's data directly.
+- **`children`** lets a component wrap UI it doesn't know about in advance.
+- Prefer **composition** over a growing list of configuration booleans.
+- **Data flows down, events flow up**: parents pass data and callbacks; children call `onSomething` with domain-level information.
+- Split UIs along **responsibilities and data**, the first step of Thinking in React.
+
+## What comes next
+
+Our `TaskList` has been rendering a fixed handful of rows. Real lists come from arrays: they can be empty, filtered, sorted, and reordered, and parts of the UI appear only under certain conditions. Getting that right involves one of React's most misunderstood ideas, the **key**. That's [Chapter 40: Conditional Rendering, Lists & Keys](/chapter/40).

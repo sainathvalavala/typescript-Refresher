@@ -1,0 +1,340 @@
+> 📖 **The problem.** A pull request lands in TaskFlow. It type-checks. It also contains a floating promise (`saveTask(task)` without `await`, so failures vanish), three different quote styles and two indentation widths, and a refactor of `groupByStatus` that no test covers. Each flaw is a different *kind* of problem, and `tsc` caught none of them, because `tsc` answers only one question.
+
+A TypeScript project is not one tool; it's a small team of tools, each of which owns a single question. This chapter assembles that team: how to **run** TypeScript during development, how to **lint** it with type-aware rules, how to **format** it so nobody argues about style, how to **test** behavior and types with Vitest, and how to wire it all into one `npm run check` command and an optional git hook.
+
+> 🧠 **Mental model.** **Each tool owns one question.** `tsc`: "is it *consistent*?" ESLint: "is it *suspicious*?" Prettier: "is it *formatted*?" Vitest: "does it *behave*?" When something slips through, ask which question nobody was asking.
+
+## 27.1 Running TS in development
+
+Node can't run TypeScript syntax by default, and browsers can't either. In development you have three ways to run a `.ts` file, and none of them is a *type checker* except `tsc`:
+
+```sh
+# 1. tsx: a fast runner (esbuild under the hood). Strips types, runs the file.
+npx tsx src/index.ts
+npx tsx watch src/index.ts      # restart on change
+
+# 2. Node's built-in type stripping (no install; recent Node versions enable it by default)
+node src/index.ts
+
+# 3. tsc: the real compiler. Type-checks everything; emits JS only if you ask it to.
+npx tsc --noEmit
+```
+
+Both `tsx` and Node's type stripping simply **erase** the type annotations and run what's left ([Chapter 3](/chapter/3)). A file with a glaring type error runs happily. Node's stripping is stricter about *what* it can erase: it handles syntax that is only types (annotations, `interface`, `type`) but not syntax that needs code generated (`enum`, `namespace`, constructor parameter properties), and imports of local files must spell the `.ts` extension.
+
+```ts
+// works with Node type stripping
+type Status = "todo" | "doing" | "done";
+interface Task { id: string; status: Status }
+
+enum Priority { Low, High } // ❌ ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX: TypeScript enum is not supported in strip-only mode
+```
+
+The setting `"erasableSyntaxOnly": true` in `tsconfig.json` makes `tsc` flag exactly those constructs, so your editor warns you before Node does. That leads to the project layout most teams adopt:
+
+```json
+{
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc"
+  }
+}
+```
+
+> ⚠️ **Common mistake.** Relying on the bundler or runner to type-check. `vite build`, `tsx`, and Node never report type errors. Keep **`typecheck` as its own script** and run it in CI, or errors reach production.
+
+## 27.2 ESLint with typescript-eslint
+
+The compiler proves your types are consistent; **ESLint** looks for code that is *legal but suspicious*. The `typescript-eslint` plugin adds rules that use the type checker's knowledge, which is what makes it more than a style tool. Modern ESLint is configured with a **flat config** file, `eslint.config.js`:
+
+```js
+// eslint.config.js
+import eslint from "@eslint/js";
+import tseslint from "typescript-eslint";
+
+export default tseslint.config(
+  eslint.configs.recommended,
+  tseslint.configs.recommendedTypeChecked, // rules that need type information
+  {
+    languageOptions: {
+      parserOptions: {
+        projectService: true,                 // let the linter reuse your tsconfig
+        tsconfigRootDir: import.meta.dirname,
+      },
+    },
+    rules: {
+      "@typescript-eslint/switch-exhaustiveness-check": "error",
+    },
+  },
+);
+```
+
+The first two entries are rule bundles; the object enables type-aware parsing and adds one extra rule. Now watch what those *type-aware* rules catch that the compiler never would:
+
+```ts
+async function saveTask(task: Task): Promise<void> { /* … */ }
+
+function onSubmit(task: Task) {
+  saveTask(task);
+  // ❌ @typescript-eslint/no-floating-promises: Promises must be awaited, end with a call to .catch,
+  //    end with a call to .then with a rejection handler or be explicitly marked as ignored with the `void` operator.
+}
+
+const data = JSON.parse(text);          // data: any
+const title = data.task.title;
+// ❌ @typescript-eslint/no-unsafe-member-access: Unsafe member access .task on an `any` value.
+
+type Status = "todo" | "doing" | "done";
+function announce(s: Status): void {
+  switch (s) {
+    // ❌ @typescript-eslint/switch-exhaustiveness-check: Switch is not exhaustive. Cases not matched: "done"
+    case "todo": console.log("To do"); break;
+    case "doing": console.log("In progress"); break;
+  }
+}
+```
+
+The `no-unsafe-*` family (`assignment`, `member-access`, `call`, `return`, `argument`) all fight the same enemy: `any` leaking through your code. Fix the cause (validate the data, add a type) instead of silencing the rule.
+
+## 27.3 Formatting with Prettier
+
+Formatting arguments (tabs vs spaces, trailing commas, line width) are the most expensive and least valuable comments in code review. **Prettier** ends them by being opinionated and automatic: it parses your code and reprints it in one canonical style, so there is nothing left to discuss.
+
+```sh
+npm install --save-dev prettier
+npx prettier --write .     # rewrite files in place
+npx prettier --check .     # exit non-zero if any file is unformatted (for CI)
+```
+
+Configuration is deliberately tiny. Most projects set a handful of options and stop:
+
+```json
+{
+  "semi": true,
+  "singleQuote": false,
+  "trailingComma": "all",
+  "printWidth": 100
+}
+```
+
+Here is what it does to a messy function. The logic is untouched; only the layout changes:
+
+```ts
+// before
+function  summarize(tasks:Task[]){const open=tasks.filter(t=>!t.done)
+return {open:open.length,total:tasks.length}}
+
+// after `prettier --write`
+function summarize(tasks: Task[]) {
+  const open = tasks.filter((t) => !t.done);
+  return { open: open.length, total: tasks.length };
+}
+```
+
+ESLint and Prettier overlap slightly on style rules. The clean division of labor is: **Prettier formats, ESLint finds problems.** Keep ESLint's rules focused on bugs, and if you enable any stylistic ones, add `eslint-config-prettier` to turn off the ones that would fight Prettier. Pair Prettier with a `.prettierignore` (`dist`, `coverage`) so it skips generated files.
+
+> 💡 **Tip.** Formatting is not a code-review topic. If a reviewer finds themselves writing "add a space here", the fix is to automate it, not to comment on it.
+
+## 27.4 Vitest in depth
+
+You've been using Vitest since [Chapter 19](/chapter/19) with a preconfigured runner. It reads the same `vite.config.ts` as your app (or a `vitest.config.ts`) and runs TypeScript with no extra setup:
+
+```ts
+// vitest.config.ts
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  test: {
+    include: ["src/**/*.test.ts"],
+    environment: "node",
+    coverage: {
+      provider: "v8",
+      include: ["src/**/*.ts"],
+      thresholds: { lines: 90, functions: 90 }, // fail the run below 90%
+    },
+  },
+});
+```
+
+Tests live next to the code (`groupByStatus.ts` beside `groupByStatus.test.ts`), grouped with `describe`, written with `it` or `test`:
+
+```ts
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { notifyOverdue } from "./notify";
+
+describe("notifyOverdue", () => {
+  const send = vi.fn();            // a test double: records calls, returns undefined
+
+  beforeEach(() => send.mockClear());
+
+  it("notifies once per overdue task", () => {
+    notifyOverdue([{ id: "t1", due: "2020-01-01" }], send);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledWith("t1");
+  });
+
+  it("does nothing when no task is overdue", () => {
+    notifyOverdue([], send);
+    expect(send).not.toHaveBeenCalled();
+  });
+});
+```
+
+`vi.fn()` creates a **fake function** you can inspect; `vi.spyOn(obj, "method")` wraps a real one; `vi.useFakeTimers()` lets you advance `setTimeout` without waiting. Day to day you'll run these:
+
+```sh
+npx vitest             # watch mode: reruns affected tests when you save
+npx vitest run         # run once and exit (CI)
+npx vitest run --coverage   # needs @vitest/coverage-v8 installed
+```
+
+> ⚠️ **Common mistake.** Tests that pass because the test data is typed `any`. `const task = {} as any` satisfies every function and checks nothing. Build real test objects with the real type, perhaps with a small `makeTask(overrides: Partial<Task>)` helper.
+
+## 27.5 Type tests in depth
+
+Types are code too, and a utility type that quietly gets looser breaks callers far away. Vitest includes `expectTypeOf`, an API for asserting **types** rather than values, and TypeScript's `// @ts-expect-error` comment asserts "the next line must fail to compile":
+
+```ts
+import { expectTypeOf, test } from "vitest";
+
+type Task = { id: string; title: string; done: boolean };
+
+test("Partial<Task> makes every key optional", () => {
+  expectTypeOf<Partial<Task>>().toEqualTypeOf<{ id?: string; title?: string; done?: boolean }>();
+});
+
+test("Pick keeps only chosen keys", () => {
+  type Preview = Pick<Task, "id" | "title">;
+  expectTypeOf<Preview>().toEqualTypeOf<{ id: string; title: string }>();
+  expectTypeOf<Preview>().not.toHaveProperty("done");
+});
+
+test("update requires an id", () => {
+  type Update = Partial<Omit<Task, "id">> & Pick<Task, "id">;
+  // @ts-expect-error: id is required
+  const bad: Update = { done: true };
+});
+```
+
+These are checked by the **type checker**, so they must run through `tsc` or `vitest --typecheck` (which looks at files named `*.test-d.ts`). A plain `vitest run` only executes the runtime code, which is why type tests need their own step. The failure mode is useful: if someone loosens a utility's return type, the `toEqualTypeOf` assertion fails, or the `@ts-expect-error` becomes unused and reports `Unused '@ts-expect-error' directive.`
+
+```ts
+// Test the types from Chapters 21 and 22 as specifications:
+test("Readonly makes a property unassignable", () => {
+  const t: Readonly<Task> = { id: "1", title: "x", done: false };
+  // @ts-expect-error: read-only property
+  t.done = true;
+});
+```
+
+## 27.6 Editor integration and scripts
+
+Tools only help if they run without effort. In VS Code, install the ESLint and Prettier extensions and let the editor do the work on every save:
+
+```json
+{
+  "editor.formatOnSave": true,
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+  "editor.codeActionsOnSave": { "source.fixAll.eslint": "explicit" }
+}
+```
+
+Then give the whole team **one command** that mirrors CI, so "works on my machine" and "passes CI" mean the same thing:
+
+```json
+{
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm run lint && npm run format:check && npm run test"
+  }
+}
+```
+
+`npm run check` stops at the first failing step (because `&&` short-circuits). Order the steps from fastest to slowest so the cheap feedback comes first. CI runs exactly the same `npm run check`.
+
+## 27.7 Git hooks (orientation)
+
+A **git hook** is a script git runs at certain moments. A *pre-commit* hook can reject a commit that fails checks, so broken code doesn't enter history. The common setup is **husky** (installs the hooks) plus **lint-staged** (runs tools only on the files you changed, so it stays fast):
+
+```json
+{
+  "scripts": { "prepare": "husky" },
+  "lint-staged": {
+    "*.{ts,tsx}": ["eslint --fix", "prettier --write"],
+    "*.{json,md}": ["prettier --write"]
+  }
+}
+```
+
+```sh
+# .husky/pre-commit
+npx lint-staged
+```
+
+Hooks have trade-offs. They catch problems early and keep style consistent, but they slow every commit, they can be skipped with `git commit --no-verify`, and they only see staged files, so a full type check (which needs the whole project) usually belongs in CI or a `pre-push` hook instead. Treat hooks as a *convenience*; **CI is the gate that can't be bypassed.**
+
+## Common mistakes
+
+> ⚠️ **Relying on the bundler to type-check.** Vite, tsx, esbuild, and Node strip types without checking them. Run `tsc --noEmit` in a `typecheck` script and in CI.
+
+> ⚠️ **Disabling lint rules instead of fixing causes.** `// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment` hides a real `any` leak. Fix the type, validate the data, or disable the rule for one line with a written reason.
+
+> ⚠️ **Tests that pass because they're typed `any`.** A test that builds its input with `as any` can't notice a type regression. Use real types and the `makeTask` helper pattern.
+
+> ⚠️ **Type tests that never run.** `expectTypeOf` lines inside a normal `.test.ts` file only execute at runtime (where they do nothing); they fail only when the type checker looks at them. Make sure `typecheck` covers your test files.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** more than one person touches the code, or the project will live longer than a week. Type-aware linting and a single `check` command pay for themselves in the first month.
+
+> 🚫 **When not to.** A throwaway script doesn't need ESLint and a pre-commit hook. And don't pile on rules for the sake of it: every rule you can't explain to a teammate is noise that trains people to ignore the linter.
+
+## How it connects
+
+> 🔗 **Connection.** `typecheck` runs the settings from [Chapter 26](/chapter/26), and the unsafe-`any` rules guard the boundaries in [Chapter 32](/chapter/32). Testing strategy is covered at length in [Chapter 66](/chapter/66) and [Chapter 67](/chapter/67), and CI in [Chapter 76](/chapter/76).
+
+> 🌍 **Real world.** Open-source TypeScript projects (including `typescript-eslint` itself) ship precisely this stack: `tsc` for types, ESLint with type-aware rules, Prettier, Vitest, and a CI job that runs one `check` command.
+
+## Exercises
+
+### Level 1 — Recall
+
+For each problem, name the tool that should catch it: (1) passing a `string` to a `number` parameter, (2) an `await` missing before `saveTask(task)`, (3) a line wrapped inconsistently, (4) a function returning the wrong total, (5) an `any` flowing into a typed variable, (6) a utility type that became looser.
+
+### Level 2 — Application
+
+Add ESLint (type-aware, flat config) and Prettier to the utility library from [P04](/projects/p04). Run them, fix everything they report without disabling rules, and raise test coverage to 90% with a coverage threshold that fails the run below it.
+
+### Level 3 — Challenge
+
+Write type tests that **fail** if someone loosens a utility type's return type: for a `DeepPartial` or `PartialBy`, assert the exact result with `toEqualTypeOf`, and add two `@ts-expect-error` cases. Then loosen the utility on purpose and show which test fails.
+
+*Hint: make sure the type-test file is included by `tsc` or run `vitest --typecheck`.*
+
+### Level 4 — Real-world
+
+**Ticket TF-288: One command to check TaskFlow.** Reviewers keep catching formatting and floating promises by hand.
+
+- Add a `check` script that runs typecheck, lint, format check, and tests, in that order.
+- Add a pre-commit hook that lints and formats only staged files.
+- CI runs the same `check` script.
+- Document the setup, and how to bypass the hook (and why you shouldn't), in the README.
+
+## Key takeaways
+
+- Each tool owns one question: `tsc` (consistent?), ESLint (suspicious?), Prettier (formatted?), Vitest (behaves?).
+- `tsx` and Node's type stripping run TypeScript by erasing types; only `tsc --noEmit` checks them, so `typecheck` is its own script.
+- Flat-config ESLint with typescript-eslint's type-aware rules catches floating promises, unsafe `any`, and non-exhaustive switches.
+- Prettier ends formatting debates; formatting is not a review topic.
+- `expectTypeOf` and `@ts-expect-error` make types testable, but only if the type checker sees those files.
+- Wire everything into one `npm run check` that CI also runs; git hooks are a convenience, CI is the gate.
+
+## What comes next
+
+Your toolchain now checks your own code. But what about code you *don't* own: a JavaScript library with no types, or a global that a script tag adds to `window`? Telling TypeScript about such code is the job of declaration files, in [Chapter 28: Declaration Files and the Type Ecosystem](/chapter/28).
+

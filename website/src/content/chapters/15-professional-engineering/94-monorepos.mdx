@@ -1,0 +1,339 @@
+> 📖 **The problem.** TaskFlow's web app and API live in two repositories. Each has its own `Task` interface, copied once and edited ever since. Last month the API renamed `dueDate` to `dueAt`. The web app's `Task` still said `dueDate`, the compiler was perfectly happy, and every due date in production showed "Invalid Date". Two types with the same name had quietly become two different things.
+
+A **monorepo**, one repository holding many packages, lets both apps import the *same* `Task` from one place, and lets one pull request change the contract and both consumers together. But a monorepo is not magic: it makes sharing cheap and boundaries *optional*, so you must make boundaries explicit. This chapter shows how: workspaces, internal packages, TypeScript project references, shared configs, a contracts package, cached task running, and rules that stop the whole thing from collapsing into one big ball of imports.
+
+> 🧠 **Mental model.** A monorepo makes shared code cheap and boundaries optional, so you must make them **explicit**. Packages are boundaries with public entry points; project references make TypeScript respect them.
+
+## 94.1 Why monorepos
+
+A monorepo gives you three things multiple repositories can't.
+
+**Shared code without publishing.** `@taskflow/contracts` is just a folder both apps depend on. No version bump, no registry, no "wait for the library release".
+
+**Atomic changes.** Renaming `dueDate` to `dueAt` is one pull request touching the schema, the API, and the web app. Tests run against all of it before merge, so the two sides cannot drift.
+
+**Consistent tooling.** One TypeScript version, one lint config, one CI pipeline.
+
+```text
+taskflow/
+├── apps/
+│   ├── web/            # React SPA
+│   └── api/            # Node API
+├── packages/
+│   ├── contracts/      # schemas + inferred types (shared)
+│   ├── ui/             # component library
+│   └── config/         # shared tsconfig/eslint/prettier
+├── pnpm-workspace.yaml
+└── package.json
+```
+
+The costs are real: CI must be smart (running everything on every change gets slow), permissions are coarse, and without discipline everything imports everything. A monorepo is an *organization* tool as much as a technical one.
+
+> 🚫 **When not to.** Two unrelated projects with different release cycles and owners, or open-source libraries that outside contributors consume separately, are often better as separate repositories.
+
+## 94.2 Workspaces
+
+A **workspace** is a package-manager feature that treats a repository's folders as packages and links them together instead of downloading them from a registry. With pnpm, you declare where the packages live, and refer to siblings with the `workspace:` protocol.
+
+```yaml
+# pnpm-workspace.yaml
+packages:
+  - "apps/*"
+  - "packages/*"
+```
+
+```json
+{
+  "name": "@taskflow/web",
+  "private": true,
+  "dependencies": {
+    "@taskflow/contracts": "workspace:*",
+    "@taskflow/ui": "workspace:*",
+    "react": "^19.0.0"
+  },
+  "devDependencies": {
+    "@taskflow/config": "workspace:*"
+  }
+}
+```
+
+After `pnpm install`, `node_modules/@taskflow/contracts` is a **symlink** to `packages/contracts`. Editing the contract is immediately visible to the web app, with no reinstall. pnpm also enforces strictness: a package can only import what it declared in its own `package.json`, which prevents "phantom dependencies" that happen to work because a neighbor installed them.
+
+```sh
+pnpm install                          # link everything
+pnpm --filter @taskflow/web dev       # run one package's script
+pnpm -r build                         # run a script in every package
+```
+
+## 94.3 Internal packages
+
+An **internal package** is only consumed inside the monorepo. You have two ways to make it usable, and the choice affects speed and complexity.
+
+**Source-shared (just-in-time).** The package's `exports` points straight at TypeScript source. The consuming app's bundler (Vite, Next) compiles it as part of the app. There's no build step for the package, changes appear instantly, and setup is minimal.
+
+```json
+{
+  "name": "@taskflow/contracts",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" }
+}
+```
+
+**Compiled.** The package builds to `dist/` with declarations, and consumers use the output ([Chapter 92](/chapter/92)). It's more setup and slower to iterate, but each package is checked and cached independently, and non-bundled consumers (a plain Node API run without a compile step) can use it.
+
+| | Source-shared | Compiled |
+|---|---|---|
+| Setup | Minimal | Build per package |
+| Dev feedback | Instant | Needs watch builds |
+| Works for plain Node | Only with a TS runner | Yes |
+| Good for | Apps with bundlers, early projects | Published libraries, large repos |
+
+Start source-shared for packages consumed by bundlers, and compile when a consumer needs plain JavaScript or when build times demand independent caching.
+
+## 94.4 Project references at scale
+
+Without help, TypeScript checks your whole monorepo as one giant program: edit one file, and the compiler may re-check everything. **Project references** split the repository into separately compiled projects with explicit dependencies. Each referenced project must be `composite`, which makes TypeScript emit declaration files and track build state.
+
+```json
+// packages/contracts/tsconfig.json
+{
+  "extends": "@taskflow/config/tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "include": ["src"]
+}
+```
+
+```json
+// apps/api/tsconfig.json
+{
+  "extends": "@taskflow/config/tsconfig.base.json",
+  "compilerOptions": { "composite": true, "outDir": "dist", "rootDir": "src" },
+  "include": ["src"],
+  "references": [{ "path": "../../packages/contracts" }]
+}
+```
+
+Now build mode (`tsc -b`) builds projects in dependency order and rebuilds only what's out of date:
+
+```sh
+tsc -b apps/api apps/web        # builds contracts first, then each app
+tsc -b --watch                  # incremental, project-aware watch mode
+```
+
+```text
+[tsc -b] Project 'packages/contracts/tsconfig.json' is out of date because output 'dist/index.d.ts' is older than input 'src/schemas.ts'
+[tsc -b] Building project 'packages/contracts/tsconfig.json'...
+[tsc -b] Project 'apps/api/tsconfig.json' is out of date because its dependency 'contracts' is out of date
+```
+
+When `apps/web` is unaffected by a change to `apps/api`, it isn't rechecked. A project can also only import another project's *declared outputs*, which is the type-level enforcement of the boundary. See [Chapter 95](/chapter/95) for the speed numbers.
+
+## 94.5 Shared configs
+
+Copy-pasting `tsconfig.json`, ESLint, and Prettier settings into every package is how repositories develop eleven slightly different definitions of "strict". Put each config in a package and have everything extend it.
+
+```json
+// packages/config/tsconfig.base.json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "declaration": true
+  }
+}
+```
+
+```json
+// packages/config/package.json
+{
+  "name": "@taskflow/config",
+  "private": true,
+  "exports": {
+    "./tsconfig.base.json": "./tsconfig.base.json",
+    "./tsconfig.react.json": "./tsconfig.react.json",
+    "./eslint": "./eslint.config.js"
+  }
+}
+```
+
+```js
+// apps/web/eslint.config.js
+import base from "@taskflow/config/eslint";
+export default [...base, { rules: { "no-restricted-imports": ["error", { patterns: ["@taskflow/*/src/*"] }] } }];
+```
+
+Offer a few *flavors* (a base, a React app, a Node library) rather than one config with a flag for everything. Changing the strictness for the whole company then becomes a one-line pull request.
+
+## 94.6 Shared contract packages
+
+The opening story's bug has a direct cure: the schema for `Task` exists **once**, in `packages/contracts`, and both the API and the web app import it. As in [Chapter 32](/chapter/32), you write a runtime schema and *infer* the TypeScript type from it, so the type and the validator can't disagree.
+
+```ts
+// packages/contracts/src/task.ts
+import { z } from "zod";
+
+export const TaskId = z.string().brand<"TaskId">();
+export const TaskSchema = z.object({
+  id: TaskId,
+  title: z.string().min(1),
+  status: z.enum(["todo", "doing", "done"]),
+  dueAt: z.iso.datetime().nullable(),
+});
+export type Task = z.infer<typeof TaskSchema>;
+
+export const CreateTaskRequest = TaskSchema.pick({ title: true, dueAt: true });
+export type CreateTaskRequest = z.infer<typeof CreateTaskRequest>;
+```
+
+```ts
+// apps/api: validates incoming requests with the schema
+const body = CreateTaskRequest.parse(await req.json());
+
+// apps/web: validates responses with the SAME schema
+const task = TaskSchema.parse(await res.json());
+```
+
+What belongs in contracts: **wire-level** schemas (requests, responses, errors), shared enums, and ID types. What does *not*: database models, React components, UI state, utility grab-bags, or anything with a runtime dependency on one side (Node-only or DOM-only code). If contracts depends on React or on the database, both sides pay for it. A contracts package should be so small and pure that nobody can resent depending on it.
+
+> ⚠️ **Common mistake.** Letting the contracts package grow into `shared/` ([Chapter 90](/chapter/90)). If a type has only one consumer, it belongs with that consumer.
+
+## 94.7 Task orchestration and caching
+
+With thirty packages, `pnpm -r build && pnpm -r test` repeats work constantly. A **task runner** such as Turborepo or Nx understands the dependency graph, runs tasks in the right order and in parallel, and **caches** results keyed by the inputs. If nothing a package depends on changed, its build and tests are replayed from cache in milliseconds.
+
+```json
+// turbo.json
+{
+  "$schema": "https://turbo.build/schema.json",
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "inputs": ["src/**", "tsconfig.json", "package.json"],
+      "outputs": ["dist/**"]
+    },
+    "typecheck": { "dependsOn": ["^build"] },
+    "test": { "dependsOn": ["build"], "outputs": ["coverage/**"] },
+    "lint": {}
+  }
+}
+```
+
+```sh
+turbo run typecheck test lint          # everything, cached
+turbo run test --filter=...[origin/main]   # only packages changed since main, plus dependents
+```
+
+The `^build` means "build my dependencies first". On CI you add a **remote cache** so a build done once by one machine is reused by every other job and every developer. The payoff is large: a typical pull request that touches `apps/web` skips rebuilding and retesting the API entirely.
+
+## 94.8 Enforcing package boundaries
+
+Workspaces make it *possible* to import anything from anywhere. Left alone, someone will write `import { cache } from "../../apps/api/src/cache"` from the web app, or deep-import `@taskflow/ui/src/internal/Portal`. Enforce two kinds of rules with tooling, not goodwill.
+
+**Public entry points.** Use `exports` ([Chapter 92](/chapter/92)) so only listed paths resolve, and add a lint rule that bans deep imports.
+
+**Dependency rules.** Decide the allowed direction (apps depend on packages; packages never depend on apps; `contracts` depends on nothing internal), and check it with a tool such as `eslint-plugin-boundaries`, `dependency-cruiser`, or Nx's module-boundary rule.
+
+```js
+// .dependency-cruiser.cjs (excerpt)
+module.exports = {
+  forbidden: [
+    {
+      name: "no-app-imports-from-packages",
+      comment: "Packages must not depend on apps.",
+      severity: "error",
+      from: { path: "^packages/" },
+      to: { path: "^apps/" },
+    },
+    {
+      name: "web-cannot-import-api",
+      severity: "error",
+      from: { path: "^apps/web/" },
+      to: { path: "^apps/api/" },
+    },
+  ],
+};
+```
+
+```sh
+npx depcruise packages apps --config .dependency-cruiser.cjs   # run in CI
+```
+
+> 🔗 **Connection.** These are the rules you drew on paper in [Chapter 90](/chapter/90), now made executable.
+
+## Common mistakes
+
+> ⚠️ **Sharing everything.** Moving every type into `shared` couples every package to every change. Share only what two or more packages genuinely use, and only at stable boundaries.
+
+> ⚠️ **Relying on relative paths across packages.** `../../packages/ui/src/Button` bypasses the package boundary. Import `@taskflow/ui`.
+
+> ⚠️ **Forgetting `references`.** With `composite` but no `references`, `tsc -b` can't order or cache your builds. The references must mirror the dependencies in `package.json`.
+
+> ⚠️ **Circular dependencies between packages.** `ui` imports `contracts`, and `contracts` imports `ui` for a type? That's a cycle, and project references forbid it. Extract the shared piece to a third package.
+
+```json
+{
+  "compilerOptions": { "composite": true },
+  "include": ["src", "../shared/**/*.ts"]
+}
+```
+
+The `include` above reaches outside the project. Under `composite`, that fails with an error like "File is not listed within the file list of project", because each project must own its inputs.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** two or more apps share contracts or UI, when a change often spans front and back end, or when you want one source of truth for tooling.
+
+> 🚫 **When not to.** A single app does not need workspaces. Resist splitting into ten packages "for cleanliness": each package adds config, a build edge, and an indirection. Split when a real second consumer exists or when a boundary must be enforced.
+
+## How it connects
+
+> 🔗 **Connection.** The layering rules come from [Chapter 90](/chapter/90), the packaging mechanics from [Chapter 92](/chapter/92), and the shared-schema idea from [Chapter 32](/chapter/32) and [Chapter 64](/chapter/64). [Chapter 95](/chapter/95) explains why project references make type-checking faster, and the capstone ([Chapter 98](/chapter/98)) uses exactly this layout.
+
+> 🌍 **Real world.** Large TypeScript codebases such as the React, Babel, and Vite repositories are monorepos with workspaces and a task runner. Companies with huge repos add remote caching and affected-only CI.
+
+## Exercises
+
+### Level 1 — Recall
+
+Draw the package graph for the capstone monorepo layout (`apps/web`, `apps/api`, `packages/contracts`, `packages/domain`, `packages/ui`, `packages/tokens`, `packages/config`). Use arrows for "depends on", and mark any arrow that must never exist.
+
+### Level 2 — Application
+
+Extract TaskFlow's request and response schemas into `packages/contracts`, with types inferred from the schemas. Make both apps import from `@taskflow/contracts`, and delete the duplicated `Task` interfaces. Rename a field in the contract and show that both apps fail to compile until updated.
+
+### Level 3 — Challenge
+
+Configure project references so that editing `contracts` re-checks only its dependents, and editing `apps/web` does not rebuild `apps/api`. Prove it with `tsc -b --verbose` output. *Hint: every referenced project needs `composite: true`, and the `references` must match the dependencies.*
+
+### Level 4 — Real-world
+
+**Ticket PLAT-12: Merge the TaskFlow API ([P07](/projects/p07)) and web app ([P14](/projects/p14)) into one monorepo.**
+
+- History from both repositories is preserved, and a single `pnpm install` works.
+- The duplicate `Task`/`User` types are replaced by `@taskflow/contracts`.
+- CI passes before and after, and runs only affected packages on a pull request.
+- A dependency rule fails CI if `apps/web` imports from `apps/api`.
+
+## Key takeaways
+
+- A monorepo makes sharing and atomic changes cheap, and boundaries **optional**, so you must make them explicit.
+- Workspaces link packages locally; internal packages can be source-shared (simple) or compiled (independent).
+- `composite` and `tsc -b` give incremental, dependency-ordered builds; references must mirror dependencies.
+- Put configs in packages and extend them, so there's one definition of "strict".
+- A contracts package holds wire-level schemas with inferred types, and nothing that couples to one side.
+- Task runners with caching run only what changed; lint and dependency rules enforce the boundaries.
+
+## What comes next
+
+As the monorepo grows, type-checking becomes the slowest step: 90 seconds, an editor that freezes on hover. Next you'll learn to measure *why*, and how to fix it: [Chapter 95: TypeScript at Scale: Compiler & Type-Checking Performance](/chapter/95).

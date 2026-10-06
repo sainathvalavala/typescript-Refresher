@@ -1,0 +1,411 @@
+> 📖 **The problem.** TaskFlow's task list loads from the server. The component's state is a tidy-looking object: `{ isLoading: boolean; error: Error | null; data: Task[] | null }`. It looks fine, until you count. Three fields give **eight** combinations, and only three of them make sense: loading, failed, or loaded. A bug ships where `isLoading` and `error` are both set, so the screen shows a spinner *and* an error banner, and the code that renders it has no idea which one to believe.
+
+The fix is not more `if` statements. It's to describe the data so the five nonsense combinations **cannot be written down at all**. That is what unions and intersections do. They are the "algebra" of types: a small set of operators (`|` for OR, `&` for AND) that let you combine types to say exactly what is allowed.
+
+This is the most important modeling chapter in the book. By the end, you'll replace boolean soup with discriminated unions, and you'll be able to read, design, and defend a union type.
+
+> 🧠 **Mental model.** **A union is OR (set union): a value is one of several alternatives. An intersection is AND (set intersection): a value satisfies all constraints at once.** The counterintuitive part: intersecting object types gives you *more* properties, because the values that satisfy both shapes are a smaller set, and a smaller set of values can be promised more.
+
+## 13.1 Union types
+
+A **union type** `A | B` means "a value of type `A` or a value of type `B`". You've already met it in `string | undefined`:
+
+```ts
+type Id = string | number;
+
+function show(id: Id): string {
+  return `#${id}`;
+}
+
+show("t1");   // ✅
+show(42);     // ✅
+show(true);   // ❌ Argument of type 'boolean' is not assignable to parameter of type 'Id'.
+```
+
+Here is the rule people forget: **with a union, you can only do what is valid for *every* member.** The compiler can't know which one you have, so it allows only what's safe for all:
+
+```ts
+function shout(id: string | number) {
+  id.toString();        // ✅ both string and number have toString()
+  id.toUpperCase();     // ❌ Property 'toUpperCase' does not exist on type 'string | number'.
+                        //      Property 'toUpperCase' does not exist on type 'number'.
+}
+```
+
+Reading that error bottom-up ([Chapter 5](/chapter/5)): `number` has no `toUpperCase`, so the union can't promise it. To use something specific to one member, you first **narrow** the union with a check:
+
+```ts
+function shout(id: string | number) {
+  if (typeof id === "string") {
+    return id.toUpperCase();   // ✅ here id: string
+  }
+  return id.toFixed(0);        // ✅ here id: number
+}
+```
+
+Narrowing is the partner of unions, and [Chapter 14](/chapter/14) is entirely about it. Think of a union as a *question* the type asks you ("which one is it?"), and narrowing as your *answer*.
+
+> 💡 **Tip.** A union makes a type *less* capable (fewer safe operations) but *more* accepting (more allowed values). Keep both sides of that trade in mind.
+
+## 13.2 Literal unions
+
+You met literal unions in [Chapter 8](/chapter/8). They are unions whose members are single values, forming a **closed vocabulary**:
+
+```ts
+type TaskStatus = "todo" | "doing" | "done";
+type Priority = 1 | 2 | 3;
+type Flag = true | false;      // this is exactly what boolean is
+
+let status: TaskStatus = "todo";
+status = "blocked";            // ❌ Type '"blocked"' is not assignable to type 'TaskStatus'.
+```
+
+Unions also **compose**. A union of unions flattens into one larger union, and repeated members collapse:
+
+```ts
+type OpenStatus = "todo" | "doing";
+type ClosedStatus = "done" | "archived";
+
+type AnyStatus = OpenStatus | ClosedStatus;
+// AnyStatus: "todo" | "doing" | "done" | "archived"
+
+type Mixed = "a" | "b" | ("b" | "c");
+// Mixed: "a" | "b" | "c"      (the duplicate "b" collapses)
+```
+
+This is a pleasant way to build vocabulary in layers. Each small union has a meaning, and bigger ones are assembled from them:
+
+```ts
+type Role = "admin" | "editor" | "viewer";
+type CanEdit = Extract<Role, "admin" | "editor">;   // "admin" | "editor"  (Chapter 21)
+
+function canEdit(role: Role): role is CanEdit {
+  return role === "admin" || role === "editor";
+}
+```
+
+(Don't worry about `Extract` or the `role is CanEdit` return type yet. They come in [Chapter 21](/chapter/21) and [Chapter 14](/chapter/14). The point is that unions combine like building blocks.)
+
+## 13.3 Intersection types
+
+An **intersection** `A & B` means "a value that is both `A` and `B` at the same time". For object types, that means a value that has the properties of *both*:
+
+```ts
+type HasId = { id: string };
+type HasTimestamps = { createdAt: string; updatedAt: string };
+
+type Entity = HasId & HasTimestamps;
+// Entity: { id: string; createdAt: string; updatedAt: string }
+
+const entity: Entity = {
+  id: "t1",
+  createdAt: "2026-01-01",
+  updatedAt: "2026-01-02",
+};
+
+const incomplete: Entity = { id: "t1" };
+// ❌ Type '{ id: string; }' is not assignable to type 'Entity'.
+//      Property 'createdAt' is missing in type '{ id: string; }' but required in type 'HasTimestamps'.
+```
+
+Intersections are how you **compose shapes** from reusable pieces, much like mixing in behavior. Notice the surprise: `Entity` has *more* properties than either input. Section 13.4 explains why that isn't a contradiction.
+
+What happens when the two sides can't both be true? For incompatible primitives, nothing can satisfy both, so the result is the empty type, `never`:
+
+```ts
+type Impossible = string & number;   // never: no value is both a string and a number
+
+type Conflict = { a: string } & { a: number };
+const c: Conflict = { a: "x" };
+// ❌ Type 'string' is not assignable to type 'never'.
+//    property 'a' is now string AND number, which is never
+```
+
+When an intersection quietly produces `never` for a property, it's a design smell. You merged two shapes that disagree. Don't use `&` to *override* a property; build a new type instead ([Chapter 21](/chapter/21) shows `Omit`).
+
+## 13.4 The set view
+
+Remember from [Chapter 6](/chapter/6): a type is a **set of values**. With that picture, the strange-looking behavior of `|` and `&` becomes obvious.
+
+Take two *primitive* sets of values:
+
+```text
+  string = { "a", "b", "hello", ... }         number = { 0, 1, 2.5, ... }
+
+  string | number  =  everything in EITHER set    (a bigger set)
+  string & number  =  everything in BOTH sets     (no overlap: empty, so never)
+```
+
+Union makes the set **bigger**: more values are allowed. But a bigger set means you know *less* about any one value, so you can do *less* with it. That's why a union gives you fewer operations.
+
+Now the part that confuses everyone: object types. An object type describes the set of all values that **have at least these properties**:
+
+```text
+  { name: string }                  all objects that have a name   (a big set)
+  { age: number }                   all objects that have an age   (a big set)
+
+  { name: string } & { age: number }
+                                    objects that have a name AND an age (a smaller set)
+```
+
+A value must satisfy *both* conditions to be in the intersection, so fewer values qualify (a *smaller* set). But because each member is guaranteed to have both properties, you can read **more** properties. A smaller set of values, more known facts about each one.
+
+```text
+   values that have a name         values that have an age
+  ┌───────────────────────┐       ┌───────────────────────┐
+  │                   ┌───┴───────┴───┐                   │
+  │                   │ name AND age  │                   │
+  │                   │ (Named & Aged)│                   │
+  │                   └───┬───────┬───┘                   │
+  └───────────────────────┘       └───────────────────────┘
+        the overlap is smaller than either circle,
+        but each value in it has both properties
+```
+
+You can see it in code. Assigning a value to a *wider* type is always fine, because the set grows; going the other way isn't:
+
+```ts
+type Named = { name: string };
+type Aged = { age: number };
+type Person = Named & Aged;
+
+declare const person: Person;
+const n: Named = person;   // ✅ every Person is a Named (a smaller set sits inside a bigger one)
+const p: Person = n;       // ❌ Type 'Named' is not assignable to type 'Person'.
+                           //      Property 'age' is missing in type 'Named' but required in type 'Aged'.
+
+// Unions go the other way: each member fits inside the union.
+const id: string | number = "t1";   // ✅ "t1" is in the union set
+```
+
+> 🧠 **Mental model.** **Union: bigger set, fewer guarantees. Intersection: smaller set, more guarantees.** When an assignment fails, ask which set must fit inside which.
+
+## 13.5 Discriminated unions
+
+Here is the most important modeling tool in this book. Suppose a request can be in one of three states, and each state carries different data. A **discriminated union** is a union of object types that **share one property with a literal type**: a *tag*, called the discriminant.
+
+```ts
+type RequestState =
+  | { status: "loading" }
+  | { status: "error"; error: Error }
+  | { status: "success"; data: Task[] };
+```
+
+The tag is `status`. Each member has a *different literal* in that slot (`"loading"`, `"error"`, `"success"`), and each carries only the fields that make sense for it. Now watch what a check on the tag does:
+
+```ts
+function render(state: RequestState): string {
+  state.data;                      // ❌ Property 'data' does not exist on type 'RequestState'.
+                                   //      Property 'data' does not exist on type '{ status: "loading"; }'.
+
+  if (state.status === "success") {
+    return `${state.data.length} tasks`;     // ✅ state: { status: "success"; data: Task[] }
+  }
+  if (state.status === "error") {
+    return state.error.message;              // ✅ state: { status: "error"; error: Error }
+  }
+  return "Loading…";                         // ✅ state: { status: "loading" }
+}
+```
+
+Testing the tag **narrows** the whole object to the matching member ([Chapter 14](/chapter/14) shows the machinery). Inside each branch, you can read exactly the fields that exist there. Outside, you can't read `data` at all, because it might not exist. That is the type system mirroring reality.
+
+Any shared literal property can be the tag. The common names are `kind`, `type`, and `status`:
+
+```ts
+type Shape =
+  | { kind: "circle"; radius: number }
+  | { kind: "rectangle"; width: number; height: number };
+
+function area(shape: Shape): number {
+  switch (shape.kind) {
+    case "circle": return Math.PI * shape.radius ** 2;
+    case "rectangle": return shape.width * shape.height;
+  }
+}
+```
+
+For the discriminant to work, the property must be a **literal type** (`"circle"`), not a plain `string`. A `kind: string` tells the compiler nothing about which fields exist:
+
+```ts
+type Broken = { kind: string; radius: number } | { kind: string; width: number };
+declare const b: Broken;
+if (b.kind === "circle") {
+  b.radius;   // ❌ Property 'radius' does not exist on type 'Broken'.
+              //      Property 'radius' does not exist on type '{ kind: string; width: number; }'.
+}
+```
+
+## 13.6 Making illegal states unrepresentable
+
+Back to the opening problem. Here is the "boolean soup" version of the request state:
+
+```ts
+type TaskListState = {
+  isLoading: boolean;
+  error: Error | null;
+  data: Task[] | null;
+};
+
+// Two booleans-ish fields and one nullable: 2 × 2 × 2 = 8 combinations.
+const ok1: TaskListState = { isLoading: true,  error: null,         data: null };          // loading ✅
+const ok2: TaskListState = { isLoading: false, error: new Error(), data: null };          // failed ✅
+const ok3: TaskListState = { isLoading: false, error: null,        data: [] };            // loaded ✅
+const bug: TaskListState = { isLoading: true,  error: new Error(), data: [] };            // ❓ all three at once
+const bug2: TaskListState = { isLoading: false, error: null,       data: null };          // ❓ nothing at all
+// Every one of these compiles. Only three are meaningful.
+```
+
+Every consumer must re-derive the real state from the flags (`if (isLoading) ... else if (error) ...`) and agree with every other consumer about the order. The type isn't helping, it is just *allowing* things.
+
+The refactor: **list the states that actually exist**, and give each exactly the data it needs. The result is the discriminated union from 13.5:
+
+```ts
+type TaskListState =
+  | { status: "loading" }
+  | { status: "error"; error: Error }
+  | { status: "success"; data: Task[] };
+
+const a: TaskListState = { status: "loading" };                          // ✅
+const b: TaskListState = { status: "error", error: new Error("boom") };  // ✅
+const c: TaskListState = { status: "success", data: [] };                // ✅
+
+const bad1: TaskListState = { status: "loading", data: [] };
+// ❌ Object literal may only specify known properties, and 'data' does not exist in type '{ status: "loading"; }'.
+const bad2: TaskListState = { status: "success" };
+// ❌ Type '{ status: "success"; }' is not assignable to type 'TaskListState'.
+//      Property 'data' is missing in type '{ status: "success"; }' but required in type '{ status: "success"; data: Task[]; }'.
+```
+
+Count again: three states, three types, **zero** nonsense combinations. The "loading *and* error" bug is no longer a bug in your code. It's a type error you *cannot ship*.
+
+The principle is called **making illegal states unrepresentable**. Instead of writing runtime checks that guard against bad states, you design types in which the bad states don't exist. The payoff compounds: fewer tests, fewer defensive `if`s, and fewer invariants living only in people's heads.
+
+```ts
+function render(state: TaskListState): string {
+  switch (state.status) {
+    case "loading": return "Loading…";
+    case "error":   return `Failed: ${state.error.message}`;   // error is guaranteed here
+    case "success": return `${state.data.length} tasks`;       // data is guaranteed here
+  }
+}
+```
+
+No `!`, no `?.`, and no "how can `data` be `null` here?" The same pattern is the backbone of UI state ([Chapter 52](/chapter/52)), reducer actions ([Chapter 55](/chapter/55)), and API results ([Chapter 61](/chapter/61)).
+
+> ⚠️ **Common mistake.** Reaching for an object with every field optional: `{ error?: Error; data?: Task[]; loading?: boolean }`. It's the soup in a different bowl, because every combination is still legal.
+
+## 13.7 Designing union types
+
+Writing the union is easy. Designing a *good* one is a skill. Four decisions come up repeatedly.
+
+**1. Choose the discriminant.** Pick a property that already exists in the domain, with a short, stable set of literal values: `status`, `kind`, `type`. Use the same name across your codebase so readers recognize it.
+
+**2. Keep it flat.** Put the tag and the variant's fields on one object. Nesting the data in a second level adds ceremony without safety:
+
+```ts
+// ✅ Flat: one check narrows everything
+type Event =
+  | { type: "taskCreated"; taskId: string; title: string }
+  | { type: "taskDeleted"; taskId: string };
+
+// 😬 Nested: two levels to read, and nothing forces `payload` to match `type`
+type Event2 = { type: "taskCreated" | "taskDeleted"; payload: { taskId: string; title?: string } };
+```
+
+**3. Share common fields with an intersection, not copy-paste.** If every state also has an `id`, put it in once:
+
+```ts
+type Base = { id: string; updatedAt: string };
+type Lifecycle =
+  | (Base & { status: "draft" })
+  | (Base & { status: "active"; assignee: string })
+  | (Base & { status: "done"; completedAt: string });
+```
+
+**4. Union of objects versus object of unions.** Compare two models of a payment:
+
+```ts
+// An object of unions: independent fields, every combination allowed
+type PaymentLoose = {
+  method: "card" | "bank";
+  cardNumber?: string;     // only meaningful for "card"
+  iban?: string;           // only meaningful for "bank"
+};
+
+// A union of objects: each method carries exactly its own fields
+type Payment =
+  | { method: "card"; cardNumber: string }
+  | { method: "bank"; iban: string };
+```
+
+`PaymentLoose` allows `{ method: "card", iban: "..." }` and forces `?` checks everywhere. `Payment` makes the connection between `method` and its fields part of the type. Reach for the **union of objects** whenever one field determines which others exist. An object of unions is fine when the fields really are independent (for example, `size: "s" | "m" | "l"` and `color: "red" | "blue"` can be combined freely).
+
+> 🚫 **When not to.** Don't use a union when the variants share all their fields and differ only in value. `{ status: "todo" | "done"; title: string }` is a single object with a literal-union field, and that's simpler.
+
+## Common mistakes
+
+> ⚠️ **"Optional everything" objects instead of unions.** `{ data?: ...; error?: ... }` allows every combination. If fields depend on a state, model the states.
+
+> ⚠️ **Discriminants that aren't literal types.** `kind: string` can't narrow anything. Use `kind: "circle"`.
+
+> ⚠️ **Using intersections to merge conflicting properties.** `{ a: string } & { a: number }` gives `a: never`. Build a new type or use `Omit` ([Chapter 21](/chapter/21)).
+
+> ⚠️ **Forgetting that union members share only common operations.** If you need a member-specific field, narrow first.
+
+> ⚠️ **Thinking intersection narrows the property list.** It does the opposite: the *set of values* shrinks and the *known properties* grow.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** data comes in a few distinct shapes (loading, error, success), when one field decides which other fields exist, or when you want the compiler to enforce an invariant that currently lives in comments and `if`s.
+
+> 🚫 **When not to.** One shape with a literal-union field is simpler than a union of objects. And an intersection is for *combining* compatible pieces. Don't use it to "override" a property.
+
+## How it connects
+
+> 🔗 **Connection.** The next chapter, [Chapter 14](/chapter/14), is the other half: **narrowing** is how you consume a union safely, including exhaustiveness checks. Discriminated unions power UI state ([Chapter 52](/chapter/52)), reducer actions ([Chapter 55](/chapter/55)), API errors ([Chapter 61](/chapter/61)), and discriminated component props ([Chapter 85](/chapter/85)).
+
+> 🌍 **Real world.** Redux actions, GraphQL result types, Rust's `enum`, and Swift's enums with associated values are all this same idea. TanStack Query's result object is a discriminated union on `status`.
+
+## Exercises
+
+### Level 1 — Recall
+
+Rewrite each boolean-flag object as a discriminated union. For each, list the illegal combinations your version eliminates.
+
+```ts
+type Upload = { isUploading: boolean; progress: number | null; url: string | null; failed: boolean };
+type Session = { isLoggedIn: boolean; user: User | null; isGuest: boolean };
+type Modal = { isOpen: boolean; isClosing: boolean; content: string | null };
+```
+
+### Level 2 — Application
+
+Model payment methods: **card** (number, expiry, CVC), **bank transfer** (IBAN, account holder), and **wallet** (provider such as `"apple"` or `"google"`, and a token). Each variant must have its own required fields. Write a function `describePayment(p: Payment): string` that returns a one-line summary and compiles with no `!` and no `?.`.
+
+### Level 3 — Challenge
+
+Model a traffic light's states **and** its allowed transitions (green to yellow to red to green) so that an invalid transition doesn't type-check. For example, `next(red)` must return a green light, and a function `toGreen(light)` must only accept a red light.
+
+*Hint: give each state its own type and express the transition as a function type from one state to the next.*
+
+### Level 4 — Real-world
+
+**Ticket TF-013: Task lifecycle.** TaskFlow tasks move through `draft`, then `active`, then `blocked`, then `done`, then `archived`. Right now `Task` has optional `assignee`, `blockedReason`, `completedAt`, and `archivedAt` fields, and bugs keep appearing (a blocked task with no reason, an archived task without a date).
+
+- Model the lifecycle as a discriminated union where each state requires the data that state needs (for example, `blocked` must have a reason; `done` must have `completedAt`).
+- Share the common fields (`id`, `title`, `projectId`) without copy-paste.
+- Write `canComplete(task)` that accepts only the states from which completion is legal.
+- Include a short list of three illegal states your type rejects, with the compiler errors.
+
+## Key takeaways
+
+- A union `A | B` is OR: a bigger set of values, but you can only use what *every* member supports until you narrow.
+- An intersection `A & B` is AND: a smaller set of values, with the properties of both. Conflicting properties become `never`.
+- A **discriminated union** (a shared literal tag) is the central modeling tool: check the tag, and the compiler knows the rest.
+- **Make illegal states unrepresentable.** Replace boolean-and-nullable flags with a union listing exactly the states that exist.
+- Design unions flat, tag them with a literal property, and use a union of objects (not an object of unions) when one field determines the others.
+
+## What comes next
+
+A union asks "which one is it?", and you've seen `typeof` and a `status` check answer it. But there are many more ways to answer: truthiness, `in`, `instanceof`, custom guards, even throwing. And once you've handled every case, the compiler can prove you did. [Chapter 14: Narrowing & Control-Flow Analysis](/chapter/14) is how you turn "it could be any of these" into "it is this one".

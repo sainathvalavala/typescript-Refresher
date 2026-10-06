@@ -1,0 +1,448 @@
+> 📖 **The problem.** TaskFlow has an `/admin` page. The sidebar hides the "Admin" link from normal users, the route redirects when `user.isAdmin` is false, and everyone agrees it is "protected". Then a teammate types `/admin` into the address bar during the half second before the user has loaded, and sees the whole page flash. A different teammate opens the network tab, notices the delete-project request includes `{"isAdmin": true}` in the body, copies it with `curl`, and deletes a project that is not theirs. The API believed the flag, because the client sent it.
+
+Both bugs come from the same confusion: treating the *interface* as the *lock*. Authentication and authorization are two different questions, and answering either one in the browser alone is answering it for the honest user only. This chapter models the signed-in user so the "I do not know yet" moment is a real state, builds `useAuth` and protected routes, models permissions as types, and then says clearly what none of that protects.
+
+> 🧠 **Mental model.** **Authentication answers "who are you?"; authorization answers "what may you do?".** The UI can **hide** things for usability, but only the server can **forbid** them. Anything on the client is a suggestion to a cooperative user.
+
+## 65.1 Authentication concepts
+
+**Authentication** (sometimes "authn") establishes identity: the person proves who they are, usually with a password, a passkey, or a third-party login. After that, every later request needs to *carry* proof of that identity, because HTTP forgets everyone between requests. There are two common ways to carry it:
+
+| | **Session** | **Token (e.g. JWT)** |
+|---|---|---|
+| What the browser holds | An opaque session ID | A signed token with claims inside |
+| Where the truth lives | A session store on the server | The token itself, verified by signature |
+| Revoking access | Delete the session: instant | Hard: wait for expiry, or keep a deny list |
+| Scaling | Needs a shared store | Stateless verification |
+| Typical transport | Cookie | `Authorization` header, or a cookie |
+
+Neither is "the secure one"; they trade revocation against statelessness. For a web app with its own backend, a **server-side session in a cookie** is usually the simplest and safest default.
+
+Tokens expire for good reasons, so long-lived logins use a **refresh** flow: a short-lived *access* token (minutes) plus a longer-lived *refresh* token that can mint a new access token without asking for the password again.
+
+```ts
+// What the client sees in a token-based flow
+type LoginResponse = {
+  accessToken: string;   // expires in ~15 minutes
+  refreshToken: string;  // expires in days; used only to get new access tokens
+  expiresIn: number;     // seconds
+};
+
+// What the client sees in a session-based flow: nothing but the cookie the browser stored.
+// The response body is just the user.
+type SessionLoginResponse = { user: User };
+```
+
+> 🔗 **Connection.** Parsing the login response is the same boundary work as [Chapter 61](/chapter/61): validate with a schema, never `as` it.
+
+## 65.2 Where credentials live
+
+The browser gives you three places to keep a credential, and they are not equally safe:
+
+- **`localStorage` / `sessionStorage`**: readable by any JavaScript on the page. If an attacker ever injects a script (**XSS**, cross-site scripting), they can read the token and use it from anywhere.
+- **Memory** (a variable or React state): cleared on refresh, still reachable by injected script, but not persisted.
+- **An `httpOnly` cookie**: set by the server and *invisible to JavaScript*. A script cannot read it; the browser attaches it to requests automatically.
+
+```ts
+// Server: the Set-Cookie header decides what the browser may do with the cookie
+// Set-Cookie: sid=9f2c...; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400
+//   HttpOnly      → document.cookie cannot see it
+//   Secure        → only sent over HTTPS
+//   SameSite=Lax  → not sent on most cross-site requests (CSRF defense)
+```
+
+```ts
+// Client: you never touch the credential. You just ask the browser to send cookies.
+const res = await fetch("/api/me", { credentials: "include" });
+
+// ❌ The anti-pattern: a token you wrote with your own script is a token any script can read.
+localStorage.setItem("token", token);
+const stolen = localStorage.getItem("token"); // anything running on the page can do this too
+```
+
+The trade-off: cookies sent automatically introduce **CSRF** (cross-site request forgery), where another site tricks the browser into making a request with your cookie. `SameSite` cookies and anti-CSRF tokens address that. Storage-based tokens are immune to CSRF but exposed to XSS. A strict Content Security Policy and careful output escaping reduce XSS either way. The practical default for a first-party app: **httpOnly, Secure, SameSite cookie for the session, and never put the credential in storage.**
+
+> ⚠️ **Common mistake.** Putting the *user object* in `localStorage` to "stay logged in" and trusting it on load. It is user-editable text. Treat it, at most, as a hint to show a skeleton while `/me` is checked with the server.
+
+## 65.3 Auth state as a discriminated union
+
+On first load, the app does not know whether the user is signed in until it asks the server (`GET /me`). That moment is real, and it is the source of the flash from the opening story. If auth state is `User | null`, "not loaded yet" and "definitely signed out" are both `null`, and a guard cannot tell them apart. Give each situation its own state:
+
+```ts
+type User = {
+  id: string;
+  name: string;
+  email: string;
+  role: Role;
+};
+
+type AuthState =
+  | { status: "loading" }                       // asking the server who we are
+  | { status: "anonymous" }                     // the server said: nobody
+  | { status: "authenticated"; user: User };    // the server said: this person
+```
+
+Only the `authenticated` member has a `user`, so you cannot read `state.user` without proving that you are signed in first:
+
+```tsx
+function Greeting({ auth }: { auth: AuthState }) {
+  auth.user;
+  // ❌ Property 'user' does not exist on type 'AuthState'. Property 'user' does not exist on type '{ status: "loading"; }'.
+
+  switch (auth.status) {
+    case "loading":
+      return <Spinner />;
+    case "anonymous":
+      return <a href="/login">Sign in</a>;
+    case "authenticated":
+      return <span>Hi, {auth.user.name}</span>; // ✅ user exists here
+  }
+}
+```
+
+Compare this with the boolean version, `{ isLoading: boolean; user: User | null }`, which allows `{ isLoading: true, user: someUser }` and `{ isLoading: false, user: null }` without distinction between "anonymous" and "error". The union makes the three real situations the only possible ones, and the `switch` is checked for exhaustiveness.
+
+## 65.4 AuthProvider and useAuth
+
+Many components need the auth state, so it lives in context. [Chapter 54](/chapter/54) gave you the safe pattern: the context's default is `null`, and one custom hook turns "no provider" into a loud error instead of a silent lie.
+
+```tsx
+import { createContext, use, useCallback, useEffect, useMemo, useState } from "react";
+
+type AuthContextValue = {
+  state: AuthState;
+  signIn: (credentials: { email: string; password: string }) => Promise<void>;
+  signOut: () => Promise<void>;
+};
+
+const AuthContext = createContext<AuthContextValue | null>(null);
+
+export function useAuth(): AuthContextValue {
+  const value = use(AuthContext);
+  if (value === null) throw new Error("useAuth must be used inside <AuthProvider>");
+  return value; // never null for callers
+}
+```
+
+The provider asks the server who the user is, once, on mount, and moves from `loading` to one of the other two states:
+
+```tsx
+export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [state, setState] = useState<AuthState>({ status: "loading" });
+
+  useEffect(() => {
+    const controller = new AbortController();
+    fetchMe(controller.signal) // validated: Promise<User | null>, null on 401
+      .then((user) => setState(user ? { status: "authenticated", user } : { status: "anonymous" }))
+      .catch(() => {
+        if (!controller.signal.aborted) setState({ status: "anonymous" });
+      });
+    return () => controller.abort();
+  }, []);
+
+  const signIn = useCallback(async (credentials: { email: string; password: string }) => {
+    const user = await login(credentials); // throws ApiError on bad credentials
+    setState({ status: "authenticated", user });
+  }, []);
+
+  const signOut = useCallback(async () => {
+    await logout();
+    setState({ status: "anonymous" });
+  }, []);
+
+  const value = useMemo(() => ({ state, signIn, signOut }), [state, signIn, signOut]);
+  return <AuthContext value={value}>{children}</AuthContext>;
+}
+```
+
+Inside protected areas, repeatedly checking `status === "authenticated"` is tedious. A second hook asserts it once, and returns a `User` that is not optional:
+
+```tsx
+export function useCurrentUser(): User {
+  const { state } = useAuth();
+  if (state.status !== "authenticated") {
+    throw new Error("useCurrentUser used outside an authenticated route");
+  }
+  return state.user; // narrowed: User
+}
+```
+
+Because the route guard in 65.5 guarantees that this hook only runs for signed-in users, the throw documents an invariant: if it ever fires, a route is misconfigured, which is a bug worth seeing immediately.
+
+> 🆕 **Modern note.** In React 19, `<AuthContext value={...}>` is the provider itself (no `.Provider`), and `use(AuthContext)` can read context. `useContext(AuthContext)` still works.
+
+## 65.5 Protected routes and redirects
+
+A **route guard** is a layout route that renders the child routes only when the user may see them. With React Router v7, that is a component returning `<Outlet />` or a `<Navigate />`. It uses all three auth states, which is how the flash from the opening story disappears: while `loading`, it renders neither the page nor a redirect.
+
+```tsx
+import { Navigate, Outlet, useLocation } from "react-router";
+
+export function RequireAuth() {
+  const { state } = useAuth();
+  const location = useLocation();
+
+  switch (state.status) {
+    case "loading":
+      return <FullPageSpinner />; // don't redirect yet, and don't reveal the page
+    case "anonymous":
+      return (
+        <Navigate
+          to="/login"
+          replace
+          state={{ from: location.pathname + location.search }} // remember where they were going
+        />
+      );
+    case "authenticated":
+      return <Outlet />;
+  }
+}
+```
+
+Mount it once above every protected route, so no page can forget to opt in:
+
+```tsx
+const router = createBrowserRouter([
+  { path: "/login", element: <LoginPage /> },
+  {
+    element: <RequireAuth />, // everything below needs a signed-in user
+    children: [
+      { path: "/", element: <BoardPage /> },
+      { path: "/projects/:projectId", element: <ProjectPage /> },
+    ],
+  },
+]);
+```
+
+After sign-in, return the user to where they were headed. `location.state` is typed `any` in the router, so treat it as untrusted and narrow it. It also guards against a crafted value sending the user to another site (an **open redirect**):
+
+```tsx
+function safeRedirectTarget(state: unknown): string {
+  if (typeof state === "object" && state !== null && "from" in state) {
+    const from = (state as { from: unknown }).from;
+    // must be an app-relative path: starts with "/" but not "//" (which would be another host)
+    if (typeof from === "string" && from.startsWith("/") && !from.startsWith("//")) return from;
+  }
+  return "/";
+}
+
+function LoginPage() {
+  const { signIn } = useAuth();
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  async function onSubmit(credentials: { email: string; password: string }) {
+    await signIn(credentials);
+    navigate(safeRedirectTarget(location.state), { replace: true });
+  }
+  // ...form from Chapter 63
+}
+```
+
+> ⚠️ **Common mistake.** Redirecting while `loading`. Every refresh of a deep link then sends signed-in users to `/login` for a moment, and "return to where you were" never works because the destination was lost.
+
+## 65.6 Modeling authorization
+
+Once the user is known, the next question is what they may do. The naive model, `user.isAdmin`, is a boolean that cannot grow. The next step is **roles** (a job in the system) and **permissions** (a specific action on a resource), with roles *granting* permissions. Define the whole table once, as data, and let types fall out of it ([Chapter 20](/chapter/20)):
+
+```ts
+export const ROLE_PERMISSIONS = {
+  viewer: ["task:read", "project:read"],
+  member: ["task:read", "task:create", "task:update", "project:read"],
+  admin:  ["task:read", "task:create", "task:update", "task:delete", "project:read", "project:update"],
+  owner:  ["task:read", "task:create", "task:update", "task:delete", "project:read", "project:update", "project:delete"],
+} as const satisfies Record<string, readonly string[]>;
+
+export type Role = keyof typeof ROLE_PERMISSIONS;
+// "viewer" | "member" | "admin" | "owner"
+
+export type Permission = (typeof ROLE_PERMISSIONS)[Role][number];
+// "task:read" | "task:create" | ... | "project:delete"
+```
+
+Adding a role or permission is one edit to the table, and `Role` and `Permission` update themselves. The permission strings follow a `resource:action` convention, which template literal types ([Chapter 24](/chapter/24)) can generate or check when you would rather list resources and actions separately:
+
+```ts
+type Resource = "task" | "project";
+type Action = "read" | "create" | "update" | "delete";
+type AnyPermission = `${Resource}:${Action}`; // 8 combinations
+// ROLE_PERMISSIONS values can then be checked against AnyPermission with satisfies
+```
+
+Now `can` is a small, total, typed function:
+
+```ts
+export function can(user: Pick<User, "role">, permission: Permission): boolean {
+  const granted: readonly Permission[] = ROLE_PERMISSIONS[user.role];
+  return granted.includes(permission);
+}
+
+can(user, "task:delete");  // ✅
+can(user, "task:remove");  // ❌ Argument of type '"task:remove"' is not assignable to parameter of type '"task:read" | "task:create" | ...'.
+```
+
+In a component, `can` decides what to *show*:
+
+```tsx
+function TaskActions({ task }: { task: Task }) {
+  const user = useCurrentUser();
+  return (
+    <>
+      {can(user, "task:update") && <button>Edit</button>}
+      {can(user, "task:delete") && <button>Delete</button>}
+    </>
+  );
+}
+```
+
+Remember what this is: a rendering convenience. 65.8 says what it is not.
+
+## 65.7 401 and 403 in the API client
+
+The two status codes sound alike and mean opposite things:
+
+- **`401 Unauthorized`** really means *unauthenticated*: "I do not know who you are", often because the session or token expired. The remedy is to **sign in again** (or refresh).
+- **`403 Forbidden`** means "I know exactly who you are, and the answer is no." Signing in again changes nothing. The remedy is to **explain**, not to log out.
+
+Both arrive through the `ApiError` union from [Chapter 61](/chapter/61), so the client can handle them in one place, once, instead of every screen reinventing it. For 401, try to refresh a single time, retry the original request, and if that fails, force a sign-out:
+
+```ts
+let refreshing: Promise<boolean> | null = null; // share one refresh among concurrent 401s
+
+async function refreshSession(): Promise<boolean> {
+  refreshing ??= fetch("/api/auth/refresh", { method: "POST", credentials: "include" })
+    .then((res) => res.ok)
+    .catch(() => false)
+    .finally(() => { refreshing = null; });
+  return refreshing;
+}
+
+export async function authedRequest(
+  path: string,
+  init: RequestInit,
+  onForcedSignOut: () => void,
+): Promise<Response> {
+  const send = () => fetch(path, { ...init, credentials: "include" });
+
+  let res = await send();
+  if (res.status === 401) {
+    const refreshed = await refreshSession();
+    if (refreshed) res = await send(); // retry exactly once
+    if (!refreshed || res.status === 401) {
+      onForcedSignOut();               // session is gone: AuthProvider sets { status: "anonymous" }
+    }
+  }
+  return res; // a 403 passes through untouched: the caller shows "no access"
+}
+```
+
+The `refreshing` variable matters. Five requests that fail at the same moment would otherwise fire five refreshes, and with rotating refresh tokens, four of them would invalidate each other. One shared promise means one refresh.
+
+On the UI side, a 403 is a *state* of a page, rendered like any error:
+
+```tsx
+function ErrorView({ error }: { error: ApiError }) {
+  switch (error.kind) {
+    case "forbidden":
+      return <p>You don't have access to this project. Ask an owner to invite you.</p>;
+    case "unauthorized":
+      return <p>Your session ended. Please sign in again.</p>; // normally the client already redirected
+    default:
+      return <p>{describeError(error)}</p>;
+  }
+}
+```
+
+> 🚫 **When not to.** Do not log the user out on 403. It is correct for a viewer to be refused deleting a project; ending their session punishes them for a permission you never granted.
+
+## 65.8 UI authorization is not security
+
+Return to the opening story. `can(user, "task:delete")` hid a button. It did not stop anyone from sending a `DELETE /tasks/42` request, because requests do not need your buttons. Every check on the client runs on a machine the user controls: they can edit the JavaScript, change `localStorage`, flip a flag in devtools, or skip the browser entirely with `curl`. So:
+
+- The client **hides** things to keep the interface honest and uncluttered.
+- The server **forbids** things. It must re-check authentication *and* authorization on every request, using the identity it established itself (from the session), and never a value the client sent.
+
+```ts
+// ❌ Trusts the client: whoever sends "isAdmin": true is an admin
+app.delete("/projects/:id", async (req, res) => {
+  if (req.body.isAdmin) { await db.projects.delete(req.params.id); return res.sendStatus(204); }
+  res.sendStatus(403);
+});
+
+// ✅ Identity comes from the session, permission from the server's own table
+app.delete("/projects/:id", requireSession, async (req, res) => {
+  const user = req.user; // set by requireSession from the cookie, never from the body
+  if (!can(user, "project:delete")) return res.sendStatus(403);
+
+  const project = await db.projects.find(req.params.id);
+  if (!project || project.ownerId !== user.id) return res.sendStatus(404); // object-level check too
+  await db.projects.delete(project.id);
+  res.sendStatus(204);
+});
+```
+
+Two ideas hide in the second handler. First, the **same** `ROLE_PERMISSIONS` table and `can` function can be imported by both sides (as with shared schemas in [Chapter 64](/chapter/64)), so the rules cannot drift, but the *enforcement* only counts on the server. Second, permissions are not the whole story: "may delete projects" is not "may delete *this* project". Object-level checks (is the user a member of this project?) belong on the server too.
+
+> 🧠 **Mental model.** Think of the UI as a restaurant menu and the server as the kitchen. A menu that omits the secret dish makes customers less likely to ask for it. It does not stop someone who walks into the kitchen. Put the lock on the kitchen door.
+
+## Common mistakes
+
+> ⚠️ **Treating `null` as both "loading" and "signed out".** Guards redirect too early, and deep links break. Use a three-state union.
+
+> ⚠️ **Storing tokens in `localStorage`.** Any injected script can read them. Prefer an httpOnly, Secure, SameSite cookie.
+
+> ⚠️ **Trusting client-sent roles or flags.** `isAdmin: true` in a request body is an invitation. Derive identity and role on the server.
+
+> ⚠️ **Redirecting to an unvalidated `from`.** Check that it is an app-relative path, or you have built an open redirect.
+
+> ⚠️ **Logging out on 403.** `403` means "known and not allowed". Show an explanation.
+
+> ⚠️ **Checking permissions only in the UI.** The button is hidden; the endpoint is open.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** the app has signed-in users: a discriminated auth state, a safe `useAuth`, one route guard above all protected routes, and a shared permission table with a typed `can`.
+
+> 🚫 **When not to.** A tiny role set (signed-in versus not) does not need a permission matrix; a `role === "admin"` check in one place is simpler. And do not write your own password storage or token signing: use a managed identity provider or a vetted library, and keep your own code to the parts in this chapter.
+
+## How it connects
+
+> 🔗 **Connection.** The safe-context pattern is [Chapter 54](/chapter/54); the unions are [Chapter 13](/chapter/13); the permission table uses `as const` and `satisfies` from [Chapter 20](/chapter/20) and optionally template literals from [Chapter 24](/chapter/24). Route guards sit on top of [Chapter 59](/chapter/59). The 401/403 handling extends the `ApiError` union of [Chapter 61](/chapter/61). Testing sign-in and expiry flows appears in [Chapter 69](/chapter/69).
+
+> 🌍 **Real world.** Most teams delegate the hard parts: Auth0, Clerk, Cognito, or an open-source library handle credentials, MFA, and token rotation. Your app still needs the discriminated auth state, the guard, and server-side authorization on every endpoint.
+
+## Exercises
+
+### Level 1 — Recall
+
+Classify each as authentication or authorization: (1) checking a password, (2) a viewer trying to delete a task, (3) verifying a session cookie, (4) hiding the "Invite member" button, (5) rejecting an expired token, (6) checking that the user belongs to this project, (7) returning `401`, (8) returning `403`, (9) an SSO redirect, (10) "only owners may archive". For each, say whether the UI, the server, or both must perform it.
+
+### Level 2 — Application
+
+Implement a typed `useAuth()` backed by a discriminated `AuthState`, and a `RequireAuth` route guard that shows a spinner while loading, redirects anonymous users to `/login` with the original path, and renders the child routes when authenticated. After sign-in, return the user to where they were.
+
+### Level 3 — Challenge
+
+Given a role-to-permissions config object, generate the `Role` and `Permission` types from it, and make `can(user, permission)` reject permissions that do not exist. Then add a compile-time check that every `Permission` is granted to at least one role. *Hint: a type that maps over `Permission` and goes to `never` when no role includes it.*
+
+### Level 4 — Real-world
+
+**Ticket TF-520: Role-based access.** TaskFlow needs owner, admin, member, and viewer roles.
+
+- A single shared permission table drives both the UI (`can`) and the API middleware.
+- Viewers see no create, edit, or delete controls; members cannot delete projects.
+- The API returns `403` for every disallowed action, even when the request is sent without the UI, and tests prove it for each role.
+- A `401` triggers one refresh attempt, then a sign-out; a `403` shows an explanation and keeps the session.
+
+## Key takeaways
+
+- Authentication is "who?"; authorization is "what may they do?". Keep the questions, and the code, separate.
+- Keep credentials out of JavaScript's reach: httpOnly, Secure, SameSite cookies beat `localStorage`.
+- Model auth as `loading | anonymous | authenticated` so guards cannot confuse "unknown" with "signed out".
+- Build `useAuth` with the safe-context pattern, and guard routes in one layout route, with a validated return path.
+- Derive `Role` and `Permission` from one config object; type `can` against them.
+- `401` means sign in; `403` means no. And the UI only hides things: **the server enforces**.
+
+## What comes next
+
+Everything in Part X, from architecture to auth, now needs proof that it keeps working. The next part, [Chapter 66: What TypeScript Catches vs What Tests Catch](/chapter/66), gives you the layered safety model, then builds up to component and end-to-end tests that exercise exactly the flows you just wrote.

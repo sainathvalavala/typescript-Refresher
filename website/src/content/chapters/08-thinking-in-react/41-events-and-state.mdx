@@ -1,0 +1,396 @@
+> 📖 **The problem.** You write the most obvious counter in the world: `let count = 0`, and a button with `onClick={() => count++}`. You click it five times. The screen still says 0. You add a `console.log(count)` to the handler and it prints 1, 2, 3, 4, 5, so the variable *is* changing. React just doesn't seem to care. Every instinct from P09 says "the variable changed, so the screen should change", and React politely ignores it.
+
+This chapter explains what React needs instead of a variable, and why. The answer, **state**, is the engine behind every interactive thing you'll build. But state behaves differently from variables in a way that trips up almost everyone at first: inside a render, it never changes. Once you understand why, a whole family of "React is broken" moments turns into "of course".
+
+By the end, you'll be able to handle events, declare and update state, predict what a sequence of updates will produce, update objects and arrays without mutation, and control how events travel through the tree.
+
+> 🧠 **Mental model.** **State is a component's memory, and every render sees a snapshot of it.** Setting state doesn't change the snapshot you're holding. It asks React for a **new render**, which will receive a **new snapshot**.
+
+## 41.1 Responding to events
+
+You respond to user actions by passing a **handler** function to an event prop like `onClick`, `onChange`, or `onSubmit`. Handlers are usually defined inside the component, so they can see its props and state, and named `handleSomething` ([Chapter 39](/chapter/39)):
+
+```tsx
+function AddTaskButton() {
+  function handleClick() {
+    alert("Adding a task…");
+  }
+  return <button onClick={handleClick}>Add task</button>;
+}
+```
+
+The single most common beginner bug is the difference between **passing** a function and **calling** it. React wants the function itself, so it can call it later, when the click happens. Adding parentheses calls it immediately, during render, and passes whatever it returns:
+
+```tsx
+const a = <button onClick={handleClick}>Add</button>;   // ✅ React calls it on click
+const b = <button onClick={handleClick()}>Add</button>; // ❌ Type 'void' is not assignable to type 'MouseEventHandler<HTMLButtonElement> | undefined'.
+const c = <button onClick={() => onDelete(task.id)}>Delete</button>; // ✅ wrap it to pass arguments
+```
+
+TypeScript catches the second line here because `handleClick` returns nothing. When you need to pass an argument, like an id, wrap the call in an arrow function: the arrow is what gets passed, and it calls your function when the click happens.
+
+React calls every handler with an **event object**, a cross-browser wrapper around the native DOM event with the same familiar interface: `target`, `currentTarget`, `key`, `preventDefault()`. For inline handlers you don't write its type; TypeScript infers it from the prop:
+
+```tsx
+<input onChange={(e) => console.log(e.target.value)} />
+// e: React.ChangeEvent<HTMLInputElement>, so e.target.value is a string, no narrowing needed
+
+<input onKeyDown={(e) => { if (e.key === "Enter") addTask(); }} />
+// e: React.KeyboardEvent<HTMLInputElement>
+```
+
+Compare that with [Chapter 35](/chapter/35), where `e.target` was a bare `EventTarget | null`. React's event types know which element the handler is attached to. Typing handlers you define *separately* from the JSX is [Chapter 51](/chapter/51)'s job. And remember [Chapter 37](/chapter/37): event handlers are the natural home for side effects. They run because the user did something, not because React rendered.
+
+## 41.2 Why local variables don't work
+
+Back to the opening counter. Here it is in full, with what actually happens:
+
+```tsx
+export function TaskCounter() {
+  let count = 0;
+
+  function handleClick() {
+    count++;
+    console.log(count); // 1, 2, 3… the variable really does change
+  }
+
+  return <button onClick={handleClick}>Added: {count}</button>;
+}
+// The button says "Added: 0" forever.
+```
+
+There are two separate problems, and fixing just one isn't enough.
+
+**Changing a local variable doesn't trigger a render.** React doesn't watch your variables. Remember the three steps from [Chapter 37](/chapter/37): without a *trigger*, there's no render and no commit, so the screen keeps showing the old description.
+
+**Even if something else triggers a render, the variable starts over.** A render is a function call. When React calls `TaskCounter()` again, the first line runs again, and `count` is a brand-new variable set to `0`. Local variables don't survive between calls; that's what "local" means.
+
+Moving the variable outside the component, to module scope, "fixes" the second problem and creates two worse ones: it's impure (the component now changes something that existed before render), and every `TaskCounter` on the page would share the same count. What we need is memory that **survives renders**, **belongs to one component instance**, and **triggers a render** when it changes. That is precisely what `useState` provides.
+
+## 41.3 `useState`
+
+`useState` is a **hook**: a special function, imported from `react`, that lets a component use a React feature. It takes the initial value and returns a pair, which you unpack with array destructuring:
+
+```tsx
+import { useState } from "react";
+
+export function TaskCounter() {
+  const [count, setCount] = useState(0);
+  // count: number (inferred from the initial value)
+  // setCount: (value: number | ((prev: number) => number)) => void   (simplified)
+
+  return <button onClick={() => setCount(count + 1)}>Added: {count}</button>;
+}
+```
+
+The pair is the two things the counter was missing. `count` is the value React **remembered** for this component since the last render. `setCount` stores a new value **and triggers a re-render**. On the next render, `useState(0)` ignores the `0` (the initial value is only used the first time) and returns the stored value instead.
+
+The pair comes back as a tuple ([Chapter 7](/chapter/7)), so you name the parts whatever you like. The convention is `[thing, setThing]`. A component can have as many state variables as it needs, and each instance of a component gets **its own** state:
+
+```tsx
+function NewTaskForm() {
+  const [title, setTitle] = useState("");                         // title: string
+  const [tasks, setTasks] = useState(initialTasks);               // tasks: Task[]
+  const [selectedId, setSelectedId] = useState<string | null>(null); // nothing to infer from null
+  const [saved, setSaved] = useState(() => loadDraftsFromDisk()); // a function: runs only on the first render
+  // …
+}
+
+<TaskCounter />  // these two counters are completely independent
+<TaskCounter />
+```
+
+Most of the time inference is all you need. When the initial value doesn't describe every value the state will hold, as with `null` that will later be a string, pass the type argument, just as you did with `createList<Task>()` in [Chapter 16](/chapter/16). When computing the initial value is expensive, pass a **function** instead of a value, so it runs once rather than on every render. [Chapter 43](/chapter/43) explains how React knows which `useState` call is which, and why hooks must be called at the top level of the component.
+
+## 41.4 State as a snapshot
+
+Here is the rule that surprises everyone. Inside a single render, **state is a constant.** `count` isn't a live wire to some changing value; it's the number React handed this render, and it stays that number for as long as this render's code runs. Calling the setter doesn't change it:
+
+```tsx
+function handleClick() {
+  setCount(count + 1);
+  console.log(count); // still 0: this render's snapshot didn't change
+}
+```
+
+Think of each render as a photograph. The JSX, the handlers, and the values they close over are all taken from the same moment. `setCount` doesn't edit the photograph; it asks React to take a new one. The new value appears in the *next* render. If you need the new value right away, compute it into a variable first:
+
+```tsx
+function handleAdd() {
+  const nextCount = count + 1;
+  setCount(nextCount);
+  console.log(nextCount); // 1 ✅
+}
+```
+
+Snapshots hold even across time. A handler that runs later, from a timer or after a network request, still sees the values from the render in which it was created:
+
+```tsx
+function MessageComposer() {
+  const [message, setMessage] = useState("");
+
+  function handleSend() {
+    setTimeout(() => {
+      alert(`Sent: ${message}`); // the message as it was when you clicked Send
+    }, 3000);
+  }
+
+  return (
+    <>
+      <input value={message} onChange={(e) => setMessage(e.target.value)} />
+      <button onClick={handleSend}>Send</button>
+    </>
+  );
+}
+// Type "hello", click Send, then type " world" within 3 seconds: the alert says "Sent: hello".
+```
+
+This isn't a quirk; it's what makes React code predictable. A handler always works with a consistent set of values, the ones that were on screen when the user acted, instead of whatever happens to be current when some asynchronous code finally runs.
+
+## 41.5 Batching and updater functions
+
+When a handler calls several setters, React doesn't re-render after each one. It waits until all the code in the handler has finished, then processes the updates together and renders **once**. This is called **batching**, and it's why you never see half-updated screens. Combine batching with snapshots and you can predict a famous puzzle:
+
+```tsx
+function handleClick() {
+  setCount(count + 1); // setCount(0 + 1)
+  setCount(count + 1); // setCount(0 + 1)
+  setCount(count + 1); // setCount(0 + 1)
+}
+// After one click: 1, not 3. All three read the same snapshot, where count is 0.
+```
+
+If the next value depends on the previous one and you update more than once, pass an **updater function** instead of a value. React puts it in a queue and calls it with the *latest* pending state during the next render:
+
+```tsx
+function handleClick() {
+  setCount((c) => c + 1); // queued: "take whatever it is and add one"
+  setCount((c) => c + 1);
+  setCount((c) => c + 1);
+}
+// After one click: 3 ✅
+```
+
+React works through the queue in order. A plain value replaces whatever came before; an updater transforms it. Mixing them follows directly from that rule:
+
+| Code in the handler (count starts at 0) | Queue processing | Result |
+|---|---|---|
+| `setCount(count + 5)` then `setCount((c) => c + 1)` | replace with 5, then 5 + 1 | 6 |
+| `setCount((c) => c + 1)` then `setCount(42)` | 0 + 1, then replace with 42 | 42 |
+| `setCount(count + 1)` three times | replace with 1, three times | 1 |
+
+You don't need updaters everywhere. `setCount(count + 1)` in a handler that updates once is perfectly fine. Reach for the updater form when you update the same state **several times in one event**, or from code that may run long after its render (timers, intervals, subscriptions), where the snapshot could be stale. Name the parameter after the state (`c`, `prevTasks`). And keep updaters pure: Strict Mode calls them twice in development, just like components.
+
+> 🆕 **Modern note.** Since React 18, batching happens everywhere: in event handlers, timeouts, promises, and native event listeners. Older React versions only batched inside React event handlers.
+
+## 41.6 Updating objects in state
+
+State can hold any value, including objects. But treat every object in state as **read-only**, a frozen part of the snapshot. Mutating it, even with a setter call afterward, breaks things in two ways:
+
+```tsx
+const [task, setTask] = useState(initialTask);
+
+function handleRename(title: string) {
+  task.title = title; // ❌ mutates the current snapshot
+  setTask(task);      // ❌ same object as before: Object.is(old, next) is true, so React may skip the render
+}
+```
+
+React decides whether state changed by comparing the old and new values with `Object.is`, which for objects means "is it the same object?". You handed it the same object, so as far as React can tell, nothing happened. Worse, you rewrote the past: any earlier snapshot holding that object (a pending timer, the previous render's handlers) now sees the new title too.
+
+The fix is to **create a new object** that copies the old one and replaces what changed. Object spread from [Chapter 12](/chapter/12) does exactly this:
+
+```tsx
+function handleRename(title: string) {
+  setTask({ ...task, title }); // ✅ a new object: every field copied, then title replaced
+}
+```
+
+Spread is **shallow**: it copies one level. For a nested object, copy each level on the path to the change:
+
+```tsx
+type Assignee = { name: string; email: string };
+type AssignedTask = { id: string; title: string; done: boolean; assignee: Assignee };
+
+function handleAssigneeEmail(email: string) {
+  setTask({
+    ...task,
+    assignee: { ...task.assignee, email }, // copy the inner object too
+  });
+}
+```
+
+If the nesting goes much deeper than this, the spreading gets painful. That's usually a sign the state should be **flattened**, which is one of the principles in [Chapter 42](/chapter/42).
+
+> 🌍 **Real world.** Many teams use Immer (often through `useImmer`) for deeply nested state. You write code that *looks* like mutation (`draft.assignee.email = email`) and Immer produces the new objects for you. It's a convenience on top of the same rule, not an exception to it.
+
+## 41.7 Updating arrays in state
+
+Arrays in state follow the same rule: never change them in place, always produce a new array. That means giving up some familiar methods. Here are the swaps:
+
+| Instead of (mutates) | Use (returns a new array) |
+|---|---|
+| `push`, `unshift` | `[...tasks, task]`, `[task, ...tasks]` |
+| `splice` to remove, `pop`, `shift` | `filter` |
+| `tasks[i] = x` | `map` |
+| `splice` to insert | `slice` plus spread, or `toSpliced` |
+| `sort`, `reverse` | copy first (`[...tasks].sort()`), or `toSorted`, `toReversed` |
+
+Here are TaskFlow's everyday operations, each one producing a new array:
+
+```tsx
+const [tasks, setTasks] = useState(initialTasks);
+
+function addTask(title: string) {
+  setTasks([...tasks, { id: crypto.randomUUID(), title, done: false }]);
+}
+
+function deleteTask(id: string) {
+  setTasks(tasks.filter((t) => t.id !== id));
+}
+
+function toggleTask(id: string) {
+  setTasks(tasks.map((t) => (t.id === id ? { ...t, done: !t.done } : t)));
+}
+
+function insertTask(index: number, task: Task) {
+  setTasks([...tasks.slice(0, index), task, ...tasks.slice(index)]);
+}
+```
+
+Look closely at `toggleTask`. It doesn't just make a new array; it makes a new object **for the task that changed** and reuses the others. Copying the array alone isn't enough, because the copy still points at the same task objects:
+
+```tsx
+const copy = [...tasks];
+copy[0].done = true; // ❌ the array is new, but tasks[0] is the same object: you mutated state
+```
+
+## 41.8 Event propagation
+
+Events in React **bubble**, just like DOM events in [Chapter 35](/chapter/35): an event starts at the element where it happened and travels up through each ancestor, calling any matching handlers along the way. Usually that's invisible. It becomes visible when a clickable element sits inside another clickable element:
+
+```tsx
+function TaskRow({ task, onOpen, onDelete }: TaskRowProps) {
+  return (
+    <li className="task" onClick={() => onOpen(task.id)}>
+      {task.title}
+      <button
+        onClick={(e) => {
+          e.stopPropagation(); // without this, the click also reaches the <li> and opens the task
+          onDelete(task.id);
+        }}
+      >
+        Delete
+      </button>
+    </li>
+  );
+}
+```
+
+`e.stopPropagation()` stops the event from travelling further up. Use it sparingly: a parent that never hears about clicks can break things like "close the menu when clicking anywhere". A related but different method is **`e.preventDefault()`**, which stops the *browser's* default behavior for an event, while still letting it propagate. The case you'll hit constantly is a form, which by default reloads the whole page on submit:
+
+```tsx
+function NewTaskForm({ onAdd }: NewTaskFormProps) {
+  const [title, setTitle] = useState("");
+
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault(); // stop the browser from reloading the page
+        if (title.trim() === "") return;
+        onAdd(title.trim());
+        setTitle("");
+      }}
+    >
+      <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="What needs doing?" />
+      <button type="submit">Add</button>
+    </form>
+  );
+}
+```
+
+Two smaller details: `e.currentTarget` is the element whose handler is running, while `e.target` is the element where the event started, exactly as in [Chapter 35](/chapter/35). And if you ever need to see an event *before* children do (for logging or analytics), React offers capture-phase props such as `onClickCapture`.
+
+> 🆕 **Modern note.** React 19 also lets you pass a function to a form's `action` prop; it receives the form's `FormData`, with no `preventDefault` needed. [Chapter 63](/chapter/63) covers forms properly, including when to use each approach.
+
+## Common mistakes
+
+> ⚠️ **Mutating state.** `tasks.push(t)`, `task.done = true`, or `tasks.sort()` followed by a setter call hands React the same object, so it may skip the render, and earlier snapshots are corrupted. Always create new objects and arrays.
+
+> ⚠️ **Expecting synchronous updates.** Reading state right after setting it gives the old value, because you're reading this render's snapshot. Compute the next value into a variable if you need it immediately.
+
+> ⚠️ **Calling the handler instead of passing it.** `onClick={save()}` runs `save` during render, on every render. Pass `save`, or wrap it: `onClick={() => save(task.id)}`.
+
+> ⚠️ **Using the value form for repeated updates.** Three `setCount(count + 1)` calls add one. When updating the same state several times in one event, use `setCount((c) => c + 1)`.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** a value changes over time *and* the screen should change with it: form inputs, the task list, the selected task, whether a menu is open. Use the **updater form** when the next value depends on the previous one and you update more than once, or from asynchronous callbacks.
+
+> 🚫 **When not to.** If a value can be **computed** from props or other state (a count, a filtered list, a "has tasks" flag), don't store it; compute it during render ([Chapter 42](/chapter/42)). If a value must be remembered but **doesn't affect what's shown** (a timer id, a previous value), state causes needless renders; use a ref ([Chapter 45](/chapter/45)). And if a value never changes, it's a constant, not state.
+
+## How it connects
+
+> 🔗 **Connection.** Events build on the DOM event model of [Chapter 35](/chapter/35), and state is the **trigger** from [Chapter 37](/chapter/37)'s trigger/render/commit cycle. Immutable updates use the spread syntax reviewed in [Chapter 4](/chapter/4). Next, [Chapter 42](/chapter/42) decides *what* to put in state and *where* it should live, and [Chapter 43](/chapter/43) explains how `useState` remembers. In Part IX, [Chapter 51](/chapter/51) types events and handlers, [Chapter 52](/chapter/52) designs state types, and [Chapter 55](/chapter/55) moves complex updates into reducers.
+
+> 🌍 **Real world.** The snapshot model is why React apps rarely suffer from the "the value changed while my async code was running" bugs common in mutable UI code. It's also why libraries for global state (Redux, Zustand) insist on immutable updates: they detect change the same way React does, by comparing references.
+
+## Exercises
+
+### Level 1 — Recall
+
+`count` starts at `0`. For each handler, predict what the button shows after **one** click, and what `console.log` prints:
+
+```tsx
+function handleA() {
+  setCount(count + 1);
+  setCount(count + 1);
+  console.log(count);
+}
+
+function handleB() {
+  setCount((c) => c + 1);
+  setCount((c) => c + 1);
+  console.log(count);
+}
+
+function handleC() {
+  setCount(count + 10);
+  setCount((c) => c * 2);
+  setCount(count + 1);
+  setTimeout(() => console.log(count), 1000);
+}
+```
+
+### Level 2 — Application
+
+Build a `TaskApp` component with an add form, a list, and per-row toggle and delete buttons. All updates must be immutable (no `push`, `splice`, or property assignment on state), new tasks get an id at creation time, the form doesn't reload the page, and empty titles are ignored.
+
+### Level 3 — Challenge
+
+Add "Move up" and "Move down" buttons to each row of your `TaskApp`. Implement `moveTask(id, direction)` without mutating the array or any task. The first task's "Move up" and the last task's "Move down" must be disabled, and rows must keep their identity (check that a half-typed note in a row moves *with* its task).
+
+*Hint: find the index, then build the new array from slices, or copy once and swap two positions in the copy, which is local mutation of a fresh array.*
+
+### Level 4 — Real-world
+
+**Ticket TF-260: Add-ons checkout.** Workspace admins can buy TaskFlow add-ons (extra seats, storage packs, priority support). Build the cart.
+
+- Each line shows the add-on, unit price, a quantity with − and + buttons, and a remove button; − at quantity 1 is disabled.
+- The subtotal per line and the cart total are **computed during render**, never stored in state.
+- All state updates are immutable, and adding an add-on that's already in the cart increases its quantity instead of creating a duplicate line.
+- An empty cart shows a dedicated empty state with a link back to the add-ons list.
+
+## Key takeaways
+
+- Pass handlers, don't call them: `onClick={handleClick}`, or an arrow when you need arguments.
+- Local variables reset every render and never trigger one. **State** survives renders and triggers them.
+- `useState(initial)` returns `[value, setValue]`; each component instance has its own state.
+- State is a **snapshot**: within a render it never changes, and setters schedule a new render with a new snapshot.
+- React **batches** updates; use **updater functions** (`setCount((c) => c + 1)`) when one event updates the same state several times.
+- Never mutate objects or arrays in state; **create new ones** with spread, `map`, and `filter`.
+- Events bubble; `stopPropagation` stops the bubbling, `preventDefault` stops the browser's default action.
+
+## What comes next
+
+You can now store anything in state. That freedom is the next problem. Should the task count be state? The filtered list? The "is anything done?" flag? Which component should own the filter, if both the tabs and the counter need it? Bad answers produce state that contradicts itself. [Chapter 42: Thinking in State](/chapter/42) gives you the rules for good answers.

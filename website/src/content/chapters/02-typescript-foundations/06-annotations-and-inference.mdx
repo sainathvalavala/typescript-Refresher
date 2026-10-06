@@ -1,0 +1,355 @@
+> 📖 **The problem.** Two developers join your team on the same day. The first annotates *everything*: `const count: number = 5`, `const name: string = "Ada"`, even `const double: (n: number) => number = (n: number): number => n * 2`. The second annotates *nothing*, and their function parameters are silently `any`. Both write code that "works". Yet neither is using TypeScript well: the first buries the signal in noise, and the second throws away the safety net.
+
+This chapter answers the question every beginner asks: **when do I write a type, and when does TypeScript already know it?** You will learn what a type actually is, the primitive types, annotation syntax, how inference works, why `const` and `let` produce different types, and a simple boundary rule for where annotations belong.
+
+By the end, you'll be able to look at any declaration and say "this annotation is carrying information" or "this annotation is noise", and you'll read type errors as a conversation instead of a rejection.
+
+> 🧠 **Mental model.** **Inference flows forward from values. Annotations are promises you make at boundaries.** TypeScript works out the types of everything it can see being created. You write types only where information *enters* your code (parameters) or *leaves* it (public return types), because there, TypeScript has nothing to infer from, or you want a contract that doesn't change by accident.
+
+## 6.1 What a type is
+
+A **type** is a description of which values are allowed. That is all. `number` is the set of all numbers; `string` is the set of all strings; `boolean` is the set containing exactly `true` and `false`. When you annotate a variable, you are saying: *the value here will always be a member of this set.*
+
+```ts
+let age: number = 30;      // ✅ 30 is in the set "number"
+age = 31;                  // ✅ still in the set
+age = "thirty";            // ❌ Type 'string' is not assignable to type 'number'.
+
+let done: boolean = false;
+done = true;               // ✅ only two members, and both are allowed
+```
+
+A type also determines **which operations are allowed**. Every member of `string` has `.toUpperCase()`; no member of `number` does. So TypeScript can check the operation without ever running it:
+
+```ts
+function show(title: string, total: number) {
+  title.toUpperCase();   // ✅ every string has this method
+  title.toFixed(2);      // ❌ Property 'toFixed' does not exist on type 'string'.
+
+  total.toFixed(2);      // ✅ every number has this method
+}
+```
+
+This "types are sets" idea powers the whole book. In [Chapter 10](/chapter/10) it becomes a full mental model with unions, intersections, and the empty set. For now, remember the two questions a type answers: *what values may be here?* and *what can I do with them?*
+
+> 💡 **Tip.** When an error confuses you, ask: "What set is this value in, and what set does the other side expect?" Most assignability errors are just "this set isn't inside that set."
+
+## 6.2 Primitive types
+
+JavaScript has seven primitive kinds of value, and TypeScript has a type for each:
+
+```ts
+const title: string = "Write docs";
+const priority: number = 2;              // integers and decimals are both number
+const done: boolean = false;
+const bigId: bigint = 9007199254740993n; // arbitrary-size integers
+const key: symbol = Symbol("task");      // unique identifiers
+const nothing: null = null;              // the intentional "no value"
+const missing: undefined = undefined;    // the "not set" value
+```
+
+You will rarely annotate these as above. Usually you let inference handle them (section 6.4). What matters is the *names*: always **lowercase**.
+
+JavaScript also has wrapper objects named `String`, `Number`, and `Boolean`. TypeScript has types with those capitalized names, and they are **not** what you want:
+
+```ts
+const good: string = "hi";
+const bad: String = "hi";          // compiles, but this is the wrapper-object type
+
+function shout(s: string) { return s.toUpperCase(); }
+shout(bad); // ❌ Argument of type 'String' is not assignable to parameter of type 'string'.
+            //    'string' is a primitive, but 'String' is a wrapper object. Prefer using 'string' when possible.
+```
+
+A primitive can be assigned to its wrapper type but not the reverse, so a `String` annotation makes your API *harder* to use. The rule has no exceptions in day-to-day code: lowercase `string`, `number`, `boolean`, `bigint`, `symbol`.
+
+> ⚠️ **Common mistake.** Writing `String`, `Number`, or `Object` because they look like the "real" class names. They describe wrapper objects, not the values you mean.
+
+## 6.3 Type annotations
+
+An **annotation** is a colon followed by a type, placed after the thing it describes. There are exactly three places you will write them most:
+
+```ts
+// 1. On a variable
+let attempts: number = 0;
+
+// 2. On each function parameter
+function addTax(price: number, rate: number) {
+  return price * (1 + rate);
+}
+
+// 3. On a function's return type (after the parameter list)
+function formatTitle(title: string): string {
+  return title.trim().toUpperCase();
+}
+
+// Arrow functions follow the same pattern
+const double = (n: number): number => n * 2;
+```
+
+Annotations can also describe arrays and objects. Here is a preview of what is coming in [Chapter 7](/chapter/7):
+
+```ts
+const scores: number[] = [90, 72, 85];
+const user: { name: string; age: number } = { name: "Ada", age: 36 };
+
+function sumScores(values: number[]): number {
+  return values.reduce((sum, n) => sum + n, 0);
+}
+```
+
+Annotations are **erased** when your code compiles ([Chapter 3](/chapter/3)). They cost nothing at runtime. They exist for the compiler and for the human reading the code.
+
+One important detail: if a declaration has no value to infer from, the annotation is the *only* source of truth:
+
+```ts
+let selected: string;          // no initial value, so the annotation matters
+selected.toUpperCase();        // ❌ Variable 'selected' is used before being assigned.
+selected = "t1";
+selected.toUpperCase();        // ✅ assigned before use
+```
+
+## 6.4 Type inference
+
+You don't have to write most types, because TypeScript **infers** them. When you declare a variable with a value, TypeScript looks at the value and gives the variable the matching type. When you write a function body, it works out the return type from the `return` statements.
+
+```ts
+const title = "Write docs";          // title: "Write docs"  (see 6.5)
+let attempts = 0;                    // attempts: number
+const tags = ["ui", "docs"];         // tags: string[]
+const task = { id: "t1", done: false }; // task: { id: string; done: boolean }
+
+function addTax(price: number, rate: number) {
+  return price * (1 + rate);
+}
+const total = addTax(100, 0.2);      // total: number   (the return type was inferred too)
+```
+
+Inference is not guessing. It follows rules, and it flows **forward**: from the value on the right, to the variable on the left; from arguments, to results. Because the type came from the value, the two cannot disagree.
+
+```ts
+let attempts = 0;
+attempts = "three";   // ❌ Type 'string' is not assignable to type 'number'.
+tags.push(42);        // ❌ Argument of type 'number' is not assignable to parameter of type 'string'.
+```
+
+How do you *see* an inferred type? **Hover.** Every editor shows it. In this book, comments like `// total: number` show what hover would display.
+
+Inference also works for callbacks, where the context supplies the types:
+
+```ts
+const titles = ["Write docs", "Fix bug"];
+const lengths = titles.map((t) => t.length);
+//                          ^ t: string, inferred from titles
+// lengths: number[]
+```
+
+You did not annotate `t`, yet `t.length` is checked. TypeScript knows `titles` is `string[]`, so `map` hands the callback a `string`.
+
+> 💡 **Tip.** If hover shows a type you didn't expect, that's information, not a failure. Either your code does something different from what you meant, or your mental model needs updating. Both are worth knowing early.
+
+## 6.5 const vs let inference
+
+Hover over these two declarations. Their types differ:
+
+```ts
+const method = "GET";   // method: "GET"
+let verb = "GET";       // verb: string
+```
+
+A `const` can never be reassigned, so TypeScript keeps the *exact value* as the type: `"GET"` is a **literal type**, a set with exactly one member. A `let` *can* be reassigned, so TypeScript **widens** the type to the general category, `string`, to leave room for later assignments.
+
+The same applies to numbers and booleans:
+
+```ts
+const limit = 10;       // limit: 10
+let count = 10;         // count: number
+const ready = true;     // ready: true
+let enabled = true;     // enabled: boolean
+```
+
+Why does this matter? Because some APIs accept only specific literal values:
+
+```ts
+type Method = "GET" | "POST";
+function request(method: Method, url: string) { /* ... */ }
+
+const a = "GET";
+request(a, "/tasks");   // ✅ a is the literal "GET"
+
+let b = "GET";
+request(b, "/tasks");   // ❌ Argument of type 'string' is not assignable to parameter of type 'Method'.
+```
+
+The same trap appears with objects, because properties are mutable, so literals are widened inside them:
+
+```ts
+const config = { method: "GET" };    // config: { method: string }
+request(config.method, "/tasks");    // ❌ Argument of type 'string' is not assignable to parameter of type 'Method'.
+```
+
+This is a *first look*. [Chapter 8](/chapter/8) shows literal unions as vocabulary, and [Chapter 20](/chapter/20) shows `as const` and `satisfies`, the tools that keep the narrow type when you want it.
+
+> ⚠️ **Common mistake.** Reaching for `let` out of habit. In TypeScript, defaulting to `const` also gives you tighter types for free.
+
+## 6.6 When to annotate
+
+If inference works, when do you still write types? Follow the **boundary rule**:
+
+| Where | Annotate? | Why |
+|---|---|---|
+| Function **parameters** | **Always** | There is no value to infer from. Without it they are `any` (an error under `strict`). |
+| **Exported** function return types | **Usually** | It is a contract. It stops an internal edit from silently changing your public API. |
+| **Local** variables with initializers | **Rarely** | The value already says everything. |
+| Variables **without** an initial value | When needed | Nothing to infer from. |
+| An empty array or object literal | When needed | `[]` alone gives no element type. |
+
+```ts
+// ✅ parameters annotated; return type annotated because it's exported
+export function summarize(tasks: Task[], status: TaskStatus): string {
+  const matching = tasks.filter((t) => t.status === status); // inferred: Task[]
+  const count = matching.length;                              // inferred: number
+  return `${count} ${status}`;
+}
+
+// ✅ annotation needed: an empty array has no element type to infer
+const selected: Task[] = [];
+// Without the annotation, `const selected = []` starts as an "evolving" any[]
+// whose type depends on later pushes, which is fragile and confusing. Say what it holds.
+```
+
+Why annotate return types of public functions? Because inference runs *backwards from the body*. If someone edits the body and accidentally returns `string | undefined`, an annotated function reports the error right there. An unannotated one passes the bug silently to every caller.
+
+```ts
+export function findTitle(tasks: Task[], id: string): string {
+  return tasks.find((t) => t.id === id)?.title;
+  // ❌ Type 'string | undefined' is not assignable to type 'string'.
+}
+```
+
+The annotation caught the mistake inside the function, not three files away.
+
+## 6.7 Type errors as conversations
+
+An error is not a verdict. It is the compiler pointing at a **disagreement between two things you wrote**, and asking which one is wrong. There are always two ways to resolve it:
+
+1. **Fix the code**: the value is wrong, and the type was right.
+2. **Fix the type**: the code is right, and the type was a wrong or outdated promise.
+
+```ts
+interface Task { id: string; title: string; priority: number }
+
+function createTask(title: string): Task {
+  return { id: "t1", title };
+  // ❌ Property 'priority' is missing in type '{ id: string; title: string; }' but required in type 'Task'.
+}
+```
+
+The message says: you promised a `Task`, but the object you returned lacks `priority`. Which side is wrong? Ask the domain. If every task must have a priority, **fix the code** (`priority: 1`). If priority is optional for new tasks, **fix the type** (`priority?: number`, see [Chapter 7](/chapter/7)).
+
+Consider a second conversation, where the answer is less obvious:
+
+```ts
+function createTask(title: string): Task {
+  return { id: "t1", title, priority: "high" };
+  // ❌ Type 'string' is not assignable to type 'number'.
+}
+```
+
+Maybe the API really uses numbers, and `"high"` was a slip. Or maybe the team has decided on named priorities, and the *type* is the stale one. The compiler can't tell you. It only reports the disagreement, and you decide.
+
+Two habits keep these conversations short. First, **resist the quick silence**: adding `as any` or `!` doesn't resolve the disagreement, it hides it. Second, **widen a type only because the domain says so**, never just to make an error disappear.
+
+```ts
+const roles = ["admin", "user"];            // roles: string[]
+type Role = "admin" | "user";
+const first: Role = roles[0];
+// ❌ Type 'string' is not assignable to type 'Role'.
+// Fix the code or the type? Here the type is right; the inferred array was too wide.
+// The fix is to keep the narrow type (Chapter 20: as const).
+```
+
+## Common mistakes
+
+> ⚠️ **Redundant annotations.** `const count: number = 5` repeats what the value already says, and adds noise. In reviews, the comment is "let this be inferred".
+
+> ⚠️ **Annotating more widely than the value.** `let s: string | number = "a"` used only as a string. It compiles because TypeScript narrows on assignment, but the annotation advertises a flexibility you don't use, and it will bite as soon as the variable crosses a function boundary or a callback. Annotate for the *intent*, not for the possibility.
+
+> ⚠️ **Wrapper types.** `String`, `Number`, and `Boolean` are not `string`, `number`, and `boolean` ([section 6.2](/chapter/6)). Always use lowercase.
+
+> ⚠️ **Under-annotating at boundaries.** Un-annotated parameters become `any`, which under `strict` is an error (`noImplicitAny`). Don't "fix" it with an `any` annotation. Write the real type.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** information enters or leaves your code: function parameters, exported return types, empty collections, and variables declared before they are assigned. Annotate also when inference gives a type that is *too wide for your intent* (see the exercises).
+
+> 🚫 **When not to.** Don't annotate a local variable whose initializer already says it (`const total = items.length`). Don't annotate callback parameters that the context already types (`titles.map((t) => ...)`). Don't annotate a return type on a tiny private helper if the body makes it obvious.
+
+## How it connects
+
+> 🔗 **Connection.** The set idea in 6.1 is formalized in [Chapter 10](/chapter/10). Literal types from 6.5 become vocabularies in [Chapter 8](/chapter/8) and are controlled precisely in [Chapter 20](/chapter/20). Function annotations are the topic of [Chapter 11](/chapter/11), and the same boundary rule decides whether you annotate props and `useState` in React ([Chapter 50](/chapter/50), [Chapter 52](/chapter/52)).
+
+> 🌍 **Real world.** Experienced reviewers flag code like `const isOpen: boolean = false` with a one-line comment: "let this be inferred". Many teams even enable a lint rule (`no-inferrable-types`) to automate it.
+
+## Exercises
+
+### Level 1 — Recall
+
+Predict the type TypeScript infers for each declaration, then check by hovering in your editor.
+
+```ts
+const a = 5;
+let b = 5;
+const c = "todo";
+let d = "todo";
+const e = [1, 2, 3];
+const f = [1, "a"];
+const g = { done: false };
+const h = (n: number) => n > 0;
+const i = null;
+let j = undefined;
+```
+
+### Level 2 — Application
+
+Remove every unnecessary annotation from this file **without changing any inferred type**. Hover before and after to confirm.
+
+```ts
+const limit: number = 10;
+const label: string = "Tasks";
+const ids: string[] = ["t1", "t2"];
+const lengths: number[] = ids.map((id: string): number => id.length);
+const isLarge: boolean = lengths.length > limit;
+function count(items: string[]): number {
+  const total: number = items.length;
+  return total;
+}
+```
+
+### Level 3 — Challenge
+
+Find a case where inference produces a type that is **too wide** for your intent. For example, a variable you meant to hold only `"todo" | "doing" | "done"` but which TypeScript calls `string`. Show the error that results when you pass it to a function expecting the narrow type, then fix it using an annotation. Explain why the annotation is justified here but redundant in Level 2.
+
+*Hint: think `let` and object properties from section 6.5.*
+
+### Level 4 — Real-world
+
+**Ticket TF-006: Annotation guidelines.** New hires keep asking "should I write the type here?" in code review. Write a short style guide section titled "When we annotate".
+
+- One paragraph (about 120 words) stating the rule and its reason.
+- A table or list covering at least five situations (parameters, exported returns, locals, empty collections, callbacks), each with a one-line verdict.
+- One before/after code example taken from your own code.
+- Send it to a teammate; revise it if they misunderstand anything.
+
+## Key takeaways
+
+- A type is a set of allowed values, and it decides which operations are legal.
+- The primitives are lowercase `string`, `number`, `boolean`, `bigint`, `symbol`, `null`, and `undefined`. Never use `String` or `Number` as types.
+- TypeScript **infers** types from values, forward, so the two cannot disagree. Hover to see them.
+- `const` keeps a literal type (`"GET"`); `let` widens it (`string`).
+- Annotate at **boundaries**: always on parameters, usually on exported returns, rarely on locals.
+- A type error is a conversation: decide whether the *code* or the *type* is wrong, and never silence it with `any`.
+
+## What comes next
+
+You can describe single values. Real programs hold *collections* and *records*: a list of tasks, a row parsed from a CSV, a user with a dozen fields. How do you describe "many of the same thing" versus "a fixed sequence of different things" versus "a shape with named slots"? That is [Chapter 7: Arrays, Tuples & Objects](/chapter/7).

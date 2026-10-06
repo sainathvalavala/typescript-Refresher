@@ -1,0 +1,319 @@
+> 📖 **The problem.** You pass a `Dog[]` to a function that expects an `Animal[]`. TypeScript accepts it. The function pushes a `Cat` into the array, and that compiles too. Later, your code calls `.bark()` on every element and crashes on the cat. The same afternoon, you hand a button-only click handler to a toolbar that accepts "a handler for any element", and *that* is rejected. So TypeScript let a real bug through in the first case and blocked you in the second, where nothing looked wrong. Is it lenient or strict?
+
+It is both, on purpose, and the rules are learnable. This chapter gives you the precise vocabulary behind "fits inside": **covariance**, **contravariance**, **bivariance**, and **invariance**. You'll learn why function parameters are checked "backwards", why methods get a pass, where TypeScript knowingly lets unsound code compile, and how to design callback-heavy APIs so the compiler protects your callers instead of surprising them.
+
+> 🧠 **Mental model.** *Producers are covariant; consumers are contravariant.* Things you **read from** can be narrower: a box of dogs works wherever someone only reads animals out of it. Things you **write to or call** must accept at least as much: a handler for any element works where a button handler is needed, but not the reverse.
+
+## 77.1 Assignability revisited
+
+In [Chapter 10](/chapter/10) you learned that a type is a set of values, and that "S is assignable to T" means *every value of S is also a value of T*. For object types, TypeScript checks this **structurally**: the source must have every required property of the target, and each property's type must itself be assignable. Extra properties are fine, because a value with more information still satisfies a shape that asks for less.
+
+```ts
+interface Task { id: string; title: string }
+interface DatedTask { id: string; title: string; due: Date }
+
+const dated: DatedTask = { id: "t1", title: "Ship v2", due: new Date() };
+const plain: Task = dated;     // ✅ extra properties are fine
+const back: DatedTask = plain; // ❌ Property 'due' is missing in type 'Task' but required in type 'DatedTask'.
+```
+
+Functions have their own rules. A function with **fewer** parameters fits a slot that will pass more arguments (it simply ignores the extras). Its **return type** must be assignable to the slot's return type. And its **parameter types** are compared in the opposite direction, which is the subject of 77.3.
+
+```ts
+type Visitor = (task: Task, index: number) => void;
+
+const logTitle: Visitor = (task) => console.log(task.title); // ✅ ignoring `index` is fine
+```
+
+The interesting question is what happens with **generic** types. If `Dog` fits inside `Animal`, does `Box<Dog>` fit inside `Box<Animal>`? The answer depends on *where* the type parameter appears inside `Box`. That relationship has a name: **variance**. It describes how assignability of the generic type follows from assignability of its argument. There are four possibilities, and the rest of this chapter takes them one at a time.
+
+## 77.2 Covariance
+
+A type is **covariant** in `T` when the subtype relationship flows the same way: if `Dog` is assignable to `Animal`, then `Producer<Dog>` is assignable to `Producer<Animal>`. This is the intuitive direction, and it's correct whenever `T` only comes **out**: return types, read-only properties, and read-only arrays.
+
+```ts
+interface Animal { name: string }
+interface Dog extends Animal { bark(): void }
+
+type Getter<T> = () => T;
+
+declare const getDog: Getter<Dog>;
+const getAnimal: Getter<Animal> = getDog; // ✅ whoever calls it expects an Animal and gets a Dog
+const getDog2: Getter<Dog> = getAnimal;   // ❌ Type 'Getter<Animal>' is not assignable to type 'Getter<Dog>'.
+```
+
+Why is the first assignment safe? Anyone holding `getAnimal` will only ever *read* the result and treat it as an `Animal`. A `Dog` has everything an `Animal` has, so nothing they do can go wrong. The reverse fails because a caller of `getDog2` would call `.bark()` on something that might be a plain animal.
+
+Read-only collections follow the same logic, since you can only take values out of them:
+
+```ts
+declare const dogs: readonly Dog[];
+const animals: readonly Animal[] = dogs; // ✅ reading animals out of a list of dogs is always safe
+animals.push({ name: "Tom" });           // ❌ Property 'push' does not exist on type 'readonly Animal[]'.
+```
+
+> 🧠 **Mental model.** Covariant positions are **outputs**. If you only get values out of something, it can safely hand you something more specific than you asked for.
+
+## 77.3 Contravariance
+
+A type is **contravariant** in `T` when the relationship flips: `Handler<Animal>` is assignable to `Handler<Dog>`, but not the other way round. This happens wherever `T` goes **in**, and the classic example is a function parameter.
+
+Picture the toolbar from the opening. It stores a handler and will call it with *any* element: a div, a link, a button. A handler written only for buttons can't safely sit in that slot, because the toolbar might call it with a div.
+
+```ts
+type ElementHandler = (el: HTMLElement) => void;
+type ButtonHandler = (button: HTMLButtonElement) => void;
+
+const disableButton: ButtonHandler = (button) => { button.disabled = true; };
+const highlight: ElementHandler = (el) => { el.style.outline = "2px solid gold"; };
+
+const forEveryElement: ElementHandler = disableButton;
+// ❌ Type 'ButtonHandler' is not assignable to type 'ElementHandler'.
+//    Types of parameters 'button' and 'el' are incompatible.
+
+const forButtons: ButtonHandler = highlight; // ✅ a handler for any element can handle buttons
+```
+
+This is why handlers are checked "backwards". When you assign a function, ask who **calls** it and with what. The slot promises to pass its parameter type; your function must accept *at least* that much. A function that accepts more (any `HTMLElement`) is more capable, so it fits a slot that will only pass buttons.
+
+TypeScript enforces this under the `strictFunctionTypes` flag, which `strict: true` turns on. Without it, parameters are compared in *both* directions, and `forEveryElement` would compile.
+
+> 💡 **Tip.** When a callback error mentions "Types of parameters … are incompatible", read it as: "the caller will pass something your function isn't prepared to receive." The fix is almost always to **widen your parameter**, not to cast.
+
+## 77.4 Bivariance and method shorthand
+
+There's an exception to the rule you just learned. A method written in **method shorthand** (`onTask(task: Task): void`) is checked **bivariantly**: its parameter may be narrower *or* wider than the target's, even with `strictFunctionTypes` on. A member written as a **function property** (`onTask: (task: Task) => void`) gets the strict, contravariant check.
+
+```ts
+interface Task { id: string; title: string }
+interface BugTask extends Task { severity: "low" | "high" }
+
+interface TaskListener { onTask(task: Task): void }         // method shorthand: bivariant
+interface StrictListener { onTask: (task: Task) => void }   // function property: contravariant
+
+const shoutSeverity = (bug: BugTask) => console.log(bug.severity.toUpperCase());
+
+const loose: TaskListener = { onTask: shoutSeverity };   // ✅ compiles…
+const strict: StrictListener = { onTask: shoutSeverity }; // ❌ Type '(bug: BugTask) => void' is not assignable to type '(task: Task) => void'.
+
+loose.onTask({ id: "t1", title: "Write docs" });
+// 💥 TypeError: Cannot read properties of undefined (reading 'toUpperCase')
+```
+
+Why would TypeScript keep a known hole? Because of arrays. `Array<T>` declares `push(...items: T[])`, `indexOf(item: T)`, and dozens of other methods with `T` in parameter position. Checked strictly, those would make `Dog[]` *not* assignable to `Animal[]`, and an enormous amount of existing code (including the DOM's own type definitions) relies on that. Method bivariance keeps those patterns compiling. The team chose usability for the standard library over soundness for method declarations.
+
+The practical lesson is a habit: **when you declare a callback, use function-property syntax.** Shorthand is fine for methods that a class implements; for callbacks a caller supplies, use the property form so the caller's function is actually checked.
+
+## 77.5 Invariance
+
+A type is **invariant** in `T` when *neither* direction works: `Cell<Dog>` and `Cell<Animal>` are not assignable to each other at all. That's the correct answer for anything you both **read from and write to**, because reading demands covariance and writing demands contravariance, and only an exact match satisfies both.
+
+```ts
+interface Ref<T> {
+  get: () => T;              // T comes out: needs covariance
+  set: (value: T) => void;   // T goes in: needs contravariance
+}
+
+declare const dogRef: Ref<Dog>;
+declare const animalRef: Ref<Animal>;
+
+const a: Ref<Animal> = dogRef;
+// ❌ Type 'Ref<Dog>' is not assignable to type 'Ref<Animal>'.
+//    Types of property 'set' are incompatible.
+const d: Ref<Dog> = animalRef;
+// ❌ Type 'Ref<Animal>' is not assignable to type 'Ref<Dog>'.
+//    The types returned by 'get()' are incompatible between these types.
+```
+
+By that logic, a mutable array should be invariant too: you can read from it *and* `push` into it. That's exactly the bug from the opening. TypeScript checks arrays covariantly anyway, because `push` is a method (77.4) and because property types are compared covariantly even when they're writable:
+
+```ts
+interface Cat extends Animal { meow(): void }
+
+const dogs: Dog[] = [{ name: "Rex", bark() {} }];
+const tom: Cat = { name: "Tom", meow() {} };
+
+const animals: Animal[] = dogs;    // ✅ allowed (covariant), but technically unsound
+animals.push(tom);                 // ✅ compiles: a Cat is an Animal…
+dogs.forEach((dog) => dog.bark()); // 💥 TypeError: dog.bark is not a function
+```
+
+`animals` and `dogs` are the same array. Writing through the wider alias broke the promise the narrower alias made. Keep this picture in mind: **aliasing plus mutation** is where covariant containers go wrong.
+
+## 77.6 Variance annotations
+
+> ⏭ **Safe to skip.** Variance annotations are a tool for library authors who publish generic types. Application code almost never needs them; read on if you maintain shared types or are curious how the checker decides variance.
+
+Normally TypeScript *measures* the variance of a generic type by looking at how `T` is used inside it. Since TypeScript 4.7 you can **declare** it instead, with modifiers on the type parameter: `out T` means covariant (T is only produced), `in T` means contravariant (T is only consumed), and `in out T` means invariant.
+
+```ts
+interface Producer<out T> { get: () => T }
+interface Consumer<in T> { accept: (value: T) => void }
+interface Cell<in out T> { value: T }   // force invariance on a mutable box
+
+declare const dogCell: Cell<Dog>;
+const animalCell: Cell<Animal> = dogCell; // ❌ Type 'Cell<Dog>' is not assignable to type 'Cell<Animal>'.
+
+interface Broken<in T> { get: () => T }
+// ❌ Type 'Broken<super-T>' is not assignable to type 'Broken<sub-T>' as implied by variance annotation.
+```
+
+Annotations do three things. They **document** intent in the declaration itself. They are **checked**: TypeScript rejects an annotation that contradicts the structure, as `Broken` shows. And they can **tighten** an unsound measurement, as `Cell` does for a writable property that would otherwise be treated covariantly. A smaller benefit is performance: for very large or deeply recursive types, the checker can skip measuring variance.
+
+They only apply to type parameters of interfaces, classes, and type aliases for object, function, or mapped types. Don't sprinkle them everywhere: an annotation that matches what TypeScript would have measured adds nothing but noise.
+
+## 77.7 Where TypeScript is unsound on purpose
+
+A type system is **sound** if every program it accepts is free of type errors at runtime. TypeScript is deliberately *not* sound. Its design goal is to catch the most bugs while staying compatible with how JavaScript is actually written, and some holes are the price of that. Knowing them by name turns "TypeScript lied to me" into "I walked into hole number four".
+
+| Hole | What slips through | How to narrow it |
+|---|---|---|
+| Array covariance | Writing a `Cat` through an `Animal[]` alias of `Dog[]` | Accept `readonly T[]` when you only read |
+| Method bivariance | Narrow callback parameters on shorthand methods | Declare callbacks as function properties |
+| `any` | Everything | `unknown` plus narrowing; lint `no-explicit-any` |
+| Assertions (`as`) | Whatever you claim | Validate instead ([Chapter 32](/chapter/32)) |
+| Unchecked indexing | `list[0]` typed as `T`, not `T \| undefined` | `noUncheckedIndexedAccess` |
+| Optional vs missing | `{ theme: undefined }` treated like `{}` | `exactOptionalPropertyTypes` |
+
+The last two are worth seeing, because both have opt-in compiler flags:
+
+```ts
+const titles: string[] = [];
+const first = titles[0];   // first: string (the default is optimistic)
+first.toUpperCase();       // 💥 at runtime. With noUncheckedIndexedAccess:
+                           // ❌ 'first' is possibly 'undefined'.
+
+interface Settings { theme?: "light" | "dark" }
+const settings: Settings = { theme: undefined };
+// default: ✅ compiles, yet `"theme" in settings` is true and the value is undefined
+// with exactOptionalPropertyTypes:
+// ❌ Type '{ theme: undefined; }' is not assignable to type 'Settings' with 'exactOptionalPropertyTypes: true'.
+```
+
+There's one more subtle hole: once an object is widened, a property TypeScript "forgot" can come back as an optional property of a *different* type.
+
+```ts
+const estimateInHours = { id: "t1", estimate: 3 };
+const forgotten: { id: string } = estimateInHours;               // ✅ extra property allowed
+const revived: { id: string; estimate?: string } = forgotten;    // ✅ estimate is optional, so OK
+revived.estimate?.toUpperCase(); // 💥 TypeError: revived.estimate?.toUpperCase is not a function
+```
+
+> 🌍 **Real world.** Most production codebases turn on `noUncheckedIndexedAccess` (this book's own site does). `exactOptionalPropertyTypes` is stricter and causes more churn with third-party types, so teams adopt it more selectively.
+
+## 77.8 Variance in API design
+
+Everything above turns into three design rules for code that other people call.
+
+**Make read-only inputs `readonly`.** A parameter typed `readonly Task[]` accepts both mutable and readonly arrays, and it *promises* the function won't write. That closes the array-covariance hole from the inside: a function that can't `push` can't push the wrong thing into a caller's `BugTask[]`.
+
+```ts
+interface BugTask extends Task { severity: "low" | "high" }
+declare const bugs: BugTask[];
+
+function addPlaceholder(tasks: Task[]) {
+  tasks.push({ id: "new", title: "Untitled" }); // a plain Task, now inside `bugs`
+}
+function countOpen(tasks: readonly Task[]): number {
+  return tasks.length; // tasks.push(…) would be a compile error here
+}
+
+addPlaceholder(bugs); // ✅ compiles, and quietly corrupts `bugs`
+countOpen(bugs);      // ✅ compiles, and is actually safe
+```
+
+**Type callback parameters as the widest thing you will really pass, and declare callbacks as function properties.** The parameter type is a promise from *you* to your caller's function. Promise exactly what you'll send, and use the property form so a too-narrow handler is caught at the call site rather than at runtime.
+
+```ts
+interface StatusSelectProps {
+  options: readonly Status[];                  // readonly input: caller's array is safe
+  onChange: (status: Status) => void;          // function property: checked contravariantly
+  renderOption?: (status: Status) => string;   // same rule for every callback prop
+}
+type Status = "todo" | "doing" | "done";
+
+const onlyDone = (status: "done") => console.log(status);
+const props: StatusSelectProps = { options: ["todo", "done"], onChange: onlyDone };
+// ❌ Type '(status: "done") => void' is not assignable to type '(status: Status) => void'.
+```
+
+**Prefer safe defaults over clever ones.** Return the narrowest type you can (outputs are covariant, so callers can always widen), accept the widest type you can handle (inputs are contravariant, so callers can always pass something narrower), and reach for invariant, read-write generics only when the caller genuinely needs to write.
+
+## Common mistakes
+
+> ⚠️ **Declaring callback props with method shorthand.** `onSelect(task: Task): void` silently accepts a handler that only works for `BugTask`. Write `onSelect: (task: Task) => void`.
+
+> ⚠️ **"Fixing" a handler error with a cast.** `onChange={handler as any}` or `as (e: Event) => void` hides a real mismatch: the component *will* call your handler with something it doesn't expect. Widen the handler's parameter instead.
+
+> ⚠️ **Assuming `readonly` on a property changes assignability.** `{ readonly value: T }` and `{ value: T }` are mutually assignable. `readonly` stops writes *through that reference*; it doesn't make the type invariant. Use `readonly` arrays and immutability conventions, or `in out` annotations, when it matters.
+
+> ⚠️ **Mutating parameters you typed as mutable arrays.** If your function takes `Task[]` and pushes, a caller can pass a `BugTask[]` and end up with a corrupted array. Either take `readonly Task[]` and return a new array, or document the mutation loudly.
+
+> ⚠️ **Turning off `strict` (or `strictFunctionTypes`) to silence callback errors.** That removes contravariant checking for every function in the project. The errors were real.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** you design callback-heavy APIs (event emitters, component props, middleware), publish generic container types, or need to understand why an `onChange` or `subscribe` signature rejects a handler. Variance thinking is also the fastest way to read an assignability error that mentions "Types of parameters".
+
+> 🚫 **When not to.** Don't add variance annotations to application types; TypeScript measures variance correctly for nearly everything you write. Don't chase total soundness either: wrapping every array in `readonly` and every index in a check where the data is local, small, and obviously safe adds friction without catching bugs. Apply these rules at **API boundaries** that other people call, and let ordinary internal code stay simple.
+
+## How it connects
+
+> 🔗 **Connection.** This chapter sharpens the set model of [Chapter 10](/chapter/10) and the function-assignability rules of [Chapter 11](/chapter/11). The handler errors you met while typing events in [Chapter 51](/chapter/51) were contravariance at work. Next, [Chapter 78](/chapter/78) does the opposite of what structural typing usually does: it makes types that *look* identical deliberately incompatible.
+
+> 🌍 **Real world.** `lib.dom.d.ts` and `lib.es5.d.ts` declare almost everything with method shorthand, which is a large part of why method bivariance survives. Variance annotations show up mostly in heavily generic libraries, where they serve as documentation and spare the checker from measuring variance on deeply recursive types.
+
+## Exercises
+
+### Level 1 — Recall
+
+For each type, mark the position of `T` as covariant, contravariant, or invariant, and say why in one sentence:
+
+```ts
+type A<T> = () => T;
+type B<T> = (value: T) => void;
+type C<T> = { get: () => T; set: (value: T) => void };
+type D<T> = (callback: (value: T) => void) => void;
+type E<T> = readonly T[];
+```
+
+*(Type `D` is the interesting one: what happens when a parameter appears inside a parameter?)*
+
+### Level 2 — Application
+
+Here's a TaskFlow helper that only reads its input but declares it as a mutable array:
+
+```ts
+function totalEstimate(tasks: Task[]): number {
+  return tasks.reduce((sum, t) => sum + (t.estimate ?? 0), 0);
+}
+```
+
+Change the parameter to `readonly Task[]`. Then write two callers: one passing a `readonly Task[]` (which failed before your change) and one passing a `BugTask[]`. Finally, add a `tasks.push(…)` inside the body and record the error you get. Write two sentences on which unsafe operations the `readonly` parameter now rules out.
+
+### Level 3 — Challenge
+
+Write a small program that compiles under `strict: true` but crashes at runtime because of **method bivariance**. It should declare an interface with a callback in method-shorthand form, assign a handler with a narrower parameter, and call it with a value the handler can't handle. Then change *only* the interface to function-property syntax and show that the bug becomes a compile error.
+
+*Hint: the handler should access a property that exists only on the narrower type.*
+
+### Level 4 — Real-world
+
+**Ticket TF-311: Explain the `onChange` type error.** A teammate's PR passes `(event: ChangeEvent<HTMLInputElement>) => void` to the shared `<TextField>` component, whose prop is typed `onChange: (event: ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => void`, and it fails to compile. They've added `as any` to get it through.
+
+- Write the PR comment explaining, in plain language, why the compiler rejected the handler (who calls it, and with what).
+- Propose the correct handler type, and show the one-line change.
+- Point out whether `TextField`'s prop is declared as a method or a function property, and what would change if it were the other.
+- Remove the `as any` and confirm the PR compiles.
+
+## Key takeaways
+
+- **Variance** describes how a generic type's assignability follows from its argument's: covariant (same direction), contravariant (flipped), invariant (neither), bivariant (both).
+- **Outputs are covariant; inputs are contravariant.** Things you read can be narrower; things you call must accept at least as much.
+- `strictFunctionTypes` checks function parameters contravariantly, but **method shorthand stays bivariant**. Declare callbacks as function properties.
+- Mutable containers should be invariant; TypeScript treats arrays **covariantly anyway**, which is unsound when you write through an alias.
+- TypeScript is unsound on purpose in a few named places. Flags (`noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`) and habits (`readonly` inputs, no casts) close most of them.
+
+## What comes next
+
+Structural typing just saved you from writing `implements` everywhere, but it has a cost: a `TaskId` and a `ProjectId` are both "just strings", so TypeScript happily lets you swap them. Next, [Chapter 78: Branded Types & Nominal Typing Patterns](/chapter/78) shows how to make structurally identical types incompatible, for free at runtime.

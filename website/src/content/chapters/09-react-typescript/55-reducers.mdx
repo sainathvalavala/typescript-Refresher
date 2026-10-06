@@ -1,0 +1,406 @@
+> 📖 **The problem.** TaskFlow's task board has grown one `useState` at a time: `tasks`, `selectedId`, `editingId`, `filter`, `draftTitle`, `isSaving`, and `error`. Eleven event handlers each update some subset of those seven variables. One afternoon a bug report arrives: "After I delete a task, the details panel shows a task that doesn't exist." The `handleDelete` function removes the task from `tasks` but forgets to reset `selectedId`. Nothing in the code connects the two, so nothing warned anyone.
+
+The bug isn't a typo. It's a structural problem: the rules for how the board's state changes are scattered across eleven functions, and no single place says "when a task is removed, this is everything that must happen". This chapter moves those rules into one pure function, a **reducer**, and then uses TypeScript to make the list of things that can happen explicit and checked. By the end, you'll be able to model actions as a discriminated union, write reducers that refuse to compile when an action is unhandled, build small state machines, share a reducer through context, and test it with a few lines of table-driven tests.
+
+> 🧠 **Mental model.** **A reducer is a pure function `(state, action) => newState`.** The actions are a discriminated union: the complete list of *events* that can happen to this state. An exhaustive `switch` over that union means that adding a new event forces you to decide what it does, because the compiler won't let you forget.
+
+## 55.1 When transitions get complex
+
+`useState` is the right tool for most component state: a toggle, an input's text, a selected tab. It stops being the right tool when the *transitions* (the ways state changes) get complicated, even if each individual value is simple. Here is the shape of the board before any refactoring:
+
+```tsx
+function TaskBoard() {
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [filter, setFilter] = useState<TaskStatus | "all">("all");
+
+  function handleDelete(id: string) {
+    setTasks((ts) => ts.filter((t) => t.id !== id));
+    // 💥 forgot: if (selectedId === id) setSelectedId(null);
+    // 💥 forgot: if (editingId === id) setEditingId(null);
+  }
+
+  function handleComplete(id: string) {
+    setTasks((ts) => ts.map((t) => (t.id === id ? { ...t, status: "done" } : t)));
+    setEditingId(null);
+  }
+  // …nine more handlers, each touching a different subset of the state
+}
+```
+
+Every handler has to remember every rule. When someone adds an eighth variable, they must audit eleven handlers. Look for these signals that you need a reducer:
+
+| Signal | What it looks like |
+|---|---|
+| Values change together | One event calls three or more setters |
+| Rules depend on other state | "Only clear the selection if the deleted task was selected" |
+| The same transition happens from several places | A keyboard shortcut and a button both complete a task |
+| You want to test the logic without rendering | "Does deleting a task clear the editor?" |
+| You've found an impossible combination | `isSaving` is `true` *and* `error` is set |
+
+None of these is about the *amount* of state. Two variables that always change together are a better reducer candidate than ten independent ones.
+
+## 55.2 useReducer
+
+`useReducer` replaces a group of `useState` calls with three pieces. The **state** is one value (usually an object) that holds everything. An **action** is a plain object describing *what happened*, such as "the user removed task t3". The **reducer** is a function that takes the current state and an action and returns the next state. You call `dispatch(action)` to send an action, React calls your reducer, and the component re-renders with the result.
+
+```tsx
+import { useReducer } from "react";
+
+type CounterState = { count: number };
+type CounterAction = { type: "incremented" } | { type: "reset" };
+
+function counterReducer(state: CounterState, action: CounterAction): CounterState {
+  if (action.type === "incremented") return { count: state.count + 1 };
+  return { count: 0 };
+}
+
+function Counter() {
+  const [state, dispatch] = useReducer(counterReducer, { count: 0 });
+  //     ^ state: CounterState   ^ dispatch: accepts a CounterAction
+  return <button onClick={() => dispatch({ type: "incremented" })}>{state.count}</button>;
+}
+```
+
+TypeScript infers everything from the reducer's annotations: the state type comes from its first parameter and return type, and the action type comes from its second parameter. That's why the reducer, not the hook call, is where your types belong.
+
+A reducer must be **pure**: given the same state and action, it returns the same result, and it does nothing else. No `fetch`, no `localStorage`, no `Date.now()`, no `Math.random()`, and no mutating `state`. React may call your reducer twice in development (Strict Mode does this on purpose to expose impurity), and it relies on a *new* object to know something changed.
+
+```tsx
+function badReducer(state: CounterState, action: CounterAction): CounterState {
+  state.count++;              // 💥 mutation: React sees the same object and may skip the re-render
+  localStorage.setItem("count", String(state.count)); // 💥 side effect: runs twice in Strict Mode
+  return state;
+}
+```
+
+> 🆕 **Modern note.** React 19's types changed how `useReducer` takes type arguments. The old `useReducer<Reducer<State, Action>>(…)` form no longer compiles. The recommended style is to pass **no** type arguments and annotate the reducer's parameters, as above. If you truly need explicit arguments, the new form is `useReducer<State, [Action]>(…)`, with the action in a tuple.
+
+## 55.3 Actions as discriminated unions
+
+An action needs a name (what happened) and a payload (the data that event carries). Different events carry different data: adding a task needs the whole `Task`, removing one needs only an `id`, and changing the filter needs a status. That's exactly the problem a **discriminated union** solves ([Chapter 13](/chapter/13)): each member has a literal `type` field (the *discriminant*) plus the fields that belong to that event, and nothing else.
+
+```tsx
+type TaskStatus = "todo" | "doing" | "done";
+type Task = { id: string; title: string; status: TaskStatus };
+
+type BoardAction =
+  | { type: "taskAdded"; task: Task }
+  | { type: "taskRemoved"; id: string }
+  | { type: "taskStatusChanged"; id: string; status: TaskStatus }
+  | { type: "taskSelected"; id: string | null }
+  | { type: "filterChanged"; filter: TaskStatus | "all" };
+```
+
+Name actions as **past-tense events** ("taskRemoved"), not commands ("removeTask"). An action records something that happened; the reducer decides what that means for the state. That framing makes it natural for one event to update several fields, which is the whole point.
+
+The union pays off at both ends. Where you dispatch, TypeScript checks that the payload matches the event. Inside the reducer, checking `action.type` *narrows* the action, so only that member's fields are available:
+
+```tsx
+dispatch({ type: "taskRemoved", id: "t3" });       // ✅
+dispatch({ type: "taskRemoved" });                 // ❌ Argument of type '{ type: "taskRemoved"; }' is not assignable to parameter of type 'BoardAction'.
+dispatch({ type: "taskDeleted", id: "t3" });       // ❌ Type '"taskDeleted"' is not assignable to type '"taskAdded" | "taskRemoved" | "taskStatusChanged" | "taskSelected" | "filterChanged"'. Did you mean '"taskSelected"'?
+
+function describe(action: BoardAction): string {
+  if (action.type === "taskStatusChanged") {
+    return `${action.id} → ${action.status}`; // ✅ action is narrowed: id and status exist
+  }
+  return action.status; // ❌ Property 'status' does not exist on type '{ type: "taskAdded"; task: Task; } | { type: "taskRemoved"; id: string; } | …'.
+}
+```
+
+The last error is TypeScript telling you, correctly, that outside the `if` the action could be one of four other events, and most of them don't have a `status`.
+
+## 55.4 Exhaustive reducers
+
+Now write the reducer as a `switch` on `action.type`. Each `case` narrows `action` to one member, so you can read its payload safely. The trick that makes this *exhaustive* is the `default` branch: after every member has been handled, TypeScript narrows `action` to `never` (the type with no values). A tiny helper that accepts only `never` turns "you forgot a case" into a compile error.
+
+```ts
+function assertNever(x: never): never {
+  throw new Error(`Unhandled action: ${JSON.stringify(x)}`);
+}
+```
+
+```tsx
+type BoardState = {
+  tasks: Task[];
+  selectedId: string | null;
+  filter: TaskStatus | "all";
+};
+
+function boardReducer(state: BoardState, action: BoardAction): BoardState {
+  switch (action.type) {
+    case "taskAdded":
+      return { ...state, tasks: [...state.tasks, action.task] };
+    case "taskRemoved":
+      return {
+        ...state,
+        tasks: state.tasks.filter((t) => t.id !== action.id),
+        selectedId: state.selectedId === action.id ? null : state.selectedId, // ✅ the rule lives here, once
+      };
+    case "taskStatusChanged":
+      return {
+        ...state,
+        tasks: state.tasks.map((t) => (t.id === action.id ? { ...t, status: action.status } : t)),
+      };
+    case "taskSelected":
+      return { ...state, selectedId: action.id };
+    case "filterChanged":
+      return { ...state, filter: action.filter };
+    default:
+      return assertNever(action); // action: never, because every member is handled
+  }
+}
+```
+
+The payoff arrives later. Six months on, someone adds `{ type: "allCleared" }` to `BoardAction`. The reducer now fails to compile, pointing at the exact place that needs a new `case`:
+
+```tsx
+default:
+  return assertNever(action);
+  // ❌ Argument of type '{ type: "allCleared"; }' is not assignable to parameter of type 'never'.
+```
+
+Notice that the delete bug from the opening is fixed structurally: `taskRemoved` is handled in one place, and that place resets `selectedId`.
+
+> 💡 **Tip.** Because the reducer's return type is `BoardState`, simply leaving out the `default` branch also produces an error when a case is missing (`Function lacks ending return statement and return type does not include 'undefined'.`). `assertNever` is still worth having: its error names the unhandled member, and it throws at runtime if an unexpected action ever arrives from outside the type system.
+
+## 55.5 Modeling state and actions together
+
+So far the state has been one bag of fields. Often the better design makes the *state* a discriminated union too, so each mode carries only the data that exists in that mode. This is a **state machine**: a fixed set of states, and a fixed set of events that move between them. Take a task editor that can be closed, editing a draft, saving, or failed:
+
+```tsx
+type EditorState =
+  | { status: "closed" }
+  | { status: "editing"; draft: string }
+  | { status: "saving"; draft: string }
+  | { status: "failed"; draft: string; message: string };
+
+type EditorAction =
+  | { type: "opened"; title: string }
+  | { type: "typed"; text: string }
+  | { type: "submitted" }
+  | { type: "saveFailed"; message: string }
+  | { type: "saveSucceeded" }
+  | { type: "cancelled" };
+```
+
+`message` exists only on `"failed"`, and `draft` doesn't exist on `"closed"`. The impossible combination "closed, but with an error message" can't even be written down.
+
+The reducer switches on the *state* first, then on the action. Events that make no sense in the current state are simply ignored, which is how you get "invalid transitions are impossible by design":
+
+```tsx
+function editorReducer(state: EditorState, action: EditorAction): EditorState {
+  switch (state.status) {
+    case "closed":
+      return action.type === "opened" ? { status: "editing", draft: action.title } : state;
+    case "editing":
+      if (action.type === "typed") return { status: "editing", draft: action.text };
+      if (action.type === "submitted") return { status: "saving", draft: state.draft };
+      if (action.type === "cancelled") return { status: "closed" };
+      return state;
+    case "saving":
+      if (action.type === "saveSucceeded") return { status: "closed" };
+      if (action.type === "saveFailed") return { status: "failed", draft: state.draft, message: action.message };
+      return state; // typing while saving? ignored by design
+    case "failed":
+      if (action.type === "submitted") return { status: "saving", draft: state.draft };
+      if (action.type === "cancelled") return { status: "closed" };
+      return state;
+    default:
+      return assertNever(state);
+  }
+}
+```
+
+> 🔗 **Connection.** This is the same "make illegal states unrepresentable" idea from [Chapter 13](/chapter/13) and from union state in [Chapter 52](/chapter/52). The reducer is where those states get their transition rules.
+
+## 55.6 Typed dispatch helpers
+
+Raw `dispatch({ type: "taskRemoved", id })` calls are fine, but they scatter string literals through the UI. Two light helpers keep call sites tidy. **Action creators** are functions that build an action; their return type is pinned to the union so typos can't slip through. And `Dispatch<Action>`, from React, is the exact type of the `dispatch` function, which you need whenever you pass it as a prop or store it in context.
+
+```tsx
+import type { Dispatch } from "react";
+
+const boardActions = {
+  taskAdded: (task: Task): BoardAction => ({ type: "taskAdded", task }),
+  taskRemoved: (id: string): BoardAction => ({ type: "taskRemoved", id }),
+  filterChanged: (filter: TaskStatus | "all"): BoardAction => ({ type: "filterChanged", filter }),
+};
+
+type TaskRowProps = {
+  task: Task;
+  dispatch: Dispatch<BoardAction>; // dispatch: (value: BoardAction) => void
+};
+
+function TaskRow({ task, dispatch }: TaskRowProps) {
+  return (
+    <li>
+      {task.title}
+      <button onClick={() => dispatch(boardActions.taskRemoved(task.id))}>Delete</button>
+    </li>
+  );
+}
+```
+
+The annotation `: BoardAction` on each creator matters. Without it, TypeScript would infer `type: string`, which is not assignable to the union and fails at the `dispatch` call.
+
+```tsx
+const bad = (id: string) => ({ type: "taskRemoved", id }); // returns { type: string; id: string }
+dispatch(bad("t1")); // ❌ Type 'string' is not assignable to type '"taskAdded" | "taskRemoved" | …'.
+```
+
+> 💡 **Tip.** Passing a whole `dispatch` to a child exposes *every* action to it. If a child should only be able to remove a task, give it `onRemove: (id: string) => void` instead and wire it to `dispatch` in the parent. Callbacks are a narrower, more honest contract.
+
+## 55.7 Reducer + context
+
+When many components deep in the tree need the board's state and the ability to change it, combine `useReducer` with context ([Chapter 54](/chapter/54)). You get app-level state with no library. The standard shape uses **two** contexts, one for state and one for dispatch, because `dispatch` never changes identity: components that only dispatch won't re-render when the state changes.
+
+```tsx
+import { createContext, use, useReducer, type Dispatch, type ReactNode } from "react";
+
+const BoardStateContext = createContext<BoardState | null>(null);
+const BoardDispatchContext = createContext<Dispatch<BoardAction> | null>(null);
+
+const initialBoard: BoardState = { tasks: [], selectedId: null, filter: "all" };
+
+export function BoardProvider({ children }: { children: ReactNode }) {
+  const [state, dispatch] = useReducer(boardReducer, initialBoard);
+  return (
+    <BoardStateContext value={state}>
+      <BoardDispatchContext value={dispatch}>{children}</BoardDispatchContext>
+    </BoardStateContext>
+  );
+}
+
+export function useBoard(): BoardState {
+  const state = use(BoardStateContext);
+  if (state === null) throw new Error("useBoard must be used inside <BoardProvider>");
+  return state;
+}
+
+export function useBoardDispatch(): Dispatch<BoardAction> {
+  const dispatch = use(BoardDispatchContext);
+  if (dispatch === null) throw new Error("useBoardDispatch must be used inside <BoardProvider>");
+  return dispatch;
+}
+```
+
+Consumers read like ordinary hooks, and neither one can be called outside the provider:
+
+```tsx
+function DeleteButton({ id }: { id: string }) {
+  const dispatch = useBoardDispatch(); // Dispatch<BoardAction>
+  return <button onClick={() => dispatch({ type: "taskRemoved", id })}>Delete</button>;
+}
+```
+
+> ⚠️ **Common mistake.** Putting the *entire* app in one reducer-plus-context. Every consumer of the state re-renders on every action. Keep each reducer small and scoped to one feature (the board, the editor, the notifications), and provide it only around the subtree that needs it.
+
+## 55.8 Testing reducers
+
+A reducer is a pure function, so it's the easiest logic in your app to test: no rendering, no mocks, no timers. Give it a state and an action, and assert on the result. Because actions and states are typed, the tests are type-checked too. A **table-driven test** lists the cases as data and runs the same assertion over each, which keeps tests short and makes a missing case easy to spot. Here is the pattern with Vitest:
+
+```ts
+import { describe, expect, it } from "vitest";
+
+const task = (id: string, status: TaskStatus = "todo"): Task => ({ id, title: `Task ${id}`, status });
+const board = (over: Partial<BoardState> = {}): BoardState => ({ ...initialBoard, ...over });
+
+describe("boardReducer", () => {
+  const cases: { name: string; state: BoardState; action: BoardAction; expected: BoardState }[] = [
+    {
+      name: "adds a task",
+      state: board(),
+      action: { type: "taskAdded", task: task("t1") },
+      expected: board({ tasks: [task("t1")] }),
+    },
+    {
+      name: "removing the selected task clears the selection",
+      state: board({ tasks: [task("t1")], selectedId: "t1" }),
+      action: { type: "taskRemoved", id: "t1" },
+      expected: board({ tasks: [], selectedId: null }),
+    },
+    {
+      name: "removing another task keeps the selection",
+      state: board({ tasks: [task("t1"), task("t2")], selectedId: "t2" }),
+      action: { type: "taskRemoved", id: "t1" },
+      expected: board({ tasks: [task("t2")], selectedId: "t2" }),
+    },
+  ];
+
+  it.each(cases)("$name", ({ state, action, expected }) => {
+    expect(boardReducer(state, action)).toEqual(expected);
+  });
+});
+```
+
+The second case is a regression test for the bug in the opening story. For a state machine, test the *ignored* transitions too, and assert that the same object comes back:
+
+```ts
+it("ignores typing while saving", () => {
+  const saving: EditorState = { status: "saving", draft: "Write docs" };
+  expect(editorReducer(saving, { type: "typed", text: "x" })).toBe(saving);
+});
+```
+
+## Common mistakes
+
+> ⚠️ **Optional payload fields instead of separate members.** `{ type: "changed"; id?: string; status?: TaskStatus; filter?: string }` forces every `case` to check which fields exist, and allows nonsense like a status change with no id. Give each event its own union member with required fields.
+
+> ⚠️ **Side effects in the reducer.** `fetch`, `localStorage`, timers, `Date.now()`, and `Math.random()` do not belong there. Compute the impure values in the event handler and put them in the action (`{ type: "taskAdded", task: { id: crypto.randomUUID(), … } }`).
+
+> ⚠️ **One mega-reducer for the whole app.** It couples unrelated features and re-renders everything. Prefer several small reducers, one per feature.
+
+> ⚠️ **Mutating state.** `state.tasks.push(action.task)` returns the same array reference, so React may skip the update. Always return new objects and arrays.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** one event changes several values, when rules depend on the current state, when the state is naturally a set of modes (idle, loading, failed), or when you want to unit-test the logic without rendering.
+
+> 🚫 **When not to.** A single independent value (a toggle, an input's text) is clearer with `useState`. Server data with caching, refetching, and retries belongs in a data-fetching library, not a hand-written reducer. And don't reach for `useReducer` just to look sophisticated: if there are two setters and no tricky rules, leave them.
+
+## How it connects
+
+> 🔗 **Connection.** The action union is a discriminated union ([Chapter 13](/chapter/13)), and `assertNever` is the exhaustiveness check you met there. Union-shaped state comes from [Chapter 52](/chapter/52), and the two-context pattern from [Chapter 54](/chapter/54). Custom hooks that wrap reducers appear in [Chapter 56](/chapter/56), and [P11](/projects/p11) puts the whole pattern into a real task board.
+
+> 🌍 **Real world.** Redux, Zustand's reducer-style stores, and XState are all this idea at larger scale: events, pure transitions, and one place where the rules live. Learning the small version makes the libraries easy to read.
+
+## Exercises
+
+### Level 1 — Recall
+
+Write the action union for a counter with a **step**, a **reset**, and a **set to a specific value**. Use past-tense names and give each member only the fields it needs. Then write the reducer's `default` branch so that adding a fourth action breaks compilation.
+
+### Level 2 — Application
+
+Convert the task state from [P11](/projects/p11) (tasks, selected id, filter) from separate `useState` calls to a reducer. Every handler becomes a dispatched action, and the reducer ends with `assertNever`. Confirm that deleting a task clears a selection that pointed to it.
+
+### Level 3 — Challenge
+
+Model a media player with the states `idle`, `loading`, `playing`, `paused`, and `error`. Events that don't apply to the current state (pausing while idle, say) must be ignored **by the shape of the reducer**, and `error` must carry a message that no other state has. Write a table-driven test covering every state with every action.
+
+*Hint: switch on the state first, as in 55.5, and return the same state object for ignored events.*
+
+### Level 4 — Real-world
+
+**Ticket TF-311: Undo and redo for the board.** Product wants Ctrl+Z and Ctrl+Shift+Z on the task board.
+
+- Implement `withUndo(reducer)`, a generic higher-order reducer that wraps any `(state, action) => state` and adds `undo` and `redo` actions.
+- State becomes `{ past: S[]; present: S; future: S[] }`, and the wrapped reducer's types must be inferred from the reducer you pass in.
+- A new ordinary action clears `future`. Undo with an empty `past` is a no-op.
+- Table-driven tests cover do, undo, redo, and "new action after undo".
+
+## Key takeaways
+
+- When one event changes many values, or the rules depend on other state, move the logic into one pure reducer.
+- Model actions as a discriminated union of past-tense events, each member carrying only the fields it needs.
+- A `switch` with `assertNever(action)` in the `default` makes unhandled actions a compile error.
+- Make the state a union too when modes carry different data. Invalid transitions become a `return state`.
+- Split state and `Dispatch<Action>` into two contexts, and expose both through hooks that throw outside the provider.
+- Reducers are pure, so test them with plain table-driven tests, with no rendering.
+
+## What comes next
+
+Reducers, context, and state hooks often get reused. Wrapping that logic in your own hooks sounds easy until `const [value, setValue] = useToggle()` infers `value` as `boolean | (() => void)`. [Chapter 56: Typing Custom Hooks](/chapter/56) shows how to give hooks precise, honest public types.

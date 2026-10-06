@@ -1,0 +1,356 @@
+> 📖 **The problem.** TaskFlow's backend has a function `assignTask(projectId, taskId)`. A teammate writes a migration script and calls it as `assignTask(taskId, projectId)`. Both IDs are strings, so TypeScript is perfectly happy. The script runs every night for a week, quietly attaching tasks to projects that don't exist, before a customer notices their board is empty. Nobody did anything "wrong" by the type system's rules. The rules simply couldn't tell a task ID from a project ID.
+
+In [Chapter 77](/chapter/77) you saw that TypeScript compares types **structurally**: if two types have the same shape, they're interchangeable. Most of the time that's a gift. This chapter is about the cases where it isn't, where two values share a representation (both strings, both numbers) but mean completely different things. You'll learn how to give such types a **brand** so that TypeScript keeps them apart, how to make sure the only way to obtain a brand is through code that checks the value, and, just as importantly, how to tell when a brand costs more friction than the bugs it prevents.
+
+> 🧠 **Mental model.** A **brand** is a compile-time tag that makes structurally identical types incompatible. It costs nothing at runtime, and the only way to get one is through a function that checks the value.
+
+## 78.1 When structural identity hurts
+
+A **type alias** gives a type a new name, but it doesn't create a new type. `type TaskId = string` is exactly `string` with a nicer label for humans. TypeScript erases the label the moment it compares two types, which is why the opening bug compiles:
+
+```ts
+type TaskId = string;
+type ProjectId = string;
+
+function assignTask(projectId: ProjectId, taskId: TaskId): void {
+  // …writes task.projectId = projectId to the database
+}
+
+declare const taskId: TaskId;
+declare const projectId: ProjectId;
+
+assignTask(taskId, projectId); // ✅ compiles. Both are just `string`.
+```
+
+The same weakness shows up in three recurring places:
+
+- **IDs.** `TaskId`, `ProjectId`, and `UserId` are all strings. Any function taking two of them can be called in the wrong order.
+- **Units.** A duration in seconds and one in milliseconds are both `number`. So are kilometres and miles, or cents and dollars. Mixing them produces numbers that look plausible and are off by a factor of 1000.
+- **Validated strings.** An email address you've checked and the raw text a user typed into a form are both `string`. A function that sends invitations can't demand "a string that has already been validated".
+
+```ts
+function scheduleReminder(delayMs: number): void { /* … */ }
+
+const settings = { reminderDelaySeconds: 30 };
+scheduleReminder(settings.reminderDelaySeconds); // ✅ compiles, fires after 30 ms instead of 30 s
+
+function sendInvite(email: string): void { /* … */ }
+sendInvite(formData.get("email") as string);   // ✅ compiles, even if the user typed "hello"
+```
+
+In each case the information that would catch the bug ("this is a task ID", "this is in seconds", "this was validated") exists only in the programmer's head. Structural typing has nothing to compare. What we need is a way to make that information part of the type, so it survives the comparison.
+
+## 78.2 Branding with intersections
+
+The trick is to make the two types *structurally different* while keeping them usable as strings. You do that with an **intersection** ([Chapter 13](/chapter/13)): a `TaskId` is "a string *and* an object with a `__brand` property whose type is the literal `"TaskId"`".
+
+```ts
+type TaskId = string & { readonly __brand: "TaskId" };
+type ProjectId = string & { readonly __brand: "ProjectId" };
+
+function assignTask(projectId: ProjectId, taskId: TaskId): void { /* … */ }
+
+declare const taskId: TaskId;
+declare const projectId: ProjectId;
+
+assignTask(projectId, taskId); // ✅
+assignTask(taskId, projectId); // ❌ Argument of type 'TaskId' is not assignable to parameter of type 'ProjectId'.
+                               //    Types of property '__brand' are incompatible.
+```
+
+Now the types differ in one place, the literal type of `__brand`, and that difference is enough. Notice what you did **not** lose:
+
+```ts
+const label: string = taskId;        // ✅ a TaskId is still a string
+const upper = taskId.toUpperCase();  // upper: string. All string methods work.
+const raw: TaskId = "t_123";         // ❌ Type 'string' is not assignable to type 'TaskId'.
+```
+
+That last line is the point. A plain string can't become a `TaskId` by accident. The only way in is a type assertion, `"t_123" as TaskId`, and section 78.4 will put that assertion somewhere you can trust.
+
+Here is the uncomfortable truth about this pattern: **the `__brand` property does not exist.** No string at runtime has a `__brand` field. The intersection is a deliberate fiction that TypeScript checks and then erases ([Chapter 3](/chapter/3)), which is why brands cost nothing. It also means you must never read the property:
+
+```ts
+console.log(taskId.__brand); // ✅ compiles, typed as "TaskId"… but prints undefined
+```
+
+Most codebases wrap the pattern in a small generic helper so every brand is declared the same way:
+
+```ts
+type Brand<T, B extends string> = T & { readonly __brand: B };
+
+type TaskId = Brand<string, "TaskId">;
+type UserId = Brand<string, "UserId">;
+type Cents = Brand<number, "Cents">;
+```
+
+> 💡 **Tip.** The property name is a convention. `__brand`, `__type`, and `_tag` are all common. Pick one for the whole codebase and put the `Brand` helper in a shared types module, so nobody invents a second scheme.
+
+## 78.3 Unique-symbol brands
+
+The string-keyed brand has two weaknesses. First, it's **forgeable**: anything that produces a value with a `__brand: "TaskId"` property type-checks as a `TaskId`, even without your validation. Second, it's **collision-prone**: if your code and a library both define `Brand<string, "UserId">` with a `__brand` key, their `UserId`s are the same type, because structurally they are.
+
+```ts
+type TaskId = string & { readonly __brand: "TaskId" };
+
+const forged: TaskId = Object.assign("anything", { __brand: "TaskId" as const }); // ✅ compiles. Oops.
+```
+
+The stronger version keys the brand by a **unique symbol**. A `unique symbol` type ([Chapter 6](/chapter/6) introduced `symbol`) is a type that only one declaration can ever have. If you never export the symbol, no other file can even *name* the brand property, let alone produce a value that has it:
+
+```ts
+declare const taskIdBrand: unique symbol; // exists only at the type level, never emitted
+
+type TaskId = string & { readonly [taskIdBrand]: true };
+```
+
+The `declare const` tells TypeScript "assume this constant exists" without generating any JavaScript, so the symbol is purely a type-level key. Another module declaring its own symbol gets a different, incompatible key, even with the same name:
+
+```ts
+// some-library.ts
+declare const taskIdBrand: unique symbol;
+type LibraryTaskId = string & { readonly [taskIdBrand]: true };
+
+declare const theirs: LibraryTaskId;
+const ours: TaskId = theirs; // ❌ Type 'LibraryTaskId' is not assignable to type 'TaskId'.
+                             //    Property '[taskIdBrand]' is missing in type …
+```
+
+A single shared symbol with a string payload gives you a reusable helper that's both collision-proof and forge-proof outside its module:
+
+```ts
+// shared/brand.ts
+declare const brand: unique symbol;
+export type Brand<T, B extends string> = T & { readonly [brand]: B };
+```
+
+Brands made with this helper are distinguished by the payload (`"TaskId"` vs `"ProjectId"`), and nobody outside `brand.ts` can write the key `[brand]` by hand. A bonus: the brand property no longer appears in autocomplete as `__brand`, so nobody is tempted to read it.
+
+> 🌍 **Real world.** Both styles are widespread. Zod's `.brand()`, Effect's `Brand`, and type-fest's `Tagged` all use a hidden or symbol-keyed property for exactly these reasons.
+
+## 78.4 Smart constructors
+
+A brand that anyone can attach with `as` is just a comment that the compiler happens to read. The pattern becomes real when the **only** place that attaches the brand is a function that has actually checked the value. That function is called a **smart constructor**: it takes the loose input (a plain `string`), validates it, and returns the branded type, or a failure if the input doesn't qualify.
+
+```ts
+type Email = Brand<string, "Email">;
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+export function parseEmail(input: string): Result<Email, string> {
+  const trimmed = input.trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) {
+    return { ok: false, error: `"${input}" is not an email address` };
+  }
+  return { ok: true, value: trimmed as Email }; // the one trusted assertion
+}
+```
+
+The `as Email` on the last line is the single assertion in the whole design, and it sits directly below the check that justifies it. Every other piece of code receives an `Email` and can rely on it.
+
+```ts
+function sendInvite(to: Email): void { /* … */ }
+
+sendInvite("ada@example.com"); // ❌ Argument of type 'string' is not assignable to parameter of type 'Email'.
+
+const parsed = parseEmail(formValue);
+if (parsed.ok) sendInvite(parsed.value); // ✅ narrowing gives us an Email
+else showError(parsed.error);
+```
+
+This is the same idea as [Chapter 32](/chapter/32): the type must be *earned* by validation, never merely claimed. A schema library gives you the same thing with less code. Zod's `z.string().email().brand<"Email">()` returns a parser whose output type is branded, so the brand is attached by the schema and nowhere else.
+
+> ⚠️ **Common mistake.** A constructor that only checks the brand's *shape* (for example, "is it a string?") and not its *meaning* produces brands that lie. If `parseTaskId` accepts any non-empty string, the brand promises nothing the plain `string` didn't.
+
+## 78.5 Units and value objects
+
+Brands are not only for IDs. Any number or string that carries a meaning the type system can't see is a candidate. The classic case is **units**: a distance in metres and a distance in feet are both `number`, and mixing them is how spacecraft get lost.
+
+```ts
+type Meters = Brand<number, "Meters">;
+type Feet = Brand<number, "Feet">;
+
+const meters = (n: number) => n as Meters;
+const feet = (n: number) => n as Feet;
+
+const toMeters = (f: Feet): Meters => (f * 0.3048) as Meters;
+const addMeters = (a: Meters, b: Meters): Meters => (a + b) as Meters;
+
+addMeters(meters(100), feet(300));            // ❌ Argument of type 'Feet' is not assignable to parameter of type 'Meters'.
+addMeters(meters(100), toMeters(feet(300)));  // ✅
+```
+
+Notice that arithmetic *erases* the brand: `meters(1) + meters(2)` has type `number`, because `+` knows nothing about your tag. That is why helper functions such as `addMeters` re-apply the brand with an assertion. Keep those helpers tiny and tested; they are the trusted core.
+
+Money needs one more idea, because the brand should depend on a **parameter** (the currency). A branded type can be generic, and a template literal type builds the tag:
+
+```ts
+type Currency = "USD" | "EUR";
+type Money<C extends Currency> = Brand<number, `Money:${C}`>;
+
+const usd = (cents: number) => cents as Money<"USD">;
+const eur = (cents: number) => cents as Money<"EUR">;
+
+function addMoney<C extends Currency>(a: Money<C>, b: NoInfer<Money<C>>): Money<C> {
+  return (a + b) as Money<C>;
+}
+
+addMoney(usd(500), usd(250)); // ✅ Money<"USD">
+addMoney(usd(500), eur(250)); // ❌ Argument of type 'Money<"EUR">' is not assignable to parameter of type 'Money<"USD">'.
+```
+
+The `NoInfer` on the second parameter matters. Without it, TypeScript infers `C` from *both* arguments, widens it to `"USD" | "EUR"`, and happily accepts the mix. `NoInfer<T>` says "check against `C`, but don't use this position to decide what `C` is". Your Level 3 exercise builds on exactly this.
+
+A branded primitive that also carries rules (`Email`, `Money`, a `NonEmptyString`) is often called a **value object**: a small immutable value defined by what it *is*, not by an identity.
+
+## 78.6 Opaque types across modules
+
+So far, anyone who can see the `TaskId` type can also write `"x" as TaskId`. A smart constructor is only a guarantee if that escape hatch is hard to reach. The tool for that is the **module boundary**: export the type and the constructor, and keep everything else private. A type used this way is called **opaque**, because code outside the module can pass it around but cannot look inside or make one by hand.
+
+```ts
+// tasks/ids.ts
+declare const taskIdBrand: unique symbol;            // not exported
+export type TaskId = string & { readonly [taskIdBrand]: true };
+
+export function parseTaskId(input: string): TaskId {
+  if (!/^t_[a-z0-9]{6,}$/.test(input)) throw new Error(`Invalid task id: ${input}`);
+  return input as TaskId;                            // the only assertion in the codebase
+}
+```
+
+Because `taskIdBrand` is never exported, other modules cannot write the property key, so they cannot forge the type without an assertion. A lint rule (`no-restricted-syntax` on `as TaskId`) can close the last gap.
+
+When you want even stronger enforcement, a **class with a private member** is nominal by design. TypeScript treats two classes with separately declared private members as different types, and a private constructor means nobody can build one without your factory:
+
+```ts
+export class UserId {
+  private readonly nominal!: void;
+  private constructor(readonly value: string) {}
+  static parse(input: string): UserId { return new UserId(input); }
+}
+
+new UserId("u_1"); // ❌ Constructor of class 'UserId' is private and only accessible within the class declaration.
+```
+
+The cost is that a class instance is an object, not a string. It must be wrapped and unwrapped (`id.value`), it will not serialize as a bare string, and it allocates at runtime. For most code, the unexported-symbol brand gives 95% of the safety at zero runtime cost.
+
+> 🚫 **When not to.** Don't reach for the class form just to get nominal typing. Use it only when the value genuinely behaves like an object (it has methods and invariants), not when it is an ID that crosses JSON.
+
+## 78.7 Brands at the boundary
+
+A branded type is only as trustworthy as the place it enters the program. The right place is the **boundary**: where data arrives from outside your control (a network response, a form, `localStorage`, a URL parameter). Parse there, once, and let the brand flow inward through function signatures.
+
+```ts
+// api/tasks.ts: the edge
+interface TaskDto { id: string; projectId: string; title: string }
+
+export interface Task { id: TaskId; projectId: ProjectId; title: string }
+
+function toTask(dto: TaskDto): Task {
+  return {
+    id: parseTaskId(dto.id),
+    projectId: parseProjectId(dto.projectId),
+    title: dto.title,
+  };
+}
+
+export async function loadTasks(): Promise<Task[]> {
+  const res = await fetch("/api/tasks");
+  const dtos: TaskDto[] = await res.json();
+  return dtos.map(toTask);
+}
+```
+
+From here on, the interior of the app never sees a raw ID. A component receiving `task.id` can pass it to `deleteTask(id: TaskId)` with no checks and no casts. The two worlds are separate: **DTOs** (data transfer objects, the loose wire shapes) use plain `string`; **domain types** use brands.
+
+The brands also help when going back out. Serializing is free, because a `TaskId` is still a `string`:
+
+```ts
+const body = JSON.stringify({ taskId: task.id }); // ✅ branded values serialize as plain strings
+
+// ❌ Reading back does NOT restore the brand. JSON.parse returns any.
+const { taskId } = JSON.parse(body); // taskId: any, so parse it again at the next boundary
+```
+
+This is [Chapter 32](/chapter/32) in action: validate at the edge, then trust the types inside.
+
+## 78.8 When brands are overkill
+
+Every brand adds friction: constructors to write, assertions to review, test fixtures that must build branded values, and a learning curve for each teammate. That friction is worth paying only when it buys bug prevention.
+
+```ts
+// Worth it: IDs of different entities passed side by side to the same function.
+function assignTask(projectId: ProjectId, taskId: TaskId): void { /* … */ }
+
+// Not worth it: a single-purpose helper where mixing is impossible.
+function formatTitle(title: Brand<string, "Title">): string { return title.trim(); } // overkill
+```
+
+> 🚫 **When not to.** Skip brands when:
+> - the values never travel together (nothing can be swapped), or only one value of that kind exists in the function;
+> - a better name or an object parameter solves the problem more cheaply: `assignTask({ projectId, taskId })` makes swaps impossible without any brand;
+> - the data is mostly written and read in tests or one-off scripts;
+> - you can't enforce the boundary. If half the code uses `as TaskId` freely, the brand gives false confidence.
+
+A good rule of thumb: **brand the things that are expensive to confuse** (IDs on the write path, money, units, validated user input going into a security-sensitive call). Leave the rest as plain primitives.
+
+## Common mistakes
+
+> ⚠️ **Forging with `as` everywhere.** If `as TaskId` appears all over the code, the brand guarantees nothing. Keep exactly one assertion per brand, inside its constructor, and ban the rest with a lint rule.
+
+> ⚠️ **Reading the brand property.** `__brand` (or the symbol key) does not exist at runtime. It prints `undefined`.
+
+> ⚠️ **Forgetting that arithmetic erases brands.** `meters(1) + meters(2)` is `number`. Wrap arithmetic in tested helpers that re-apply the brand.
+
+> ⚠️ **Inferring a union by accident.** A generic brand such as `Money<C>` with two parameters of the same `C` can silently widen to `"USD" | "EUR"`. Use `NoInfer` on the later parameters.
+
+> ⚠️ **Branding without validating.** A smart constructor that checks nothing is just `as` with extra steps.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** two values share a representation but must never be mixed: IDs of different entities, units, currencies, and "already validated" or "already sanitized" strings. Pair every brand with a smart constructor at the edge ([Chapter 32](/chapter/32)).
+
+> 🚫 **When not to.** One-off values, single-parameter helpers, and codebases that can't enforce construction. Object parameters, better names, or a discriminated union are often cheaper fixes.
+
+## How it connects
+
+> 🔗 **Connection.** Brands lean on intersections ([Chapter 13](/chapter/13)), `unique symbol` (78.3, building on `symbol` from [Chapter 6](/chapter/6)), and the earned-by-validation idea from [Chapter 32](/chapter/32). They are also a deliberate use of the structural-typing rules from [Chapter 77](/chapter/77): the brand adds a property so that structural comparison finally has something to compare. [Chapter 81](/chapter/81) builds typed strings out of template literal types.
+
+> 🌍 **Real world.** Zod's `.brand()`, Effect's `Brand` module, type-fest's `Tagged`, and Prisma-style generated ID types all follow this pattern. React Query keys, Stripe-style money libraries, and unit libraries use it to prevent exactly the bugs in this chapter.
+
+## Exercises
+
+### Level 1 — Recall
+
+Define `TaskId` and `ProjectId` brands with a shared `Brand` helper. Write `assignTask(projectId: ProjectId, taskId: TaskId)` and show, with `@ts-expect-error` comments, that swapping the arguments and passing a raw string both fail to compile.
+
+### Level 2 — Application
+
+Add a smart constructor `parseEmail(input: string): Result<Email, string>`. It trims, lowercases, and rejects invalid addresses with a useful message. Write four test cases (two valid, two invalid), and a function `sendInvite(to: Email)` that cannot be called with a plain string.
+
+### Level 3 — Challenge
+
+Implement `Money<C>` with currency safety: `add`, `subtract`, and `multiply(m, factor)` for the same currency, where `add(usd, eur)` is a compile error. Store amounts in integer cents. Add a `convert(m, from, to, rate)` that is the only way to change currency.
+
+*Hint: check whether your two-argument functions accidentally widen `C` to a union.*
+
+### Level 4 — Real-world
+
+**Ticket TF-310: Branded IDs across TaskFlow.** Two production incidents this quarter came from swapped IDs in the API client.
+
+- Introduce `TaskId`, `ProjectId`, and `UserId` brands, created only in smart constructors at the API boundary.
+- Update the API client, the stores, and the components. Count the files changed and the number of `as` assertions added.
+- Add a lint rule or test that fails when an assertion to a branded type appears outside its constructor.
+- Write a short report: how large was the churn, how many latent swaps did the compiler find, and would you do it again?
+
+## Key takeaways
+
+- Structural typing can't tell two same-shaped values apart. Brands add a compile-time tag so it can.
+- A brand is an intersection with a phantom property. It's erased at runtime and must never be read.
+- Unexported `unique symbol` keys make brands collision-proof and hard to forge.
+- Brands are only trustworthy if they are earned by a **smart constructor** at the boundary. Keep one assertion per brand.
+- Parse at the edge, carry brands inward. Arithmetic erases brands, and generic brands need `NoInfer` to stay strict.
+- Brand what's expensive to confuse. Skip it when a cheaper fix exists.
+
+## What comes next
+
+Brands depend on conditional logic you've only touched lightly. In [Chapter 79](/chapter/79) we go deep on conditional types and `infer`, the type-level pattern-matching language that powers most advanced utility types.

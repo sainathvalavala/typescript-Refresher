@@ -1,0 +1,412 @@
+> 📖 **The problem.** You open a TypeScript tutorial, and by page two you hit a line like `const { id, ...rest } = await fetchTask(url)`. Is the confusing part the *types*, or the *JavaScript underneath them*? If you can't tell, you can't fix it, and you will blame TypeScript for gaps that were always in the JavaScript.
+
+This chapter is **not** a JavaScript tutorial. It is a short, honest self-assessment. For each of nine JavaScript concepts you get a quick review, a small self-test, and a note on **where TypeScript or React will lean on it later**. At the end, a scoring rubric tells you whether to proceed or to spend a few days on a specific gap first.
+
+Do the self-tests *without running the code*. Predicting output is the skill that matters, because TypeScript is, in the end, a program that predicts what your code will do.
+
+> 🧠 **Mental model.** TypeScript is JavaScript plus a *description* of it. Everything you write in a type annotation describes values that JavaScript creates at runtime. If you can't picture the runtime value, you can't describe it. So this chapter checks that you can picture the values.
+
+## 4.1 Variables & primitive values
+
+JavaScript has two ways to declare a variable you will actually use: `const` (the binding can't be reassigned) and `let` (it can). Forget `var`. There are seven primitive types: `string`, `number`, `boolean`, `bigint`, `symbol`, `null`, and `undefined`. Everything else is an object. Primitives are compared by **value**; objects are compared by **identity**.
+
+```js
+const title = "Write docs";   // string
+let attempts = 0;             // number
+attempts = attempts + 1;      // fine: let can be reassigned
+title = "Ship it";            // TypeError: Assignment to constant variable.
+
+console.log(typeof 42);       // "number"
+console.log(typeof null);     // "object"  (a 30-year-old quirk)
+console.log(0.1 + 0.2);       // 0.30000000000000004
+console.log(1n + 2n);         // 3n  (bigint)
+```
+
+**Self-test.**
+
+1. What does `typeof undefined` print?
+2. Can you change an element of an array declared with `const`?
+3. What is `"5" + 3`, and what is `"5" * 3`?
+
+*Answers: `"undefined"`. Yes, `const` freezes the binding, not the value. `"53"` and `15`.*
+
+> 🔗 **Why it matters later.** TypeScript infers *different* types for `const` and `let`: `const status = "todo"` gets the exact type `"todo"`, while `let status = "todo"` gets `string` ([Chapter 6](/chapter/6) and [Chapter 8](/chapter/8)). You can't see why until you hold the const/let difference firmly.
+
+## 4.2 Objects & arrays
+
+Objects are bags of named properties; arrays are ordered lists. Both are **reference** values: assigning one to another variable copies the *reference*, not the contents. That single fact causes more bugs, and more React confusion, than any other.
+
+```js
+const a = { title: "Write docs", done: false };
+const b = a;                 // b points at the SAME object
+b.done = true;
+console.log(a.done);         // true: a changed too
+
+const c = { ...a };          // shallow copy: a NEW object
+c.done = false;
+console.log(a.done);         // true: a is untouched
+
+const tags = ["urgent", "ui"];
+const more = [...tags, "docs"];   // new array; tags is unchanged
+tags.push("oops");                // mutates in place
+console.log({} === {});           // false: two different objects
+```
+
+**Self-test.**
+
+1. After `const x = [1, 2]; const y = x; y.push(3);`, what is `x`?
+2. Does `{ ...a }` copy nested objects too?
+3. Why is `[1] === [1]` false?
+
+*Answers: `[1, 2, 3]`. No, it's a shallow copy; nested objects are shared. Two array literals create two distinct objects, and `===` compares identity.*
+
+> 🔗 **Why it matters later.** Object and array types are the heart of [Chapter 7](/chapter/7), `readonly` only makes sense once you understand mutation, and React state **must be replaced, never mutated** ([Chapter 41](/chapter/41)).
+
+## 4.3 Functions, scope & closures
+
+A function declared inside another function can read the outer function's variables, even after the outer function has returned. That captured environment is a **closure**. Arrow functions (`(x) => x * 2`) are the everyday syntax; they also capture the surrounding `this`.
+
+```js
+function makeCounter() {
+  let count = 0;
+  return () => {
+    count = count + 1;
+    return count;
+  };
+}
+
+const next = makeCounter();
+console.log(next()); // 1
+console.log(next()); // 2: count survived inside the closure
+
+const fns = [];
+for (let i = 0; i < 3; i++) {
+  fns.push(() => i);
+}
+console.log(fns.map((f) => f())); // [0, 1, 2]  (with var, this would print [3, 3, 3])
+```
+
+**Self-test.**
+
+1. You run `makeCounter()()` twice, creating two separate counters. What does each call return?
+2. What is the difference between a function *declaration* and an arrow function expression regarding hoisting?
+3. In the loop above, why does `let` give `[0, 1, 2]`?
+
+*Answers: `1` both times, since each call to `makeCounter` creates a fresh `count`. Declarations are hoisted with their body; arrow functions assigned to `const` are not usable before the line runs. `let` creates a new binding per iteration, and each closure captures its own.*
+
+> 🔗 **Why it matters later.** Callbacks are everywhere in typed code ([Chapter 11](/chapter/11)). And closures that capture **old** values are the cause of the infamous *stale closure* bug in React effects ([Chapter 44](/chapter/44)).
+
+## 4.4 Destructuring, rest & spread
+
+Destructuring unpacks values from objects and arrays into variables. The **rest** pattern (`...rest`) gathers what's left; **spread** (`...value`) does the opposite, expanding a value into a new array, object, or argument list. Together they are the standard way to build new values from old ones.
+
+```js
+const task = { id: "t1", title: "Write docs", done: false, tags: ["ui"] };
+
+const { id, title } = task;                  // pick two properties
+const { done, ...others } = task;            // others: { id, title, tags }
+const { priority = "medium" } = task;        // default when missing
+const [first, , third = "none"] = ["a", "b"]; // skip one; default for third
+
+function total(...numbers) {                 // rest parameter: a real array
+  return numbers.reduce((sum, n) => sum + n, 0);
+}
+console.log(total(...[1, 2, 3]));            // 6: spread into arguments
+
+const updated = { ...task, done: true };     // copy with one change
+```
+
+**Self-test.**
+
+1. In `const { a: x } = { a: 1 }`, which variable exists: `a` or `x`?
+2. What is `{ ...{ a: 1, b: 2 }, b: 3 }`?
+3. What does `const [p, q] = "hi"` give you?
+
+*Answers: `x` only (the `a:` is the property to read, `x` is the new name). `{ a: 1, b: 3 }`, because later keys win. `p` is `"h"` and `q` is `"i"`, since strings are iterable.*
+
+> 🔗 **Why it matters later.** React components receive a single props object that you almost always destructure ([Chapter 50](/chapter/50)). Spread is how immutable updates are written ([Chapter 41](/chapter/41)). Rest parameters get their own type syntax in [Chapter 11](/chapter/11).
+
+## 4.5 Classes & prototypes
+
+A `class` is JavaScript's syntax for building objects that share behavior. Under the hood, methods live on a **prototype** object, and an instance finds them by walking up a *prototype chain*. `extends` links one prototype to another, `super` calls the parent, and `this` refers to the instance on which a method was called.
+
+```js
+class Task {
+  constructor(title) {
+    this.title = title;
+    this.done = false;
+  }
+  complete() {
+    this.done = true;
+  }
+}
+
+class TimedTask extends Task {
+  constructor(title, minutes) {
+    super(title);            // must come before using this
+    this.minutes = minutes;
+  }
+}
+
+const t = new TimedTask("Review PR", 15);
+console.log(t instanceof Task);                                // true
+console.log(Object.getPrototypeOf(t) === TimedTask.prototype); // true
+const detached = t.complete;
+detached();   // TypeError: Cannot set properties of undefined (setting 'done')
+```
+
+**Self-test.**
+
+1. Why does `detached()` throw?
+2. Where is `complete` stored: on each instance, or somewhere shared?
+3. What error do you get if a subclass constructor uses `this` before calling `super`?
+
+*Answers: a method pulled off its object loses `this` (it's `undefined` in class bodies). On the shared `Task.prototype`. A `ReferenceError`: must call super before accessing `this`.*
+
+> 🔗 **Why it matters later.** [Chapter 15](/chapter/15) adds access modifiers and contracts to classes, and [Chapter 14](/chapter/14) uses `instanceof` to narrow types. React function components rarely need classes, but custom errors ([Chapter 33](/chapter/33)) do.
+
+## 4.6 Modules (ES Modules)
+
+A module is a file with its own scope. It shares things with `export` and receives things with `import`. A module can have many **named** exports and at most one **default** export. Named imports use braces and must match the exported names; default imports pick any local name.
+
+```js
+// tasks.js
+export const DEFAULT_STATUS = "todo";
+export function createTask(title) {
+  return { title, status: DEFAULT_STATUS };
+}
+export default class TaskStore {}
+
+// app.js
+import TaskStore, { createTask, DEFAULT_STATUS as initial } from "./tasks.js";
+import * as tasks from "./tasks.js";        // namespace object
+
+console.log(tasks.createTask("Write docs"));
+const lazy = await import("./report.js");    // dynamic import returns a promise
+```
+
+**Self-test.**
+
+1. What is the difference between `import x from "./a.js"` and `import { x } from "./a.js"`?
+2. Can you `import` inside an `if` block? What can you do instead?
+3. Why do many files in modern projects end in `.mjs` or have `"type": "module"` in `package.json`?
+
+*Answers: the first reads the default export (any name), the second reads a named export called `x`. Static `import` must be top level; use dynamic `import()`. Node needs to be told a file is an ES module rather than CommonJS.*
+
+> 🔗 **Why it matters later.** Type-only imports, `verbatimModuleSyntax`, and module resolution settings are all in [Chapter 25](/chapter/25), and they decide whether your editor can find types at all.
+
+## 4.7 Promises & async/await
+
+A **promise** is an object representing a value that will exist later: pending, then either fulfilled with a value or rejected with an error. `async` functions always return a promise, and `await` pauses *that function* (not the whole program) until a promise settles. Rejections behave like thrown errors inside `try`/`catch`.
+
+```js
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function loadTask(id) {
+  const response = await fetch(`/api/tasks/${id}`);
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json();            // the async function wraps this in a promise
+}
+
+const [a, b] = await Promise.all([loadTask("t1"), loadTask("t2")]); // parallel
+loadTask("t1").then((t) => console.log(t.title)).catch(console.error);
+
+console.log("A");
+wait(0).then(() => console.log("B"));
+console.log("C");                     // prints A, C, B
+```
+
+**Self-test.**
+
+1. In what order do `A`, `B`, `C` print above, and why?
+2. If one promise in `Promise.all` rejects, what happens to the combined promise?
+3. Does `async function f() { return 1 }` return `1` or something else?
+
+*Answers: A, C, B, because callbacks run after the current synchronous code finishes. The combined promise rejects immediately with that error. It returns a `Promise` that resolves to `1`.*
+
+> 🔗 **Why it matters later.** `Promise<T>` and the `Awaited` helper appear in [Chapter 11](/chapter/11) and [Chapter 21](/chapter/21). Data fetching in React ([Chapter 61](/chapter/61)) is promise code with extra rules.
+
+## 4.8 Error handling
+
+`throw` can throw *any* value, but you should throw `Error` objects, which carry a message and a stack trace. `try` runs code that might throw, `catch` receives whatever was thrown, and `finally` runs no matter what. Errors thrown in `async` functions turn into rejections.
+
+```js
+function parseTask(json) {
+  try {
+    return JSON.parse(json);
+  } catch (error) {
+    throw new Error("Invalid task JSON", { cause: error }); // keep the original
+  } finally {
+    console.log("parse attempted");   // runs on success AND failure
+  }
+}
+
+try {
+  parseTask("{ not json");
+} catch (error) {
+  console.log(error instanceof Error); // true
+  console.log(error.message);          // "Invalid task JSON"
+  console.log(error.cause.name);       // "SyntaxError"
+}
+
+throw "just a string";   // legal, but you lose the stack trace. Avoid.
+```
+
+**Self-test.**
+
+1. What does a `finally` block run on: success only, failure only, or both?
+2. What is wrong with `throw "failed"`?
+3. A function does `return await somePromise()` inside `try`/`catch`. Why is the `await` there significant?
+
+*Answers: both (even after a `return`). The string has no stack trace, no `.message`, and fails `instanceof Error` checks. Without `await`, the rejection would escape the `try`, because the promise is returned before it settles.*
+
+> 🔗 **Why it matters later.** In TypeScript the variable in `catch (e)` has type `unknown`, because anything can be thrown ([Chapter 14](/chapter/14)). Designing your own error types is [Chapter 33](/chapter/33).
+
+## 4.9 DOM basics & browser APIs
+
+In a browser, the page is a tree of **DOM** nodes. You select elements, read or change them, and listen for **events**. Browsers also ship APIs such as `fetch` (HTTP) and `localStorage` (a small string-only key-value store that survives reloads).
+
+```js
+const list = document.querySelector("#task-list");        // Element or null
+const button = document.querySelector("button.add");
+
+button.addEventListener("click", (event) => {
+  const li = document.createElement("li");
+  li.textContent = "New task";
+  list.append(li);
+});
+
+localStorage.setItem("filter", "done");
+const filter = localStorage.getItem("filter");             // "done", or null if absent
+localStorage.setItem("count", 3);                          // stored as the string "3"
+
+const response = await fetch("/api/tasks");
+const tasks = await response.json();
+```
+
+**Self-test.**
+
+1. What does `querySelector` return when nothing matches?
+2. What type do values come back as from `localStorage`, whatever you stored?
+3. Why does `await response.json()` need a second `await` after `await fetch(...)`?
+
+*Answers: `null`. Always strings (or `null`). `fetch` resolves when headers arrive; reading the body is a separate asynchronous step.*
+
+> 🔗 **Why it matters later.** The `null` from `querySelector` is why DOM code is a classic use case for narrowing ([Chapter 14](/chapter/14)). DOM types are [Chapter 35](/chapter/35), and React's event types are [Chapter 51](/chapter/51). The Level 4 exercise below returns in Chapter 35.
+
+## 4.10 Your readiness verdict
+
+Count how many self-tests you answered correctly *before* reading the answers. There were nine sections with three questions each, so 27 points in total (4.1 through 4.9).
+
+| Score | Verdict | What to do |
+|---|---|---|
+| 24–27 | Ready | Proceed to [Chapter 5](/chapter/5). |
+| 18–23 | Mostly ready | Proceed, but review the sections where you missed two or more questions. Do that alongside Part II, not before. |
+| 12–17 | Gaps that will hurt | Spend a few days on the weak topics first (see below), then retake the quiz. |
+| Under 12 | Build the base first | Work through a full JavaScript course, then return. TypeScript will make sense in half the time. |
+
+Not all gaps cost the same. Rank them by how much the book leans on them:
+
+```text
+Must be solid:     4.2 objects/arrays (reference vs copy), 4.3 closures, 4.4 destructuring/spread, 4.7 promises
+Strongly helpful:  4.1 const/let, 4.6 modules, 4.8 error handling
+Can learn on the way: 4.5 classes (Chapter 15 re-teaches them), 4.9 DOM (Chapter 35 re-teaches it)
+```
+
+For review, these free resources cover everything above: [javascript.info](https://javascript.info) (the modern tutorial, best for a structured pass), [MDN's JavaScript Guide](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide) (the reference you will keep open), and *Eloquent JavaScript* (free online, best for closures and async). Pick one and read only the chapters matching your weak sections.
+
+> 💡 **Tip.** A weak spot is not a failure. Read the explanation, then **retype** the example and change one thing to see what happens. Ten minutes of that beats an hour of re-reading.
+
+## Common mistakes
+
+> ⚠️ **Skipping the checkpoint because "it's only JavaScript".** Closures and reference semantics are the two topics that account for most "TypeScript is confusing" and "React is broken" moments. They are JavaScript topics.
+
+> ⚠️ **Expecting TypeScript to teach you JavaScript.** The compiler tells you *what* might be wrong with a type, not *why* a closure captured a stale value. Fix runtime misunderstandings at the source.
+
+> ⚠️ **Reading the answers first.** The value of a self-test is the prediction. If you peek, you learn nothing about your gaps.
+
+> ⚠️ **Treating `var`, callbacks, and prototype code as required.** You will meet them in old code, but this book uses `const`/`let`, promises, and `class`.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** you are new to JavaScript, returning after years away, or coming from another language (you may know *what* closures are but not how JavaScript's `this` and `==` behave).
+
+> 🚫 **When not to.** If you ship JavaScript professionally every day, skim the "why it matters later" notes, skip the self-tests, and do only the Level 3 and 4 exercises.
+
+## How it connects
+
+> 🔗 **Connection.** Each section above points forward: `const`/`let` to inference ([Chapter 6](/chapter/6)), objects to [Chapter 7](/chapter/7), closures to [Chapter 44](/chapter/44), classes to [Chapter 15](/chapter/15), modules to [Chapter 25](/chapter/25), errors to [Chapter 14](/chapter/14), and the DOM to [Chapter 35](/chapter/35). Chapters 1 to 3 told you *why* types exist; this one confirmed you can read the code they describe.
+
+## Exercises
+
+### Level 1 — Recall
+
+A twenty-question predict-the-output quiz. Write each answer on paper, then run the code to check.
+
+```js
+console.log(typeof null);                       // 1
+console.log(typeof [] === "object");            // 2
+console.log([1, 2, 3].map((n) => n * 2));       // 3
+console.log("5" - 2, "5" + 2);                  // 4
+console.log(0 == "", 0 === "");                 // 5
+console.log([] + []);                           // 6
+console.log([10, 9, 1].sort());                 // 7
+const a = [1, 2]; const b = a; b.push(3);
+console.log(a.length);                          // 8
+console.log({ ...{ x: 1 }, x: 2 });             // 9
+const { p = 5, q } = { q: undefined };
+console.log(p, q);                              // 10
+console.log((() => { try { return 1 } finally { console.log("f") } })()); // 11
+console.log([..."abc"].length);                 // 12
+console.log(null ?? "d", 0 ?? "d", 0 || "d");   // 13
+console.log(Number("12px"), parseInt("12px"));  // 14
+console.log([1, 2, 3].includes(2), [NaN].includes(NaN)); // 15
+console.log(Object.keys({ b: 1, a: 2 }));       // 16
+const f = () => this; console.log(typeof f);    // 17
+Promise.resolve(1).then(console.log); console.log(2); // 18
+console.log([1, [2, [3]]].flat(Infinity));      // 19
+console.log(new Set([1, 1, 2]).size);           // 20
+```
+
+### Level 2 — Application
+
+Refactor this callback-based script to `async`/`await`. Wrap the work in `try`/`catch`, check `response.ok`, and make the two independent loads run in parallel.
+
+```js
+function loadDashboard(done) {
+  fetch("/api/user").then((r) => r.json()).then((user) => {
+    fetch("/api/tasks").then((r) => r.json()).then((tasks) => {
+      done(null, { user, tasks });
+    }).catch(done);
+  }).catch(done);
+}
+```
+
+### Level 3 — Challenge
+
+In plain JavaScript, write a short program with a counter and a timer where a closure prints an **old** value after the counter has changed. Then explain in three or four sentences, in your own words, *which variable the closure captured and why it didn't see the update*. This explanation returns as the stale-closure bug in [Chapter 44](/chapter/44).
+
+*Hint: loop with `var`, or capture a value in a `setTimeout` callback and change a different copy later.*
+
+### Level 4 — Real-world
+
+**Ticket TF-004: Prototype the task list page.** Product wants a throwaway page before any framework is chosen.
+
+- Plain HTML plus one JavaScript file; no libraries.
+- On load, `fetch` a list of tasks (use a public placeholder API or a local JSON file) and render each as an `li`.
+- Show a loading message while waiting and a readable error message if the request fails or returns a non-2xx status.
+- Persist a "hide completed" toggle in `localStorage`.
+
+Keep it. You will add types to this exact page in [Chapter 35](/chapter/35).
+
+## Key takeaways
+
+- TypeScript describes JavaScript values, so you must be able to picture the runtime values first.
+- `const` vs `let`, reference vs copy, closures, and promises are the four topics the rest of the book leans on hardest.
+- Destructuring, rest, and spread are everyday syntax in typed code and in React.
+- Anything can be thrown in JavaScript, and `localStorage` and `querySelector` can hand back `null`. Both facts will matter once the compiler starts asking about them.
+- Score yourself honestly; a short, targeted review now saves weeks of confusion later.
+
+## What comes next
+
+You can read the code. Now let's make the compiler read it too. In [Chapter 5](/chapter/5) you will install TypeScript, rename a perfectly working JavaScript file to `.ts`, and watch three red squiggles appear. The question to carry in is: *are they bugs, or noise?*

@@ -1,0 +1,346 @@
+> 📖 **The problem.** TaskFlow's shared `Button` was written in an afternoon: `type ButtonProps = { label: string; onClick: () => void }`. Then the sign-in form needs `type="submit"`, the toolbar needs `disabled`, and the icon-only delete button needs `aria-label`. Each one is a compile error. Under deadline, someone adds `[key: string]: any` to the props type. Every error disappears, and so does every check: `<Button onClcik={save} />` now compiles, and the save button silently does nothing.
+
+A component's props type is the contract between the person who wrote the component and everyone who uses it. Most bad component code isn't bad *logic*; it's a bad contract: too loose, too rigid, inconsistent with its neighbors, or re-inventing what HTML already defines. This chapter teaches you to design that contract on purpose. By the end, you'll type optional props, children, callbacks, and slots correctly, extend native elements without losing a single attribute, and recognize the API smells that make components hard to use.
+
+> 🧠 **Mental model.** **A component's props type is its public API.** Design it like a function signature: small, consistent, hard to misuse. When the component *is* a native element with extras (a button, an input, a link), extend that element's props rather than re-describing them.
+
+## 50.1 Props types
+
+A props type is just an object type that describes the single argument a component receives. You can write it with a `type` alias or an `interface` ([Chapter 8](/chapter/8)), and for a simple object, both work identically:
+
+```tsx
+type TaskCardProps = {
+  task: Task;
+  compact?: boolean;
+};
+
+interface TaskCardProps2 {
+  task: Task;
+  compact?: boolean;
+}
+
+function TaskCard({ task, compact }: TaskCardProps) {
+  return <article className={compact ? "compact" : ""}>{task.title}</article>;
+}
+```
+
+The difference shows up as props get more interesting. Props are often built from **unions** (two mutually exclusive shapes, 50.7) and **intersections** (native props plus your own, 50.6). Only a `type` alias can name a union directly, so this book uses `type` for all props, for consistency. If your team prefers `interface`, that's fine too; the important thing is to pick one.
+
+Naming has a strong convention: the props type of `TaskCard` is `TaskCardProps`, declared right above the component in the same file. Export it when other code needs it, such as a wrapper component or a test.
+
+```tsx
+export type TaskCardProps = {
+  task: Task;
+  compact?: boolean;
+};
+
+export function TaskCard({ task, compact = false }: TaskCardProps) {
+  // …
+}
+```
+
+## 50.2 Optional props and defaults
+
+Mark a prop optional with `?` and the caller may leave it out. Inside the component, an optional prop has `undefined` in its type, which TypeScript will make you handle. The cleanest way to handle it is a **default value in the destructuring pattern**: if the caller omits the prop, the default fills in, and TypeScript removes `undefined` from the variable's type.
+
+```tsx
+type BadgeProps = {
+  label: string;
+  size?: "sm" | "md" | "lg";
+};
+
+function Badge({ label, size = "md" }: BadgeProps) {
+  //                    ^ size: "sm" | "md" | "lg", with no undefined
+  return <span className={`badge badge-${size}`}>{label}</span>;
+}
+
+<Badge label="Urgent" />;            // ✅ size is "md"
+<Badge label="Urgent" size="lg" />;  // ✅
+<Badge label="Urgent" size="xl" />;  // ❌ Type '"xl"' is not assignable to type '"lg" | "md" | "sm" | undefined'.
+```
+
+Notice the default lives in exactly one place, right next to the code that uses it. Older code put defaults in a separate `Badge.defaultProps = { size: "md" }` object. React 19 ignores `defaultProps` on function components entirely, so if you're upgrading, move each default into the destructuring.
+
+> ⚠️ **Common mistake.** A default like `tags = []` creates a *new* array on every render. That's harmless for display, but it breaks `memo` and effect dependencies that compare by identity ([Chapter 47](/chapter/47)). For object and array defaults, hoist a constant: `const NO_TAGS: readonly string[] = [];` and write `tags = NO_TAGS`.
+
+## 50.3 Typing children
+
+`children` is just a prop with a special syntax: whatever you put between the opening and closing tags. Type it like any other prop, almost always as `ReactNode` ([Chapter 49](/chapter/49)), and decide whether it's required.
+
+```tsx
+import type { PropsWithChildren, ReactNode } from "react";
+
+type PanelProps = { title: string; children: ReactNode };       // required
+type CardProps = { title: string; children?: ReactNode };       // optional
+type SectionProps = PropsWithChildren<{ title: string }>;       // same as CardProps
+
+function Panel({ title, children }: PanelProps) {
+  return <section><h2>{title}</h2>{children}</section>;
+}
+
+<Panel title="Today" />; // ❌ Property 'children' is missing in type '{ title: string; }' but required in type 'PanelProps'.
+```
+
+`PropsWithChildren<P>` is a small helper that adds `children?: ReactNode` to `P`. It's handy, but writing `children` out is just as short and says whether it's required. Either is fine; just don't leave `children` out of the type when you use it.
+
+What you **can't** usefully do is restrict *which* elements may be passed as children. Every JSX expression has the same type, `React.JSX.Element`, no matter which component created it. So a type like `ReactElement<TabProps>` looks strict but accepts anything:
+
+```tsx
+type TabProps = { label: string; children: ReactNode };
+function Tabs({ children }: { children: ReactElement<TabProps>[] }) { /* … */ }
+
+<Tabs>
+  <Tab label="Board">…</Tab>
+  <div>sneaky</div> {/* ✅ compiles anyway: every element is JSX.Element */}
+</Tabs>;
+```
+
+When you need structured children, pass **data** instead (`tabs={[{ label, content }]}`) or use slot props (50.5). [Chapter 87](/chapter/87) covers compound components, the pattern for when JSX children really are the best API.
+
+## 50.4 Callback props
+
+A callback prop is how a child tells its parent that something happened. Type it as a function type, and name it for the **event**, not for what the parent will do: `onSelect`, `onComplete`, `onStatusChange`. Inside the parent, the function you pass is conventionally called `handleSelect`, `handleComplete`, and so on. Props say what happened (`on…`); handlers say how to respond (`handle…`).
+
+```tsx
+type TaskId = Task["id"];
+
+type TaskRowProps = {
+  task: Task;
+  onSelect: (id: TaskId) => void;
+  onStatusChange: (id: TaskId, status: Task["status"]) => void;
+};
+
+function TaskRow({ task, onSelect, onStatusChange }: TaskRowProps) {
+  return (
+    <li onClick={() => onSelect(task.id)}>
+      {task.title}
+      <button onClick={() => onStatusChange(task.id, "done")}>Done</button>
+    </li>
+  );
+}
+
+function TaskList({ tasks }: { tasks: Task[] }) {
+  function handleSelect(id: TaskId) { /* open the detail panel */ }
+  function handleStatusChange(id: TaskId, status: Task["status"]) { /* save */ }
+  return tasks.map((t) => (
+    <TaskRow key={t.id} task={t} onSelect={handleSelect} onStatusChange={handleStatusChange} />
+  ));
+}
+```
+
+Two design choices make this API good. First, the callback passes **domain values** (`id`, `status`), not a DOM event, so the parent never has to dig through `e.target`. Second, the return type is `void`, which tells callers "I ignore what you return", so a handler that happens to return something is still accepted. If a parameter type disagrees, the error is the familiar function-compatibility message:
+
+```tsx
+<TaskRow task={t} onSelect={(id: number) => {}} onStatusChange={save} />;
+// ❌ Type '(id: number) => void' is not assignable to type '(id: string) => void'.
+```
+
+## 50.5 Slot props
+
+Sometimes a component has more than one place where the caller decides what to render: an icon before the label, a header, an actions area. `children` covers only one place. **Slot props** cover the rest: ordinary props typed `ReactNode`.
+
+```tsx
+type TaskPanelProps = {
+  header: ReactNode;          // required slot
+  actions?: ReactNode;        // optional slot
+  icon?: ReactNode;
+  children: ReactNode;
+};
+
+function TaskPanel({ header, actions, icon, children }: TaskPanelProps) {
+  return (
+    <section className="panel">
+      <header>{icon}{header}{actions && <div className="actions">{actions}</div>}</header>
+      <div className="body">{children}</div>
+    </section>
+  );
+}
+
+<TaskPanel
+  header={<h2>Sprint 14</h2>}
+  icon={<CalendarIcon />}
+  actions={<Button variant="ghost">Edit</Button>}
+>
+  <TaskList tasks={tasks} />
+</TaskPanel>;
+```
+
+Because a slot is `ReactNode`, the caller can pass text, an element, or nothing. When the component needs to give the caller **data** before they decide what to render, a plain node isn't enough, so you use a **render-function prop**: a function that receives the data and returns a node.
+
+```tsx
+type TaskListProps = {
+  tasks: Task[];
+  renderItem: (task: Task) => ReactNode;
+};
+```
+
+You'll use render functions heavily with generic components in [Chapter 57](/chapter/57), and [Chapter 88](/chapter/88) explores them as a full pattern.
+
+## 50.6 Extending native elements
+
+Back to the opening `Button`. It *is* a button, so it should accept everything a `<button>` accepts. Instead of listing those props by hand, intersect the native props with your own and spread the rest onto the element:
+
+```tsx
+import type { ComponentProps } from "react";
+
+type ButtonProps = ComponentProps<"button"> & {
+  variant?: "primary" | "secondary" | "ghost";
+  size?: "sm" | "md" | "lg";
+};
+
+function Button({ variant = "primary", size = "md", type = "button", className, ...rest }: ButtonProps) {
+  const classes = ["btn", `btn-${variant}`, `btn-${size}`, className].filter(Boolean).join(" ");
+  return <button type={type} className={classes} {...rest} />;
+}
+
+<Button type="submit" disabled={saving}>Save</Button>;      // ✅ native props
+<Button aria-label="Delete task" variant="ghost">🗑</Button>; // ✅
+<Button onClcik={save}>Save</Button>; // ❌ Property 'onClcik' does not exist on type 'IntrinsicAttributes & ClassAttributes<HTMLButtonElement> & ButtonHTMLAttributes<HTMLButtonElement> & { ...; }'. Did you mean 'onClick'?
+```
+
+Three details matter. `...rest` collects every prop you didn't destructure (including `children`, `onClick`, `ref`, and all the `aria-*` attributes) and passes it through. `className` is pulled out so you can **merge** it with yours instead of letting the caller's replace it. And `type` defaults to `"button"`, because a native button inside a form defaults to `"submit"`, a classic source of accidental form submissions.
+
+When your prop has the **same name** as a native one with a different type, an intersection produces an impossible type. The native `<input>` has `size?: number`, so adding `size?: "sm" | "md"` gives `number & ("sm" | "md")`, which is `never`. Remove the native version first with `Omit` ([Chapter 21](/chapter/21)):
+
+```tsx
+type BadFieldProps = ComponentProps<"input"> & { size?: "sm" | "md" };
+function BadField(props: BadFieldProps) { return <input {...props} />; }
+<BadField size="sm" />; // ❌ Type 'string' is not assignable to type 'undefined'.
+
+type TextFieldProps = Omit<ComponentProps<"input">, "size" | "onChange"> & {
+  size?: "sm" | "md";
+  onChange?: (value: string) => void; // a friendlier, value-first callback
+};
+```
+
+## 50.7 Discriminated props (first look)
+
+Some props only make sense together. A TaskFlow action is either a button with an `onClick` or a link with an `href`. Making both optional allows nonsense: a "link" with no `href`, or both at once. A **discriminated union** of props ([Chapter 13](/chapter/13)) states the real rule: the `variant` decides which other props are required.
+
+```tsx
+type ActionProps =
+  | { variant: "button"; label: string; onClick: () => void }
+  | { variant: "link"; label: string; href: string };
+
+function Action(props: ActionProps) {
+  if (props.variant === "link") {
+    return <a href={props.href}>{props.label}</a>;   // props narrowed: href exists
+  }
+  return <button onClick={props.onClick}>{props.label}</button>;
+}
+
+<Action variant="link" label="Docs" href="/docs" />;  // ✅
+<Action variant="link" label="Docs" />;
+// ❌ Property 'href' is missing in type '{ variant: "link"; label: string; }' but required in type '{ variant: "link"; label: string; href: string; }'.
+<Action variant="button" label="Save" href="/x" />;
+// ❌ Property 'href' does not exist on type 'IntrinsicAttributes & { variant: "button"; label: string; onClick: () => void; }'.
+```
+
+Inside the component, check `props.variant` **before** reading the variant-specific props. Narrowing works on the `props` object, which is why this example doesn't destructure everything up front. [Chapter 85](/chapter/85) goes much deeper: optional discriminants, `never` to forbid props, and combining unions with native element props.
+
+## 50.8 Designing component APIs
+
+Good types are necessary but not sufficient; the *shape* of the API matters too. A few principles cover most decisions.
+
+**Prefer unions over boolean flags.** `primary`, `danger`, and `small` as separate booleans allow `<Button primary danger small large />`. One `variant` and one `size` union make conflicting combinations impossible. **Be consistent across components.** If `Button` uses `size: "sm" | "md" | "lg"`, so should `Badge` and `TextField`; callers shouldn't have to remember that one component says `small`. **Choose controlled or uncontrolled deliberately.** A *controlled* component takes `value` plus `onChange` and the parent owns the state; an *uncontrolled* one takes `defaultValue` and owns its own. Supporting both is a real cost; supporting one clearly is often better. **Default to the common case**, so the simplest usage is the shortest.
+
+Here's a P10 component redesigned with those rules:
+
+```tsx
+// Before: flags, an index signature, and a vague callback
+type OldToggleProps = {
+  on: boolean;
+  small?: boolean;
+  large?: boolean;
+  change: (e: any) => void;
+  [key: string]: any;
+};
+
+// After: one size union, a value-first callback, native props, safe defaults
+type ToggleProps = Omit<ComponentProps<"button">, "onChange" | "value"> & {
+  checked: boolean;                          // controlled
+  onCheckedChange: (checked: boolean) => void;
+  size?: "sm" | "md" | "lg";
+  label: string;                             // required: icon-only toggles need a name
+};
+
+function Toggle({ checked, onCheckedChange, size = "md", label, ...rest }: ToggleProps) {
+  return (
+    <button role="switch" aria-checked={checked} aria-label={label} type="button"
+      className={`toggle toggle-${size}`} onClick={() => onCheckedChange(!checked)} {...rest} />
+  );
+}
+```
+
+Every change removes a way to misuse the component, and the type now reads like documentation.
+
+## Common mistakes
+
+> ⚠️ **Index signatures on props.** `[key: string]: any` turns every typo into valid code: `<Button onClcik={save} />` compiles and does nothing. If you need "every native prop", use `ComponentProps<"button">`, which is complete *and* checked.
+
+> ⚠️ **Re-declaring native props by hand.** `disabled?: boolean; type?: string; ariaLabel?: string` is always incomplete, often wrong (`type` should be `"submit" | "reset" | "button"`, and the attribute is `aria-label`), and it drifts as React's types improve.
+
+> ⚠️ **Boolean flags that should be a union.** `small`, `medium`, `large` as booleans have eight combinations and only three are meaningful. Write `size: "sm" | "md" | "lg"`.
+
+```tsx
+type LooseProps = { label: string; [key: string]: any };
+function Loose(props: LooseProps) { return <button {...props}>{props.label}</button>; }
+
+<Loose label="Save" onClcik={save} />; // ✅ compiles, which is exactly the problem
+```
+
+## When to use it, and when not to
+
+> ✅ **Use it when** a component is a thin wrapper around one native element (`Button`, `TextField`, `Link`, `Card` as a `div`): extend that element's props with `ComponentProps<…>` so callers keep every attribute and handler they already know.
+
+> 🚫 **When not to.** Don't extend native props for components that aren't wrappers of a native element. A `TaskCard` or `ProjectSummary` is a domain component; spreading 200 `div` attributes onto it makes the API huge and blurs what the component is for. Give it a small, specific props type, and add `className` explicitly if styling hooks are needed.
+
+## How it connects
+
+> 🔗 **Connection.** Props are a function's parameter ([Chapter 11](/chapter/11)), optional props come from [Chapter 7](/chapter/7), `Omit` and `Partial` are the utility types of [Chapter 21](/chapter/21), and discriminated props are the unions of [Chapter 13](/chapter/13) and narrowing of [Chapter 14](/chapter/14) applied to components. [Chapter 51](/chapter/51) types the event handlers you've been passing, and [Chapters 85–89](/chapter/85) return to component API design at an advanced level.
+
+> 🌍 **Real world.** Design systems publish their props types as their documentation. Look at how Radix UI or React Aria name things: `onOpenChange`, `onValueChange`, `defaultValue`, `size`, `variant`. Consistent naming across dozens of components is a large part of why those libraries feel easy.
+
+## Exercises
+
+### Level 1 — Recall
+
+Write a props type (and the function signature) for each component, using the description only:
+
+1. `Avatar`: a required user name, an optional image URL, and a size of small, medium, or large (medium by default).
+2. `ProgressBar`: a value from 0 to 100 and an optional accessible label.
+3. `Dialog`: an `open` flag, a callback when it should close, a required title slot, and children.
+4. `TagList`: a list of tag strings and a callback when a tag is removed, which receives the tag.
+5. `PriorityPicker`: a controlled priority value (`"low" | "medium" | "high"`) and a change callback.
+
+### Level 2 — Application
+
+Build TaskFlow's `Button`. It accepts every native `<button>` prop plus `variant` (`"primary" | "secondary" | "ghost" | "danger"`) and `size` (`"sm" | "md" | "lg"`). It defaults to `type="button"`, merges the caller's `className` with its own, and passes `ref` through. Write five usages, including one that should fail to compile.
+
+### Level 3 — Challenge
+
+Build a `TextField` with `label` (required), `error?: string`, `hint?: string`, and all native `<input>` props. The label must be connected to the input by `id`, and the hint and error must be connected by `aria-describedby`. If the caller doesn't pass an `id`, generate one.
+
+*Hint: `useId` gives you a stable id; the caller's `id` should win when present.*
+
+### Level 4 — Real-world
+
+**Ticket TF-327: API review of the gallery components.** Three P10 components (`Button`, `Toggle`, and `Card`) have inconsistent and leaky APIs.
+
+- Write a short review for each: what can be misused today, with an example call that compiles but is wrong.
+- Ship improved versions with no index signatures, no boolean flag clusters, and consistent `size`/`variant` naming across all three.
+- Every wrapper of a native element accepts that element's native props; domain-only components do not.
+- Update every call site in the gallery; it compiles and renders the same.
+
+## Key takeaways
+
+- A props type is a component's public API: keep it small, consistent, and hard to misuse.
+- Put defaults in destructuring. React 19 ignores `defaultProps` on function components.
+- Type `children` and slots as `ReactNode`, and say whether they're required. You can't usefully restrict which elements are passed.
+- Name callback props `onX` and pass domain values, not DOM events. Name the parent's functions `handleX`.
+- Extend native elements with `ComponentProps<"button"> & …`, spread `...rest`, and `Omit` any prop you redefine.
+- Use a discriminated union when one prop decides which others are required, and unions instead of boolean flags.
+
+## What comes next
+
+Your `Button` now accepts `onClick`, and your `TextField` accepts `onChange`. But what exactly is the `e` those handlers receive, and why do so many codebases type it `any`? [Chapter 51: Typing Events](/chapter/51) gives every handler an honest type.

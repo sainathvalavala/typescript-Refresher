@@ -1,0 +1,529 @@
+> 📖 **The problem.** TaskFlow has grown to 60 components, all sitting side by side in one flat `components/` folder. Adding a "blocked" status touched `types.ts`, a 900-line `utils/format.ts`, and three components that had nothing to do with each other. Two developers keep editing the same files and fighting merge conflicts. Nobody can say where a new "task comments" feature should go, so it goes everywhere.
+
+Nothing here is a TypeScript error, and nothing is a React bug. The code works. What's broken is the **shape** of the codebase: every change is expensive, ownership is unclear, and a new teammate needs a week just to find things. This chapter is about giving a React application a structure that keeps changes small and local as it grows.
+
+By the end, you'll be able to organize an app by feature, draw the layers that data flows through, decide where each kind of type belongs, enforce the rules with a linter, type and validate your environment config, and scaffold the TaskFlow Web app you'll build across this part.
+
+> 🧠 **Mental model.** **Organize by feature, depend in one direction, and expose each feature through a small public API.** Each feature is a box with one door (its `index.ts`). Arrows only point *down*, from the app to features to shared code. And at every seam between boxes, a **type is the contract**.
+
+## 58.1 Why structure matters
+
+Folder structure feels like a matter of taste until you measure what it costs. Three costs grow with a badly shaped codebase:
+
+- **Change cost.** How many files must you touch, and understand, to make one change? In a healthy structure, a feature change touches one folder.
+- **Ownership.** Can a team (or a person) say "this folder is mine" and change it without coordinating with everyone? Merge conflicts are a symptom of shared ownership of the same files.
+- **Onboarding.** Can a newcomer find "everything about tasks" by opening one place, or do they need to search the whole tree?
+
+Here's the flat TaskFlow from the opening, and the commit that added one status:
+
+```text
+src/
+  components/          ← 60 files, alphabetical, no grouping
+    AddTaskButton.tsx
+    Avatar.tsx
+    BoardColumn.tsx
+    InviteMemberModal.tsx
+    ProjectCard.tsx
+    ProjectSummary.tsx
+    TaskCard.tsx
+    …53 more
+  hooks/               ← useTasks, useProjects, useDebounce, all mixed
+  utils/format.ts      ← 900 lines: dates, money, task helpers, project helpers
+  types.ts             ← every type in the app
+```
+
+```sh
+$ git show --stat HEAD
+feat: add "blocked" task status
+ src/types.ts                        |  2 +-
+ src/utils/format.ts                 | 14 +++++---
+ src/components/BoardColumn.tsx      |  6 ++--
+ src/components/TaskCard.tsx         |  9 ++---
+ src/components/ProjectSummary.tsx   |  4 +-
+```
+
+One idea ("tasks can be blocked") was smeared across five files in three folders. Multiply by every feature and every developer, and you have the opening scenario. Structure is how you make *one idea live in one place*.
+
+## 58.2 By type vs by feature
+
+There are two classic ways to organize a frontend. **By type** groups files by what they *are*: all components together, all hooks together, all utilities together. **By feature** groups files by what they're *for*: everything about tasks together, everything about projects together.
+
+```text
+By type                          By feature
+src/                             src/
+  components/                      features/
+    TaskCard.tsx                     tasks/
+    ProjectCard.tsx                    TaskCard.tsx
+    Button.tsx                         useTasks.ts
+  hooks/                               tasksApi.ts
+    useTasks.ts                      projects/
+    useProjects.ts                     ProjectCard.tsx
+  api/                                 useProjects.ts
+    tasksApi.ts                        projectsApi.ts
+    projectsApi.ts                 shared/
+                                     Button.tsx
+```
+
+By type is easy to start with and fine for small apps: there are few files, and "where does a hook go?" has an obvious answer. It scales badly because a feature change cuts *across* every folder. By feature keeps related code together, so a change to tasks stays in `features/tasks`, but it raises a new question: where does code that *several* features use go?
+
+The answer is a **hybrid** that this book recommends, and that most mature React codebases converge on:
+
+| Folder | What lives there | Example |
+|---|---|---|
+| `app/` | Wiring: router, providers, root layout | `router.tsx`, `providers.tsx` |
+| `features/` | One folder per product feature, organized by type *inside* | `features/tasks/hooks/` |
+| `shared/` | Code with no product knowledge, used by many features | `shared/ui/Button.tsx` |
+
+By feature on the outside, by type on the inside. You get locality for changes and familiar sub-folders for finding things.
+
+## 58.3 Feature modules
+
+A **feature module** is a folder that owns one slice of the product: its components, its hooks, its API calls, and its types. Inside, it uses the same small set of sub-folders every time, so moving between features feels familiar:
+
+```text
+features/tasks/
+  components/
+    TaskBoard.tsx
+    TaskCard.tsx
+    TaskStatusBadge.tsx
+  hooks/
+    useProjectTasks.ts
+    useUpdateTaskStatus.ts
+  api/
+    tasksService.ts      ← calls the API client, maps DTOs to domain types
+    taskDto.ts           ← the wire format (Chapter 61)
+  types.ts               ← the domain types for this feature
+  index.ts               ← the public API: the only door in
+```
+
+The most important file is the smallest one. `index.ts` decides what the rest of the app is *allowed* to use. Everything not listed there is private to the feature, even though JavaScript can't technically stop you from importing it (section 58.6 adds a lint rule that does).
+
+```ts
+// features/tasks/index.ts: the public API of the tasks feature
+export { TaskBoard } from "./components/TaskBoard";
+export { TaskStatusBadge } from "./components/TaskStatusBadge";
+export { useProjectTasks } from "./hooks/useProjectTasks";
+export type { Task, TaskStatus, Priority } from "./types";
+// Not exported: TaskCard, tasksService, taskDto. Internal details, free to change.
+```
+
+```tsx
+// Somewhere else in the app
+import { TaskBoard, type Task } from "@/features/tasks"; // ✅ through the door
+import { TaskCard } from "@/features/tasks/components/TaskCard"; // ❌ reaching inside (see 58.6)
+```
+
+A small public API is what makes refactoring safe. You can rename `TaskCard`, split it in three, or rewrite `tasksService` entirely, and as long as `index.ts` still exports the same names with the same types, no other feature can notice.
+
+> ⚠️ **Common mistake.** Writing `export * from "./components"` in `index.ts`. A wildcard barrel exports *everything*, so the "public API" is now the whole folder again. List exports by name; the list is the contract.
+
+## 58.4 Layers in a frontend
+
+Folders answer "where does this file go?". **Layers** answer "what is this code allowed to know about?". Data in TaskFlow Web flows through five layers, and each one knows only about the layer directly below it:
+
+```text
+ UI components ──props──► feature hooks ──domain types──► services ──DTOs──► API client ──► network
+      ▲                         ▲                              ▲                    ▲
+  view models             query/mutation hooks          mappers (DTO → domain)  schemas (unknown → DTO)
+```
+
+Read it right to left as the data arrives. The **API client** sends requests and turns raw `unknown` JSON into validated **DTOs** (data transfer objects, the exact shape on the wire). **Services** call the client and map DTOs into **domain types**, the shapes your app thinks in. **Feature hooks** expose those domain types to React, with loading and error states. **UI components** receive data as props and render it.
+
+Here is one vertical slice, "show a project's tasks", through all five layers:
+
+```tsx
+// shared/api/client.ts: talks to the network, validates the shape (Chapter 61)
+export const api = createApiClient({ baseUrl: env.apiUrl });
+
+// features/tasks/api/tasksService.ts: DTOs in, domain types out
+export async function listProjectTasks(projectId: string): Promise<Task[]> {
+  const dtos = await unwrap(api.tasks.listByProject(projectId)); // TaskDto[]
+  return dtos.map(toTask);                                        // Task[]
+}
+
+// features/tasks/hooks/useProjectTasks.ts: React-facing, caching and status (Chapter 62)
+export function useProjectTasks(projectId: string) {
+  return useQuery({
+    queryKey: ["tasks", "project", projectId],
+    queryFn: () => listProjectTasks(projectId),
+  });
+}
+
+// features/tasks/components/TaskBoard.tsx: renders; knows nothing about HTTP
+export function TaskBoard({ projectId }: { projectId: string }) {
+  const tasks = useProjectTasks(projectId);
+  if (tasks.isPending) return <BoardSkeleton />;
+  if (tasks.isError) return <ErrorState error={tasks.error} />;
+  return <BoardColumns tasks={tasks.data} />;
+}
+```
+
+Each layer can be swapped without disturbing the others. Change the URL scheme, and only the client changes. Rename a JSON field, and only the mapper changes. Replace the caching library, and only the hooks change. The component never learns that HTTP exists.
+
+> 🔗 **Connection.** This is the same layering you built on the server in [Chapter 31](/chapter/31) (routes → services → repositories), mirrored on the client. The next chapters fill in each layer: the client and mappers in [Chapter 61](/chapter/61), the hooks in [Chapter 62](/chapter/62).
+
+## 58.5 Where types live
+
+Once there are layers, "the `Task` type" is really three types, one per layer, and each belongs in a different place:
+
+| Kind | What it describes | Where it lives |
+|---|---|---|
+| **DTO** | The exact JSON on the wire, including its quirks | `features/tasks/api/` or a shared contracts package |
+| **Domain type** | The concept as your app thinks of it | `features/tasks/types.ts` |
+| **View model** | What one component needs to render, pre-formatted | Next to the component that uses it |
+
+```ts
+// features/tasks/api/taskDto.ts: the wire format. Dates are strings; the assignee is nested.
+export type TaskDto = {
+  id: string;
+  title: string;
+  status: "todo" | "doing" | "done";
+  dueAt: string | null;                               // "2026-10-06T09:00:00Z"
+  assignee: { id: string; displayName: string } | null;
+};
+
+// features/tasks/types.ts: the domain. Real Dates; flat and convenient.
+export type Task = {
+  id: string;
+  title: string;
+  status: TaskStatus;
+  dueDate: Date | null;
+  assigneeName: string | null;
+};
+
+// features/tasks/components/TaskCard.tsx: the view model. Exactly what the card draws.
+type TaskCardView = { title: string; dueLabel: string; isOverdue: boolean };
+```
+
+So what goes in `shared/types`? Only types that are **cross-cutting and product-agnostic**: generic helpers like `Result<T, E>`, `Paginated<T>`, or a branded `Id<"Task">`. If a type mentions a product concept, like a task or a project, it belongs to a feature. A `shared/types/index.ts` that contains `Task` is the old `types.ts` dumping ground with a new name.
+
+```ts
+// shared/types/result.ts: ✅ product-agnostic, used everywhere
+export type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+// shared/types/paginated.ts: ✅
+export type Paginated<T> = { items: T[]; nextCursor: string | null };
+```
+
+## 58.6 Dependency rules
+
+Structure only helps if it's respected, and conventions erode under deadline pressure. TaskFlow Web follows three dependency rules:
+
+1. **Dependencies point one way:** `app` → `features` → `shared`. Shared code never imports from a feature.
+2. **Features don't reach into each other.** A feature may import another feature only through its `index.ts`.
+3. **Inside a feature, use relative imports.** `./components/TaskCard` is fine within `features/tasks`.
+
+```text
+        app/  (router, providers, pages)
+          │
+          ▼
+   features/tasks ──index.ts only──► features/projects
+          │                                │
+          ▼                                ▼
+                    shared/  (ui, lib, config, api)
+          ✗ shared → features      ✗ tasks → projects/components/…
+```
+
+Rules that live only in a wiki get broken. Rules that live in the linter get enforced on every save. ESLint's built-in `no-restricted-imports` rule can forbid deep imports into features, and a second block forbids `shared/` from importing features at all:
+
+```js
+// eslint.config.js (flat config)
+export default [
+  {
+    files: ["src/**/*.{ts,tsx}"],
+    rules: {
+      "no-restricted-imports": ["error", {
+        patterns: [{
+          group: ["@/features/*/*"],
+          message: "Import from the feature's public API (@/features/<name>) instead.",
+        }],
+      }],
+    },
+  },
+  {
+    files: ["src/shared/**/*.{ts,tsx}"],
+    rules: {
+      "no-restricted-imports": ["error", {
+        patterns: [{ group: ["@/features/*", "@/app/*"], message: "shared/ must not depend on features or app." }],
+      }],
+    },
+  },
+];
+```
+
+```tsx
+// features/projects/components/ProjectSummary.tsx
+import { TaskStatusBadge } from "@/features/tasks";                   // ✅
+import { TaskCard } from "@/features/tasks/components/TaskCard";      // ❌ '@/features/tasks/components/TaskCard' import is restricted from being used by a pattern. Import from the feature's public API (@/features/<name>) instead.
+```
+
+> 🌍 **Real world.** Teams that want stricter boundaries use a dedicated plugin such as `eslint-plugin-boundaries`, which understands "element types" (app, feature, shared) and can also catch relative imports like `../../tasks/components`, which a path-pattern rule misses.
+
+> 💡 **Tip.** If two features need each other in both directions (tasks needs projects, projects needs tasks), that's a design signal. Either the shared piece belongs in `shared/`, or the composition belongs one level up, in an `app/` page that imports both features and wires them together.
+
+## 58.7 Shared components
+
+Not every component belongs to a feature. A `Button`, a `Dialog`, a `Badge`, or a `Spinner` is useful everywhere and knows nothing about tasks. These are **UI primitives**, and they live in `shared/ui`. The distinction is about knowledge, not reuse: a primitive knows only about *presentation*; a feature component knows about the *product*.
+
+```tsx
+// shared/ui/Badge.tsx: a primitive. It knows "tones", not tasks.
+type Tone = "neutral" | "info" | "success" | "warning";
+
+type BadgeProps = { tone?: Tone; children: React.ReactNode };
+
+export function Badge({ tone = "neutral", children }: BadgeProps) {
+  return <span className={`badge badge--${tone}`}>{children}</span>;
+}
+```
+
+```tsx
+// features/tasks/components/TaskStatusBadge.tsx: a feature component built from the primitive
+import { Badge } from "@/shared/ui";
+import type { TaskStatus } from "../types";
+
+const statusDisplay = {
+  todo:  { tone: "neutral", label: "To do" },
+  doing: { tone: "info",    label: "In progress" },
+  done:  { tone: "success", label: "Done" },
+} as const satisfies Record<TaskStatus, { tone: string; label: string }>;
+
+export function TaskStatusBadge({ status }: { status: TaskStatus }) {
+  const { tone, label } = statusDisplay[status];
+  return <Badge tone={tone}>{label}</Badge>;
+}
+```
+
+The mapping from "task status" to "badge tone" is product knowledge, so it lives in the tasks feature. Add `"blocked"` to `TaskStatus` and the `satisfies` check fails right here, in the one file that needs updating.
+
+When should a feature component be promoted to `shared/ui`? When a *third* feature wants it, and only after you strip out the product knowledge. Promoting on first reuse tends to produce "shared" components with a `taskId` prop that only one feature ever passes.
+
+## 58.8 Environment configuration
+
+Every deployed app needs configuration that differs per environment: the API's URL, an analytics key, a feature flag. Vite reads these from `.env` files and exposes them on `import.meta.env`. Two facts matter immediately:
+
+- **Only variables prefixed with `VITE_` reach the browser.** Vite inlines them into your JavaScript bundle at build time. Anything else in `.env` stays on the build machine.
+- **Because they're in the bundle, they're public.** Anyone can open DevTools and read them. A secret (a database password, a private API key) must *never* get a `VITE_` prefix.
+
+```text
+# .env.production
+VITE_API_URL=https://api.taskflow.dev
+VITE_ENABLE_BOARD_V2=false
+SENTRY_AUTH_TOKEN=sk_live_…        ← no VITE_ prefix: build tools can use it, the browser never sees it
+```
+
+By default, every `import.meta.env.VITE_*` property is typed loosely. You describe your variables by adding to Vite's `ImportMetaEnv` interface in `vite-env.d.ts`. This is **declaration merging** ([Chapter 28](/chapter/28)): your interface merges with the one Vite ships, which already declares `MODE`, `DEV`, and `PROD`.
+
+```ts
+// src/vite-env.d.ts
+/// <reference types="vite/client" />
+
+interface ImportMetaEnv {
+  readonly VITE_API_URL: string;
+  readonly VITE_ENABLE_BOARD_V2?: string;
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}
+```
+
+But notice what that file is: a *promise* about values TypeScript never sees. If someone forgets `VITE_API_URL` on the staging build, the type still says `string` and the app requests `undefined/tasks`. The `.d.ts` is "what TypeScript believes". So, exactly as on the server in [Chapter 32](/chapter/32), parse the real values once, at startup, and let the rest of the app import a validated, renamed, properly typed object:
+
+```ts
+// src/shared/config/env.ts
+import { z } from "zod";
+
+const EnvSchema = z.object({
+  VITE_API_URL: z.url(),
+  VITE_ENABLE_BOARD_V2: z.enum(["true", "false"]).default("false"),
+});
+
+const parsed = EnvSchema.safeParse(import.meta.env);
+if (!parsed.success) {
+  throw new Error(`Invalid environment configuration:\n${z.prettifyError(parsed.error)}`);
+}
+
+export const env = {
+  apiUrl: parsed.data.VITE_API_URL,
+  enableBoardV2: parsed.data.VITE_ENABLE_BOARD_V2 === "true", // env values are always strings
+  isDev: import.meta.env.DEV,
+} as const;
+// env: { readonly apiUrl: string; readonly enableBoardV2: boolean; readonly isDev: boolean }
+```
+
+Now a misconfigured build fails on the first page load with a message naming the missing variable, instead of failing mysteriously three screens later. And no other file touches `import.meta.env` directly.
+
+> 💡 **Tip.** Since Vite 6, you can add `interface ViteTypeOptions { strictImportMetaEnv: unknown }` to `vite-env.d.ts`. Then reading an undeclared variable like `import.meta.env.VITE_TYPO` is a compile error instead of a silent `any`.
+
+## 58.9 A styling strategy
+
+A large app needs one answer to "how do we style things?". Two approaches dominate modern React, and both work well with TypeScript:
+
+- **CSS Modules**: ordinary CSS files whose class names are scoped to the component that imports them. Vite supports any file named `*.module.css` out of the box.
+- **Utility CSS** (such as Tailwind): small single-purpose classes composed directly in `className`, with a design system encoded in the configuration.
+
+```tsx
+// features/tasks/components/TaskCard.tsx with CSS Modules
+import styles from "./TaskCard.module.css";
+
+export function TaskCard({ task }: { task: Task }) {
+  return (
+    <article className={styles.card}>
+      <h3 className={styles.title}>{task.title}</h3>
+      <p className={styles.titel}>{task.status}</p> {/* compiles: styles is typed as a string index */}
+    </article>
+  );
+}
+```
+
+That last line shows the typing gap: Vite types every CSS module as "any string key maps to a string", so a typo compiles and simply produces no style. Plugins can generate exact `.d.ts` files for CSS modules if that matters to your team.
+
+Utility classes push style decisions into TypeScript itself. A typed map from domain values to classes makes the compiler enforce consistency:
+
+```tsx
+// Utility CSS: a typed variant map
+const priorityClasses: Record<Priority, string> = {
+  low: "text-slate-500",
+  medium: "text-amber-600",
+  high: "text-red-600 font-semibold",
+};
+
+export function PriorityLabel({ priority }: { priority: Priority }) {
+  return <span className={priorityClasses[priority]}>{priority}</span>;
+}
+// Add "urgent" to Priority → ❌ Property 'urgent' is missing in type '{ low: string; medium: string; high: string; }' but required in type 'Record<Priority, string>'.
+```
+
+Which one should TaskFlow pick? Honestly, either. What hurts large codebases is not choosing the "wrong" tool but having **three** of them: some components in CSS Modules, some in utility classes, and a few with inline style objects. Pick one, write it down in an architecture decision record, and keep primitives in `shared/ui` as the single place where visual decisions live.
+
+## 58.10 Scaffolding TaskFlow Web
+
+Here is the structure you'll fill in throughout Part X, and that [P14](/projects/p14) builds on. It applies every rule from this chapter:
+
+```text
+apps/web/
+  src/
+    app/
+      main.tsx            ← entry: mounts <App />
+      providers.tsx       ← QueryClientProvider, AuthProvider, …
+      router.tsx          ← every route in one place (Chapter 59)
+      layouts/RootLayout.tsx
+    features/
+      auth/               ← Chapter 65
+      projects/           components/ hooks/ api/ types.ts index.ts
+      tasks/              components/ hooks/ api/ types.ts index.ts
+      settings/
+    shared/
+      api/client.ts       ← the typed API client from P08 (Chapter 61)
+      config/env.ts       ← validated environment
+      lib/                ← dates, money, assertNever
+      types/              ← Result, Paginated
+      ui/                 ← Button, Badge, Dialog, Spinner, index.ts
+    vite-env.d.ts
+  eslint.config.js
+  tsconfig.json
+  vite.config.ts
+```
+
+The `@/` prefix used throughout this part is a path alias, configured once for TypeScript and once for Vite so both resolve it the same way:
+
+```ts
+// tsconfig.json (excerpt):  "compilerOptions": { "paths": { "@/*": ["./src/*"] } }
+
+// vite.config.ts
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import { fileURLToPath, URL } from "node:url";
+
+export default defineConfig({
+  plugins: [react()],
+  resolve: { alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) } },
+});
+```
+
+```tsx
+// src/app/main.tsx
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import "@/shared/config/env"; // validate config before anything renders
+import { Providers } from "./providers";
+import { AppRouter } from "./router";
+
+createRoot(document.getElementById("root")!).render(
+  <StrictMode>
+    <Providers>
+      <AppRouter />
+    </Providers>
+  </StrictMode>,
+);
+```
+
+Every later chapter in this part plugs one piece into this skeleton: routes into `app/router.tsx`, state into the right home, data into `shared/api` and feature hooks, forms into feature components, and auth into `features/auth`.
+
+## Common mistakes
+
+> ⚠️ **`shared/` as a junk drawer.** If `shared/lib/utils.ts` contains `formatTaskDueDate` and `calculateProjectBudget`, product knowledge has leaked into shared code. Move it back into its feature.
+
+> ⚠️ **Wildcard barrels.** `export *` in a feature's `index.ts` makes every internal file public. Export names deliberately.
+
+> ⚠️ **DTO types in components.** A component that renders `task.dueAt` (a string from the wire) will break when the API changes. Components should receive domain types or view models, never DTOs.
+
+> ⚠️ **Secrets behind `VITE_`.** Anything with the prefix ships to every visitor. Secrets stay on servers.
+
+> ⚠️ **Trusting `vite-env.d.ts`.** Declaring a variable doesn't make it exist. Validate `import.meta.env` once in `shared/config/env.ts`.
+
+```ts
+// ❌ A secret, typed and "safe-looking", shipped in the bundle to every browser
+const stripe = new Stripe(import.meta.env.VITE_STRIPE_SECRET_KEY);
+```
+
+## When to use it, and when not to
+
+> ✅ **Use it when** more than one person works on the app, when it has more than a handful of screens, or when you can name distinct product areas (tasks, projects, billing). Feature folders, a public `index.ts`, and lint-enforced boundaries pay for themselves the first time a refactor stays inside one folder.
+
+> 🚫 **When not to.** A weekend prototype or a three-screen internal tool doesn't need `features/`, `shared/`, layers, and an ESLint boundary config. Start flat, and introduce structure when you feel the pain of the opening scenario: changes touching unrelated files, or nobody knowing where code goes. Don't invent layers you don't have; a service layer that only forwards calls to the client is ceremony.
+
+## How it connects
+
+> 🔗 **Connection.** Feature modules and public APIs build on ES modules and type-only imports from [Chapter 25](/chapter/25). Typing `import.meta.env` is declaration merging from [Chapter 28](/chapter/28), and validating it is the startup check from [Chapter 32](/chapter/32). The frontend layers mirror the server layers of [Chapter 31](/chapter/31). Next, [Chapter 59](/chapter/59) fills in `app/router.tsx`, and [Chapter 61](/chapter/61) builds the API client and mapper layers.
+
+> 🌍 **Real world.** "Feature-sliced" layouts, Bulletproof React, and most large company codebases use a variant of `app` / `features` / `shared` with enforced import boundaries. The names differ (`modules/`, `domains/`, `entities/`); the one-way dependency rule doesn't.
+
+## Exercises
+
+### Level 1 — Recall
+
+Sort these twelve files into a feature-based structure (`app/`, `features/<name>/…`, `shared/…`). For each one, say which sub-folder it goes in and why: `TaskCard.tsx`, `Button.tsx`, `router.tsx`, `useProjectTasks.ts`, `projectDto.ts`, `formatDate.ts`, `InviteMemberForm.tsx`, `env.ts`, `Result.ts`, `TaskStatusBadge.tsx`, `providers.tsx`, `tasksService.ts`.
+
+### Level 2 — Application
+
+Add an ESLint rule to a TaskFlow project that forbids importing another feature's internals (anything deeper than `@/features/<name>`) and forbids `shared/` from importing features. Write one file that violates each rule and confirm the linter reports both.
+
+### Level 3 — Challenge
+
+Refactor the flat [P11](/projects/p11) TaskFlow app into `app/`, `features/`, and `shared/` without breaking its tests. Each feature must expose a named-export `index.ts`, and no file outside a feature may import from inside it.
+
+*Hint: move one feature at a time, and run the tests and the linter after each move.*
+
+### Level 4 — Real-world
+
+**Ticket TF-301: Document TaskFlow Web's architecture.** Write an architecture decision record (ADR) for the structure of TaskFlow Web before [P14](/projects/p14) begins.
+
+- It states the context (team size, expected features), the decision (folders, layers, dependency rules, styling choice), and at least two alternatives considered with reasons for rejecting them.
+- It includes the folder tree and the dependency-direction diagram.
+- It names the lint rules that enforce the decision.
+- It lists the consequences, including at least one cost of the chosen structure.
+
+## Key takeaways
+
+- Structure is measured in **change cost, ownership, and onboarding**. A good structure makes one idea live in one place.
+- Organize **by feature on the outside, by type on the inside**, with `app/`, `features/`, and `shared/`.
+- Each feature exposes a small, named **public API** through `index.ts`; everything else is private.
+- Data flows through **layers** (UI → hooks → services → API client → network), and each layer has its own types: view models, domain types, DTOs.
+- Dependencies point **one way**, and a **lint rule** enforces it, not a wiki page.
+- Type `import.meta.env` with declaration merging, then **validate** it; only `VITE_` variables reach the browser, and they are public.
+- Pick one styling strategy and apply it consistently; consistency matters more than the choice.
+
+## What comes next
+
+The skeleton has an empty `app/router.tsx`. Right now TaskFlow Web is one screen: refreshing loses your place, the back button leaves the site, and nobody can share a link to a task. The URL is the most shareable state an app has, and we're not using it. That's [Chapter 59: Routing & Navigation](/chapter/59).

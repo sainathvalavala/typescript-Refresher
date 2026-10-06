@@ -1,0 +1,445 @@
+> 📖 **The problem.** The create-task form validates the title on the client: "valid". The user clicks Create, the server answers `400`, and the form shows a generic red toast, "Request failed". The real reason was that the title was already taken in this project, a rule only the server can know. The field the user must fix is not highlighted, nothing says why, and the toast vanishes after three seconds. Worse, the client's rule says titles can be 200 characters while the server's says 120, because two people wrote the same rule twice and one of them changed it.
+
+Validation in a real app has two audiences with different jobs. The client validates for *experience*: fast feedback, no wasted round trips. The server validates for *safety*: it cannot trust anything the client sent. When those two disagree, or when the server knows something the client cannot, the form must still show the right message on the right field. This chapter makes the rules a single source of truth, types the errors that flow back, then looks at what form libraries and React 19's Actions give you so you do not have to hand-build all of it.
+
+> 🧠 **Mental model.** **One schema, two sides.** The same schema validates on the client (for experience) and on the server (for safety), and the server always has the final word. Everything else in this chapter is plumbing to get the server's verdict back onto the right field.
+
+## 64.1 One schema, two sides
+
+When both sides are TypeScript, the cleanest fix for drifting rules is to stop writing them twice. Put the schema in a package both import (a monorepo workspace such as `packages/schemas`, or a shared folder), and derive types from it.
+
+```ts
+// packages/schemas/src/task.ts
+import { z } from "zod";
+
+export const CreateTaskSchema = z.object({
+  title: z.string().trim().min(1, "Enter a title.").max(120, "Keep it under 120 characters."),
+  projectId: z.string().min(1),
+  status: z.enum(["todo", "doing", "done"]),
+  dueDate: z.iso.date().nullable(), // "2026-12-31" or null
+});
+
+export type CreateTaskInput = z.infer<typeof CreateTaskSchema>;
+```
+
+The client uses it to check a form before sending; the server uses it to reject bad requests:
+
+```ts
+// server: an Express-style handler
+app.post("/tasks", async (req, res) => {
+  const parsed = CreateTaskSchema.safeParse(req.body); // req.body is unknown to us
+  if (!parsed.success) {
+    return res.status(400).json({ errors: z.flattenError(parsed.error).fieldErrors });
+  }
+  const task = await db.tasks.create(parsed.data); // parsed.data: CreateTaskInput
+  res.status(201).json(task);
+});
+```
+
+Now the title limit exists in exactly one place. Change `120` to `200`, and both sides move together at the next build.
+
+> 🚫 **When not to.** If the backend is not TypeScript, you cannot import the schema. Generate it from an OpenAPI or JSON Schema document instead, or accept that the server is the source of truth and rely on 64.3 to surface its errors. Do not hand-copy rules and hope.
+
+## 64.2 Runtime schemas for forms
+
+A form's inputs always hold strings, but your schema may want numbers, dates, or booleans. Zod's `z.input` and `z.output` distinguish the two sides: what the schema *accepts* and what it *produces*. For a form, the input is what the fields hold and the output is what you send.
+
+```ts
+const TaskFormSchema = z.object({
+  title: z.string().trim().min(1, "Enter a title.").max(120),
+  estimateHours: z.coerce.number().int().min(0).max(200), // "8" in, 8 out
+  dueDate: z.string().transform((s) => (s === "" ? null : s)).pipe(z.iso.date().nullable()),
+  assigneeId: z.string().optional(),
+});
+
+type TaskFormInput = z.input<typeof TaskFormSchema>;   // what the form fields hold
+type TaskFormOutput = z.output<typeof TaskFormSchema>; // what you get after parsing
+// TaskFormInput.estimateHours is unknown (coerce accepts anything); the output is number
+```
+
+Parse once, on submit. The result is a discriminated union, so a failure carries per-field messages you can feed straight into the form's errors:
+
+```ts
+function validateTaskForm(values: TaskFormInput): FormErrors<TaskFormInput> {
+  const result = TaskFormSchema.safeParse(values);
+  if (result.success) return {};
+
+  const { fieldErrors } = z.flattenError(result.error); // { title?: string[]; estimateHours?: string[]; ... }
+  const errors: FormErrors<TaskFormInput> = {};
+  for (const key of Object.keys(fieldErrors) as (keyof TaskFormInput)[]) {
+    errors[key] = fieldErrors[key]?.[0]; // show the first message per field
+  }
+  return errors;
+}
+```
+
+That function plugs into the `useForm` from [Chapter 63](/chapter/63) as its `validate`. The hand-written `if` chain is replaced by a declaration.
+
+> ⚠️ **Common mistake.** Using `z.coerce.number()` on an empty string. `Number("")` is `0`, so a blank field silently becomes zero and passes. Check for empty first, or use `z.string().min(1)` before converting.
+
+## 64.3 Server validation errors
+
+Client validation can only enforce rules it knows. "This title is already taken in this project" needs a database. So the server answers `400`, and the form must take that answer and put each message on its field. Agree on a response shape and validate it like any other response ([Chapter 61](/chapter/61)):
+
+```ts
+const ValidationBodySchema = z.object({
+  errors: z.record(z.string(), z.array(z.string())), // { title: ["Title already used."] }
+  formError: z.string().optional(),                  // errors not tied to a field
+});
+```
+
+In the typed `ApiError` union, this is the `validation` kind. The mapping from server field names to form field names is where typos hide, so make the compiler check it:
+
+```ts
+type ServerFieldErrors<T> = Partial<Record<keyof T, string[]>>;
+
+function toFormErrors<T>(
+  server: Record<string, string[]>,
+  knownFields: readonly (keyof T & string)[],
+): { fields: FormErrors<T>; unmapped: string[] } {
+  const fields: FormErrors<T> = {};
+  const unmapped: string[] = [];
+
+  for (const [name, messages] of Object.entries(server)) {
+    const known = knownFields.find((f) => f === name);
+    if (known) fields[known] = messages[0];
+    else unmapped.push(...messages); // server reported a field we don't have: don't lose the message
+  }
+  return { fields, unmapped };
+}
+```
+
+The `unmapped` bucket matters. If the server complains about a field the form does not have, silently dropping it recreates the original bug (a failure with no visible reason). Show those messages in a form-level alert. And keep the **client** errors and **server** errors as separate state: a server error belongs to the submission that produced it, and should clear when the user edits that field.
+
+## 64.4 Error typing
+
+A form has at least three kinds of problems, and one `string | null` cannot say which you have:
+
+1. **Field errors**: attached to one input ("Title already used.").
+2. **Form-level errors**: about the submission as a whole ("You've reached your plan's limit of 50 projects.").
+3. **Transport failures**: nothing about the data at all (offline, `500`).
+
+Give each its own place in a typed result, and make the *codes* a closed union so the UI can switch on them, translate them, and test them:
+
+```ts
+type TaskFormErrorCode = "TITLE_TAKEN" | "PROJECT_ARCHIVED" | "PLAN_LIMIT_REACHED";
+
+type SubmitResult<T> =
+  | { ok: true }
+  | {
+      ok: false;
+      fieldErrors: FormErrors<T>;
+      formError?: { code: TaskFormErrorCode; message: string };
+    }
+  | { ok: false; transport: "network" | "server" };
+```
+
+Rendering is then an exhaustive decision, not a guess:
+
+```tsx
+function SubmitBanner({ result }: { result: SubmitResult<TaskFormInput> | null }) {
+  if (result === null || result.ok) return null;
+
+  if ("transport" in result) {
+    return <p role="alert">{result.transport === "network" ? "You're offline." : "Server error. Try again."}</p>;
+  }
+
+  switch (result.formError?.code) {
+    case "PLAN_LIMIT_REACHED":
+      return <UpgradePrompt />;
+    case "PROJECT_ARCHIVED":
+      return <p role="alert">This project is archived. Restore it to add tasks.</p>;
+    case "TITLE_TAKEN":
+    case undefined:
+      return null; // field errors are already shown next to their inputs
+  }
+}
+```
+
+Error **codes** are for logic; the **message** is for display. Never branch on message text, because translators and copy editors will change it. If the server returns a code your union does not know, treat it as a generic form error: the union describes the contract, not a guarantee, so validate the body (64.3) before trusting it.
+
+## 64.5 Form libraries
+
+By now you have written `useForm`, a `touched` map, an error-mapping function, and focus management. A form library gives you all of that, with performance tuned (inputs do not re-render the whole form on each keystroke), plus nested fields and arrays. **React Hook Form** (RHF) is the most widely used. It pairs with a **schema resolver**, which means your Zod schema *is* the validation, and the form's types come from it.
+
+```tsx
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+
+function CreateTaskForm({ projectId }: { projectId: string }) {
+  const {
+    register,
+    handleSubmit,
+    setError,
+    formState: { errors, isSubmitting },
+  } = useForm({
+    resolver: zodResolver(CreateTaskSchema), // types flow from the schema
+    defaultValues: { title: "", projectId, status: "todo" as const, dueDate: null },
+  });
+
+  const create = useCreateTask(); // Chapter 62
+
+  return (
+    <form
+      noValidate
+      onSubmit={handleSubmit(async (values) => {
+        // values: CreateTaskInput, already validated by the schema
+        try {
+          await create.mutateAsync(values);
+        } catch (e) {
+          if (isValidationError(e)) {
+            for (const [name, messages] of Object.entries(e.fields)) {
+              setError(name as keyof CreateTaskInput, { type: "server", message: messages[0] });
+            }
+          }
+        }
+      })}
+    >
+      <label htmlFor="title">Title</label>
+      <input id="title" {...register("title")} aria-invalid={errors.title ? true : undefined} />
+      {errors.title && <p role="alert">{errors.title.message}</p>}
+      <button disabled={isSubmitting}>Create task</button>
+    </form>
+  );
+}
+```
+
+`register("title")` is checked against the values type, so `register("tilte")` is a compile error, and `errors.title?.message` is typed. Server errors enter through `setError`, the same place client errors live.
+
+When does a library pay off? Roughly: **more than a handful of fields, nested or repeating groups, cross-field rules, or performance-sensitive large forms.** For a three-field dialog, the `useForm` from Chapter 63 is shorter and has no dependency.
+
+> 🌍 **Real world.** TanStack Form and Formik are the other common choices. They differ in API and re-render strategy, but they all track the same four things from Chapter 63, and all of them accept a schema for validation.
+
+## 64.6 React Actions
+
+React 19 builds a simple form story into the library itself. Instead of an `onSubmit` handler that prevents the default and collects values, you pass a function to `<form action>`. React calls it with a `FormData` object when the form submits, and wraps the call in a **transition**, so pending state comes for free.
+
+```tsx
+function RenameProject({ id }: { id: string }) {
+  async function rename(formData: FormData) {
+    const name = String(formData.get("name") ?? ""); // FormData values are FormDataEntryValue | null
+    await renameProject(id, name);
+  }
+
+  return (
+    <form action={rename}>
+      <input name="name" defaultValue="TaskFlow" />
+      <button type="submit">Rename</button>
+    </form>
+  );
+}
+```
+
+For a form that needs to show a result, `useActionState` holds the action's last outcome, plus a pending flag. The action receives the previous state first and the `FormData` second:
+
+```tsx
+import { useActionState } from "react";
+
+type CreateState =
+  | { status: "idle" }
+  | { status: "invalid"; errors: FormErrors<CreateTaskInput> }
+  | { status: "created"; taskId: string };
+
+async function createAction(_prev: CreateState, formData: FormData): Promise<CreateState> {
+  const parsed = CreateTaskSchema.safeParse(Object.fromEntries(formData));
+  if (!parsed.success) {
+    const fieldErrors = z.flattenError(parsed.error).fieldErrors;
+    return { status: "invalid", errors: { title: fieldErrors.title?.[0] } };
+  }
+  const task = await createTask(parsed.data);
+  return { status: "created", taskId: task.id };
+}
+
+function ActionForm() {
+  const [state, formAction, pending] = useActionState(createAction, { status: "idle" });
+  // state: CreateState, formAction: (payload: FormData) => void, pending: boolean
+
+  return (
+    <form action={formAction}>
+      <input name="title" aria-invalid={state.status === "invalid" && !!state.errors.title} />
+      {state.status === "invalid" && state.errors.title && <p role="alert">{state.errors.title}</p>}
+      <button disabled={pending}>Create</button>
+    </form>
+  );
+}
+```
+
+The same schema validates here, and the state is a discriminated union, so the JSX narrows cleanly. Note that React resets uncontrolled fields when an action completes, which is why `defaultValue`s are used rather than `value`s.
+
+Two more hooks round out Actions. **`useFormStatus`** (from `react-dom`) lets a *child* of a form read whether that form is submitting, so a reusable submit button needs no props:
+
+```tsx
+import { useFormStatus } from "react-dom";
+
+function SubmitButton({ children }: { children: React.ReactNode }) {
+  const { pending } = useFormStatus(); // must be rendered INSIDE a <form>, not in the same component as it
+  return <button type="submit" disabled={pending}>{pending ? "Saving…" : children}</button>;
+}
+```
+
+**`useOptimistic`** shows a temporary value while an action is in flight, then snaps back to the real state when it finishes. It is the form-friendly cousin of the optimistic mutation in [Chapter 62](/chapter/62):
+
+```tsx
+import { useOptimistic } from "react";
+
+function CommentList({ comments }: { comments: string[] }) {
+  const [optimistic, addOptimistic] = useOptimistic(
+    comments,
+    (current, newComment: string) => [...current, newComment], // how to apply the guess
+  );
+
+  async function send(formData: FormData) {
+    const text = String(formData.get("text"));
+    addOptimistic(text);        // appears immediately
+    await postComment(text);    // real list arrives via props when this settles
+  }
+
+  return (
+    <>
+      <ul>{optimistic.map((c, i) => <li key={i}>{c}</li>)}</ul>
+      <form action={send}><input name="text" /><SubmitButton>Send</SubmitButton></form>
+    </>
+  );
+}
+```
+
+> 🚫 **When not to.** Actions shine for simple forms and server-driven apps. For rich client-side validation as you type, large dynamic forms, or a form already built on a library, `onSubmit` plus a form library remains the better tool. Actions and a form library can coexist; use whichever owns that form.
+
+## 64.7 Reusable form components
+
+Every field repeats the same shape: label, input, error text, and the accessibility wiring from Chapter 63. Extract it, and bind it to the form's **field names** so a wrong name cannot compile. First, a minimal description of what a field component needs from a form:
+
+```ts
+type FormApi<T> = {
+  values: T;
+  errorFor: (name: keyof T) => string | undefined;
+  setField: <K extends keyof T>(name: K, value: T[K]) => void;
+  touch: (name: keyof T) => void;
+};
+
+// Only the keys whose value is a string: a TextField cannot bind to a boolean
+type StringKeys<T> = { [K in keyof T]: T[K] extends string ? K : never }[keyof T] & string;
+```
+
+Then the component is generic over the form's values type:
+
+```tsx
+export function TextField<T extends Record<string, string | boolean>>(props: {
+  form: FormApi<T>;
+  name: StringKeys<T>;
+  label: string;
+  type?: "text" | "email" | "password";
+}) {
+  const { form, name, label, type = "text" } = props;
+  const error = form.errorFor(name);
+  const errorId = `${name}-error`;
+
+  return (
+    <div>
+      <label htmlFor={name}>{label}</label>
+      <input
+        id={name}
+        name={name}
+        type={type}
+        value={form.values[name] as string}
+        onChange={(e) => form.setField(name, e.target.value as T[typeof name])}
+        onBlur={() => form.touch(name)}
+        aria-invalid={error ? true : undefined}
+        aria-describedby={error ? errorId : undefined}
+      />
+      {error && <p id={errorId} role="alert">{error}</p>}
+    </div>
+  );
+}
+```
+
+Used with the sign-up form, the compiler checks the names against the values:
+
+```tsx
+<TextField form={form} name="email" label="Email" type="email" />  {/* ✅ */}
+<TextField form={form} name="acceptTerms" label="Terms" />
+{/* ❌ Type '"acceptTerms"' is not assignable to type 'StringKeys<Values>'. */}
+<TextField form={form} name="emial" label="Email" />
+{/* ❌ Type '"emial"' is not assignable to type 'StringKeys<Values>'. Did you mean '"email"'? */}
+```
+
+The same idea gives you `SelectField` (bound to keys whose values are string unions, with `options` typed as that union) and `CheckboxField` (bound to boolean keys). The pattern is always: *derive the legal names from the values type, then constrain a prop to them.*
+
+## 64.8 Type-safe form abstractions
+
+How far should you take this? The examples above reach a sweet spot: typed field names, typed values, one place for accessibility. Pushing further runs into real limits.
+
+- **Nested paths.** `"address.street"` and `"tags.0.name"` need template-literal path types and recursive mapped types, which is why libraries ship `Path<T>` helpers. They work, but their error messages are long and their compile times grow with the type's depth.
+- **Value conversion.** Inputs speak strings; domain values speak numbers and dates. Making the types honest about both sides (`z.input` versus `z.output`) is real work.
+- **Dynamic and conditional fields.** Fields that appear depending on other fields turn a flat `keyof T` into a union of possible shapes.
+- **Performance.** A naive hook re-renders the entire form per keystroke. Fixing that means uncontrolled inputs, refs, and subscriptions, which is a library's whole design.
+
+```ts
+// A type-level path helper looks innocent and gets expensive quickly:
+type Paths<T> = T extends object
+  ? { [K in keyof T & string]: T[K] extends object ? K | `${K}.${Paths<T[K]>}` : K }[keyof T & string]
+  : never;
+
+type P = Paths<{ title: string; address: { street: string; zip: string } }>;
+// "title" | "address" | "address.street" | "address.zip"
+```
+
+The rule of thumb: **build abstractions for the form you have, and adopt a library for the form you fear.** Writing your own `Field` components on top of a library's `register` or `useController` is healthy. Writing your own form *framework* is a project, not a task, and you will rebuild the library's bug list from scratch.
+
+## Common mistakes
+
+> ⚠️ **Trusting client validation.** It is a courtesy. The server must re-validate everything, since anyone can send a request without your form.
+
+> ⚠️ **Two copies of the same rule.** Hand-writing the max length in the form and again on the server guarantees drift. Share the schema, or generate both from one contract.
+
+> ⚠️ **Dropping unmapped server errors.** A message for a field the form does not have must still appear somewhere, or the user sees a failure with no reason.
+
+> ⚠️ **Branching on error message text.** Messages change; use a typed code.
+
+> ⚠️ **Calling `useFormStatus` in the same component as the form.** It reads the status of a *parent* form, so it only works in a child component.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** more than one place validates the same data, when the server can reject input the client cannot predict, or when a form has enough fields that hand-rolled state hurts. A shared schema plus a library is the standard answer.
+
+> 🚫 **When not to.** One-field forms and tiny dialogs do not need a schema, a resolver, and a library. Do not build typed field-path generics for forms with five flat fields.
+
+## How it connects
+
+> 🔗 **Connection.** Schemas and `unknown` at the boundary: [Chapter 32](/chapter/32) and [Chapter 61](/chapter/61). The state you extend: [Chapter 63](/chapter/63). Mutations and invalidation feed `useCreateTask`: [Chapter 62](/chapter/62). Typed key and path helpers use mapped and template literal types: [Chapters 22](/chapter/22) and [24](/chapter/24).
+
+> 🌍 **Real world.** Full-stack frameworks pass the same Zod schema to server actions and client forms. Libraries such as tRPC make the shared contract automatic by deriving client types from server procedures.
+
+## Exercises
+
+### Level 1 — Recall
+
+Write a Zod schema for the create-task form (title, project, status, optional due date) and infer its TypeScript type. Name one rule the client can check and one only the server can.
+
+### Level 2 — Application
+
+A `POST /tasks` returns `400` with `{ "errors": { "title": ["Already used."], "dueDate": ["Must be in the future."] } }`. Parse that body with a schema, and map each entry onto the matching form field. Keep any message for an unknown field in a form-level banner.
+
+### Level 3 — Challenge
+
+Build `Field` components (`TextField`, `SelectField`, `CheckboxField`) that only accept names of fields with the right value type, as in 64.7. Show three compile errors your design catches. *Hint: a mapped type that filters keys by `T[K] extends string`.*
+
+### Level 4 — Real-world
+
+**Ticket TF-431: Rebuild the project wizard on a library.** Take the wizard from [Chapter 63](/chapter/63) and rebuild it with React Hook Form and a shared Zod schema.
+
+- Each step validates its own slice of the schema; the final submit validates the whole thing.
+- Server `400` field errors land on the correct step and field, and the wizard jumps back to the first step with an error.
+- Write a short comparison: lines of code, handled edge cases, and anything the library made harder.
+
+## Key takeaways
+
+- One schema, shared by client and server, removes drifting rules. The client's check is for experience; the server's is for safety, and it has the final word.
+- Use `z.input` and `z.output` for forms: strings go in, typed values come out.
+- Type the errors: field errors, form-level errors with typed codes, and transport failures. Never lose an unmapped message.
+- React Hook Form plus a resolver gives typed `register`, errors, and server-error injection. React 19 Actions give `<form action>`, `useActionState`, `useFormStatus`, and `useOptimistic` for simpler cases.
+- Derive field names from the values type to build field components that cannot be misspelled, and stop before you build your own form framework.
+
+## What comes next
+
+Forms let users send data. Before the server accepts any of it, it must know **who is asking** and **what they are allowed to do**. [Chapter 65: Authentication & Authorization](/chapter/65) models the signed-in user as a discriminated union, builds protected routes, and draws the line between hiding a button and enforcing a rule.

@@ -1,0 +1,261 @@
+> 📖 **The problem.** You've used `ReturnType<typeof fn>` and `Exclude<Status, "done">` and they worked like magic. But how does `ReturnType` reach *inside* a function type and pull out what it returns? How does `Exclude` remove just *some* members of a union? Neither can be written with the mapped types from [Chapter 22](/chapter/22), because both need the type system to **make a decision**.
+
+Conditional types are TypeScript's `if`. They let a type's shape depend on another type, and `infer` lets you capture a piece of a matched type. By the end of this chapter you'll rebuild `Exclude`, `Extract`, `NonNullable`, `ReturnType`, `Parameters`, and `Awaited` yourself, predict when a conditional "distributes" over a union, and know when a conditional type is the wrong tool.
+
+> 🧠 **Mental model.** **A conditional type is a type-level ternary:** `T extends U ? X : Y` asks "does `T` fit inside `U`?" **`infer` is pattern matching:** "if `T` looks like this shape, capture the part I mark with `infer`, and call it by this name."
+
+## 23.1 Conditional type syntax
+
+The form is `T extends U ? X : Y`. Think of it through the **set model** from [Chapter 10](/chapter/10): every type is a set of values, and `extends` asks "is the set `T` entirely contained in the set `U`?" If yes, the result is `X`; otherwise `Y`.
+
+```ts
+type IsString<T> = T extends string ? true : false;
+
+type A = IsString<string>;   // true
+type B = IsString<"hello">;  // true  (the literal "hello" is inside the set of strings)
+type C = IsString<number>;   // false
+type D = IsString<string | number>; // boolean (more on this in 23.2)
+```
+
+A more useful one picks the type for an ID by its entity:
+
+```ts
+type IdOf<T> = T extends { id: infer I } ? I : never;
+type TaskId = IdOf<{ id: string; title: string }>; // string
+type NoId = IdOf<{ title: string }>;               // never
+
+type Primitive = string | number | boolean | null | undefined;
+type IsPrimitive<T> = T extends Primitive ? "primitive" : "object";
+type P1 = IsPrimitive<number>;     // "primitive"
+type P2 = IsPrimitive<Date>;       // "object"
+```
+
+Conditional types can nest, like chained ternaries, but nested ones get unreadable fast. Keep them to two or three levels and name each step.
+
+## 23.2 Distributive conditional types
+
+Here is the behavior that surprises almost everyone. When `T` is a **bare type parameter** on the left of `extends` and you pass a **union**, TypeScript applies the conditional to *each member separately* and unions the results. This is **distribution**.
+
+```ts
+type ToArray<T> = T extends unknown ? T[] : never;
+
+type R = ToArray<string | number>;
+// string[] | number[]       ← NOT (string | number)[]
+// evaluated as: ToArray<string> | ToArray<number>
+```
+
+Distribution is what makes `Exclude` and `Extract` work. Rebuild them:
+
+```ts
+type MyExclude<T, U> = T extends U ? never : T;
+type MyExtract<T, U> = T extends U ? T : never;
+
+type Status = "todo" | "doing" | "done";
+
+type Active = MyExclude<Status, "done">;
+// "todo" extends "done" ? never : "todo"   → "todo"
+// "doing" extends "done" ? never : "doing" → "doing"
+// "done" extends "done" ? never : "done"   → never
+// union of results: "todo" | "doing" | never = "todo" | "doing"
+
+type Done = MyExtract<Status, "done" | "archived">; // "done"
+```
+
+`never` is the empty set, and `X | never` is just `X`, so returning `never` for a member *removes* it from the final union. That is the whole trick: **filtering a union is "map each member to itself or to `never`".**
+
+> ⚠️ **Common mistake.** Distribution only happens when the checked type is a *naked* type parameter. `ToArray<T>` distributes, but `{ value: T } extends …` and `T[] extends …` don't, because `T` is wrapped.
+
+## 23.3 Turning distribution off
+
+Sometimes you want to ask a question about the *whole* union, not each member. Wrap both sides in a one-element tuple. A tuple type is not a naked parameter, so distribution stops:
+
+```ts
+type ToArrayWhole<T> = [T] extends [unknown] ? T[] : never;
+
+type R1 = ToArrayWhole<string | number>; // (string | number)[]
+```
+
+The classic case where this matters is checking for `never`. `never` is the empty union, so distribution over it produces *no members at all*, and the result is `never` rather than `true`:
+
+```ts
+type IsNeverBad<T> = T extends never ? true : false;
+type X = IsNeverBad<never>; // never  ← surprise! zero members to distribute over
+
+type IsNever<T> = [T] extends [never] ? true : false;
+type Y = IsNever<never>;    // true
+type Z = IsNever<string>;   // false
+```
+
+Another case is "is this type exactly a union of those two, as a whole?":
+
+```ts
+type IsBoolish<T> = [T] extends [boolean] ? "yes" : "no";
+type Q1 = IsBoolish<true | false>; // "yes"
+type Q2 = IsBoolish<boolean | string>; // "no"; without the brackets it would be "yes" | "no"
+```
+
+The rule to remember: **bare `T` distributes; `[T]` doesn't.** If a conditional type gives a surprising union as its answer, check whether you wanted distribution.
+
+## 23.4 infer
+
+Conditional types become powerful with `infer`. Inside the `extends` clause you can write `infer Name` in any position, and if the match succeeds, TypeScript captures whatever sat in that position and makes it available as `Name` in the true branch.
+
+```ts
+type ElementType<T> = T extends readonly (infer E)[] ? E : T;
+
+type E1 = ElementType<string[]>;         // string
+type E2 = ElementType<readonly number[]>; // number
+type E3 = ElementType<boolean>;          // boolean (no match, falls through to T)
+
+type ReturnOf<F> = F extends (...args: never[]) => infer R ? R : never;
+type R1 = ReturnOf<() => number>;                  // number
+type R2 = ReturnOf<(id: string) => Promise<Task>>; // Promise<Task>
+
+type PromiseValue<T> = T extends Promise<infer V> ? V : never;
+type V1 = PromiseValue<Promise<string[]>>; // string[]
+```
+
+Read `T extends (infer E)[] ? E : T` as: "if `T` is an array of *something*, call that something `E` and give it back." The `infer` position is a blank in a template, and TypeScript fills it in from the type you passed.
+
+You can infer several things at once, and from any shape: tuple elements, object properties, or function parameters:
+
+```ts
+type FirstAndRest<T> = T extends [infer First, ...infer Rest] ? [First, Rest] : never;
+type F1 = FirstAndRest<[string, number, boolean]>; // [string, [number, boolean]]
+
+type PropType<T, K extends string> = T extends { [P in K]: infer V } ? V : never;
+type Title = PropType<{ title: string; done: boolean }, "title">; // string
+```
+
+## 23.5 Rebuilding NonNullable, ReturnType, Parameters and Awaited
+
+You now have every ingredient, so here are the built-ins, opened. Each one is a conditional type, and most use `infer`.
+
+```ts
+type MyNonNullable<T> = T extends null | undefined ? never : T;
+type N1 = MyNonNullable<string | null | undefined>; // string
+
+type MyReturnType<F extends (...args: any) => any> =
+  F extends (...args: any) => infer R ? R : any;
+
+type MyParameters<F extends (...args: any) => any> =
+  F extends (...args: infer P) => any ? P : never;
+
+function connect(url: string, retries: number): boolean { return true; }
+type Ret = MyReturnType<typeof connect>;  // boolean
+type Args = MyParameters<typeof connect>; // [url: string, retries: number]
+```
+
+`Parameters` infers the *whole parameter list* as one tuple `P`, which is why it comes out as a labeled tuple. `Awaited` is recursive: if the type is a promise, unwrap it and try again.
+
+```ts
+type MyAwaited<T> = T extends Promise<infer U> ? MyAwaited<U> : T;
+
+type A1 = MyAwaited<Promise<string>>;           // string
+type A2 = MyAwaited<Promise<Promise<number>>>;  // number
+type A3 = MyAwaited<boolean>;                   // boolean
+```
+
+> 🆕 **Modern note.** The built-in `NonNullable<T>` is now defined as `T & {}` (an intersection with "anything except null and undefined"), and the built-in `Awaited` also handles objects with a `then` method (thenables). Our versions teach the idea; prefer the built-ins in real code.
+
+## 23.6 Conditional types in function signatures
+
+A conditional type can describe a return type that depends on a parameter's type. It reads well from the caller's side, but the *implementation* hits a limit: inside the function body, TypeScript can't narrow the generic `T`, so it won't accept your return value.
+
+```ts
+type Parsed<T extends string | number> = T extends string ? string[] : number[];
+
+function wrap<T extends string | number>(value: T): Parsed<T> {
+  if (typeof value === "string") {
+    return value.split(""); // ❌ Type 'string[]' is not assignable to type 'Parsed<T>'.
+  }
+  return [value];           // ❌ Type 'number[]' is not assignable to type 'Parsed<T>'.
+}
+
+const letters = wrap("abc"); // letters: string[] (the call site works)
+const nums = wrap(5);        // nums: number[]
+```
+
+Narrowing `value` doesn't narrow `T`, so the compiler can't prove `string[]` is a `Parsed<T>`. The honest fixes are **overloads** (clear and checked) or a single assertion inside the body:
+
+```ts
+function wrapOverloaded(value: string): string[];
+function wrapOverloaded(value: number): number[];
+function wrapOverloaded(value: string | number): string[] | number[] {
+  return typeof value === "string" ? value.split("") : [value]; // ✅
+}
+
+function wrapAsserted<T extends string | number>(value: T): Parsed<T> {
+  return (typeof value === "string" ? value.split("") : [value]) as Parsed<T>; // ✅ you vouch for it
+}
+```
+
+> 🚫 **When not to.** If the function has two or three known input shapes, overloads are clearer than a conditional return type and give real checking inside the body. Reach for a conditional return type when the relationship is open-ended, as in library helpers.
+
+## Common mistakes
+
+> ⚠️ **Surprise distribution.** A union argument gives a union of results (`string[] | number[]`), not one combined answer. If you wanted the whole union treated at once, write `[T] extends [U]`.
+
+> ⚠️ **`T extends never` for "is never".** It returns `never`, not `true`, because there are no members to distribute over. Use `[T] extends [never]`.
+
+> ⚠️ **Conditional types where overloads are clearer.** If you can list the cases on one hand, overloads read better and the body is checked.
+
+> ⚠️ **Writing what a built-in already does.** Before writing `T extends Promise<infer U> ? U : T`, check whether `Awaited`, `ReturnType`, `NonNullable`, or `Extract` is exactly what you need.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** the output type must depend on the *shape* of an input type: extracting parts (`infer`), filtering unions, or building utility helpers that library users call with many different types.
+
+> 🚫 **When not to.** If a mapped type or an existing utility type expresses it, prefer that: they are shorter and better understood. Don't use conditional return types for functions with two or three fixed behaviors; use overloads.
+
+## How it connects
+
+> 🔗 **Connection.** Section 23.2 explains how `Exclude` and `Extract` from [Chapter 21](/chapter/21) work, and `infer` finishes the story of `ReturnType`, `Parameters`, and `Awaited`. [Chapter 24](/chapter/24) combines conditional, mapped, and template literal types into your own utilities, and [Chapter 55](/chapter/55) uses `ReturnType` on action creators to derive reducer action types.
+
+> 🌍 **Real world.** Libraries such as TanStack Query, Zod (`z.infer`), and tRPC use `infer` heavily to turn a value you define (a schema, a router) into types for the rest of your code.
+
+## Exercises
+
+### Level 1 — Recall
+
+Evaluate by hand, then check in your editor. Let `type Is<T> = T extends string ? "s" : "n"`.
+
+1. `Is<"a">`
+2. `Is<number>`
+3. `Is<string | number>`
+4. `Is<never>`
+5. `[string | number] extends [string] ? "s" : "n"`
+6. `Exclude<"a" | "b" | "c", "b" | "c">`
+
+### Level 2 — Application
+
+Write `ElementType<T>` that extracts the element type of an array, and returns `T` unchanged if it is not an array. Make it work for `string[]`, `readonly number[]`, and `[string, number]` (a tuple), and show what each gives.
+
+### Level 3 — Challenge
+
+Write `UnwrapPromiseDeep<T>`, which unwraps nested promises, and also unwraps promises inside arrays (`Promise<string>[]` becomes `string[]`). Compare it with the built-in `Awaited` on five inputs and say where they differ.
+
+*Hint: you need recursion in both the promise branch and the array branch.*
+
+### Level 4 — Real-world
+
+**Ticket TF-245: Typed action payloads.** The reducer module exports action creators such as `addTask(title: string)` and `completeTask(id: string)`.
+
+- Write `PayloadOf<AC>` that gives the payload type of any action creator in the module.
+- Write `ActionOf<AC>` giving the full action object type (`ReturnType`), and a union `AnyAction` covering every creator via an object type.
+- Adding a creator to the module must extend `AnyAction` with no further edits.
+- Include at least four `expectTypeOf` assertions.
+
+## Key takeaways
+
+- A conditional type `T extends U ? X : Y` picks a type by asking whether `T` fits inside `U`.
+- A bare type parameter **distributes** over a union: each member is evaluated separately. That is how `Exclude` and `Extract` filter by mapping members to `never`.
+- `[T] extends [U]` turns distribution off, and is the correct way to test for `never`.
+- `infer` captures a piece of a matched type: array elements, return types, parameter lists, promise values.
+- `NonNullable`, `ReturnType`, `Parameters`, and `Awaited` are each a few lines of conditional type.
+- Conditional return types can't be narrowed inside the body; prefer overloads for a few fixed cases.
+
+## What comes next
+
+You now have the three engines of type-level programming: mapped types, conditional types, and `infer`. The last piece is *strings*: event names like `"task:created"`, handler names like `onClick`. In [Chapter 24: Template Literal Types and Custom Utility Types](/chapter/24) you'll combine everything into your own tools, and learn when to stop.
+

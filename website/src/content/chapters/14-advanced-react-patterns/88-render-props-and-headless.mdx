@@ -1,0 +1,357 @@
+> 📖 **The problem.** TaskFlow adopted a combobox library for the "assign to" field. It works, until design asks for the chevron icon to be replaced and the highlighted option to show an avatar. The library's markup is fixed: no prop changes the icon, and the option renderer is internal. The team's options are to fork the library, to hide its output with CSS and `!important`, or to rebuild a combobox, a component whose keyboard and ARIA rules fill a 40-page specification.
+
+There's a better split. The hard part of a combobox is its **behavior**: filtering, highlighted index, keyboard handling, ARIA attributes. The easy part, which teams want to change, is its **appearance**. This chapter is about pulling those apart with **inversion of control**: the component (or hook) provides behavior and state, and the *caller* provides rendering. You'll type render props, see why hooks replaced most of them, build a headless `useDisclosure` and `useCombobox<T>` with typed prop getters, and decide when the indirection is worth it.
+
+> 🧠 **Mental model.** Inversion of control means **the component provides behavior and the caller provides rendering.** Headless components are the extreme: all behavior, zero markup.
+
+## 88.1 Inversion of control
+
+Every reusable component answers one question: **who decides what gets rendered?**
+
+```text
+Fully owned          <Combobox items={tasks} />            component decides all markup
+Partly inverted      <Combobox renderItem={(t) => …} />    caller decides item markup
+Slot-inverted        <Card header={<Title/>} />            caller supplies pieces
+Fully inverted       const cb = useCombobox({ … })         caller decides ALL markup;
+                                                           component decides behavior
+```
+
+The further down that list, the more flexibility the caller gets, and the more *work* they take on (they must render, style, and wire everything). It's a trade, not an improvement. A library author has to guess where callers will want control; every guess is either too stingy (the fork in the opening story) or too generous (an API nobody can learn).
+
+The simplest form of inversion is one you use daily without naming it: `array.map(callback)`. `map` provides the iteration, and you provide what to do with each item. The patterns in this chapter are `map` for UI.
+
+```tsx
+// Owned: simple, rigid
+<TaskList tasks={tasks} />
+
+// Inverted: caller supplies the row; the list keeps the <ul>, keys, and spacing
+<TaskList tasks={tasks} renderTask={(task) => <TaskRow task={task} dense />} />
+```
+
+> 🔗 **Connection.** [Chapter 87](/chapter/87) inverted *layout* (the caller arranges the parts). This chapter inverts *rendering*.
+
+## 88.2 Typed render props
+
+A **render prop** is a prop whose value is a function that returns UI. The component calls it with some **state**, and TypeScript checks that the caller uses that state correctly. The type is `(state: T) => ReactNode`. The common spellings are a prop named `render` and **function-as-children**:
+
+```tsx
+type DisclosureState = { open: boolean; toggle: () => void };
+
+function Disclosure({ children }: { children: (state: DisclosureState) => ReactNode }) {
+  const [open, setOpen] = useState(false);
+  return <>{children({ open, toggle: () => setOpen((o) => !o) })}</>;
+}
+
+<Disclosure>
+  {({ open, toggle }) => <button onClick={toggle}>{open ? "Hide filters" : "Show filters"}</button>}
+</Disclosure>;
+
+<Disclosure>{({ opne }) => null}</Disclosure>;
+// ❌ Property 'opne' does not exist on type 'DisclosureState'.
+```
+
+The parameter is *contextually typed*: the caller never writes `DisclosureState`, and autocomplete lists `open` and `toggle`. Render props combine well with generics, which is where they shine for lists, because the callback's parameter follows the data:
+
+```tsx
+function List<T>({ items, getKey, renderItem }: {
+  items: readonly T[];
+  getKey: (item: T) => string;
+  renderItem: (item: T, index: number) => ReactNode;
+}) {
+  return <ul>{items.map((item, i) => <li key={getKey(item)}>{renderItem(item, i)}</li>)}</ul>;
+}
+
+<List items={tasks} getKey={(t) => t.id} renderItem={(t) => <b>{t.title}</b>} />; // ✅ t: Task
+<List items={tasks} getKey={(t) => t.id} renderItem={(t) => <b>{t.name}</b>} />;  // ❌ Property 'name' does not exist on type 'Task'.
+```
+
+> ✅ **When is this useful?** When the component needs to hand the caller **per-render information** that a hook can't supply at that spot: the current item in a list, a measured size, a visible range.
+
+> 🚫 **When is this unnecessary complexity?** When the state is just "open or closed" at the top of your own component. A `useState` or a custom hook is shorter, flatter, and easier to read than a callback nested in JSX.
+
+## 88.3 Hooks replaced most render props
+
+Before hooks, sharing stateful logic *required* a render prop or a higher-order component, since a function component had nowhere to put state. Today, the `Disclosure` above is a three-line hook, and the caller keeps flat JSX with no callback nesting:
+
+```tsx
+function useDisclosure(defaultOpen = false) {
+  const [open, setOpen] = useState(defaultOpen);
+  return { open, toggle: () => setOpen((o) => !o) };
+}
+
+function Filters() {
+  const { open, toggle } = useDisclosure(); // flat, no wrapper component
+  return <button onClick={toggle}>{open ? "Hide filters" : "Show filters"}</button>;
+}
+```
+
+If you inherit a render-prop component whose state doesn't depend on *where* it renders, convert it to a hook. The exercise for this chapter does exactly that.
+
+Render props still win when the component must **call you repeatedly, at positions only it knows**. Two cases:
+
+```tsx
+// 1. Virtualization: only the visible rows exist, and the list decides which
+type VirtualListProps<T> = {
+  items: readonly T[]; rowHeight: number; height: number;
+  renderRow: (item: T, index: number) => ReactNode;
+};
+
+<VirtualList items={tasks} rowHeight={32} height={320} renderRow={(t, i) => <span>{i}: {t.title}</span>} />;
+
+// 2. Measured layout: the size is known only after the DOM exists
+<Measure>{({ width }) => <p>{width > 600 ? "wide" : "narrow"}</p>}</Measure>;
+```
+
+A hook can't do (1): rows are rendered *by* the list, at positions it computes during scroll. For (2), `Measure` wraps the element it observes, so a render prop gives the caller the measurement without a ref juggling act. (Libraries often offer a hook for (2) too, such as `useResizeObserver(ref)`, when you already have a ref.)
+
+> ⚠️ **Common mistake.** Passing an inline arrow as a render prop to a memoized child and expecting memoization to work. A new function identity on every render defeats `memo`. Wrap in `useCallback` only after you've measured a problem ([Chapter 72](/chapter/72)).
+
+## 88.4 Headless components
+
+A **headless** component (usually a hook) supplies behavior, state, and accessibility wiring, and renders **nothing**. The caller owns every element and every class name. That is the answer to the opening story: a headless combobox lets you change the chevron, the option layout, and the styling, and still get keyboard navigation and ARIA for free.
+
+Here is the *shape* of a headless `useCombobox<T>`. The generic `T` is the item type, so everything the hook hands back is typed to your data:
+
+```tsx
+type ComboboxOptions<T> = {
+  items: readonly T[];
+  itemToString: (item: T) => string; // how to show an item as text
+  onSelect: (item: T) => void;
+};
+
+declare function useCombobox<T>(options: ComboboxOptions<T>): {
+  isOpen: boolean;
+  inputValue: string;
+  highlightedIndex: number;
+  filtered: T[];                                 // items matching the input
+  getInputProps: (overrides?: ComponentProps<"input">) => ComponentProps<"input">;
+  getListProps: (overrides?: ComponentProps<"ul">) => ComponentProps<"ul">;
+  getItemProps: (item: T, index: number, overrides?: ComponentProps<"li">) => ComponentProps<"li">;
+};
+```
+
+Now the first UI, a plain list, with TaskFlow's `Task` as `T`:
+
+```tsx
+function TaskPicker({ tasks }: { tasks: Task[] }) {
+  const cb = useCombobox({
+    items: tasks,
+    itemToString: (t) => t.title,          // t: Task, inferred from items
+    onSelect: (t) => console.log(t.status),
+  });
+
+  return (
+    <div>
+      <input {...cb.getInputProps({ placeholder: "Find a task" })} />
+      <ul {...cb.getListProps()}>
+        {cb.filtered.map((t, i) => (
+          <li key={t.id} {...cb.getItemProps(t, i)}>{t.title}</li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+```
+
+A second UI on the same hook can look completely different (avatars, status chips, a chevron of your choice) because nothing in the hook cares about markup:
+
+```tsx
+<li key={t.id} {...cb.getItemProps(t, i)} className={i === cb.highlightedIndex ? "row row--hot" : "row"}>
+  <StatusDot status={t.status} />
+  <span>{t.title}</span>
+</li>
+```
+
+> ✅ **When is this useful?** Complex behavior that **many different UIs** will share: comboboxes, date pickers, tables, drag and drop. A design-system team writes the hook once, and each product styles it.
+
+> 🚫 **When is this unnecessary complexity?** Your app has one combobox, styled one way. A plain `TaskPicker` component (with the logic inside it) is less code than a hook plus a component, and nobody has to learn getters.
+
+## 88.5 Prop getters
+
+Look at `getInputProps()` above. A **prop getter** is a function that returns a bundle of props (event handlers, ARIA attributes, ids) for the caller to spread onto *their* element. It keeps the wiring inside the hook while the element stays yours. Because handlers are bundled, the getter must **merge** with the caller's own: if you pass `onClick`, both yours and the hook's must run.
+
+```tsx
+type ButtonProps = ComponentProps<"button">;
+type DivProps = ComponentProps<"div">;
+
+function useDisclosure({ defaultOpen = false }: { defaultOpen?: boolean } = {}) {
+  const [open, setOpen] = useState(defaultOpen);
+  const id = useId();
+  const toggle = () => setOpen((o) => !o);
+
+  function getToggleProps(overrides: ButtonProps = {}): ButtonProps {
+    return {
+      type: "button",
+      "aria-expanded": open,
+      "aria-controls": id,
+      ...overrides,
+      onClick: (e) => {                        // e: MouseEvent<HTMLButtonElement>
+        overrides.onClick?.(e);                // the caller's handler runs first
+        if (!e.defaultPrevented) toggle();     // ...and can veto ours
+      },
+    };
+  }
+
+  function getContentProps(overrides: DivProps = {}): DivProps {
+    return { id, hidden: !open, ...overrides };
+  }
+
+  return { open, toggle, getToggleProps, getContentProps };
+}
+```
+
+Using it, the types keep each bundle on the right element:
+
+```tsx
+function Faq() {
+  const { open, getToggleProps, getContentProps } = useDisclosure();
+  return (
+    <>
+      <button {...getToggleProps({ className: "faq", onClick: () => track("faq") })}>
+        {open ? "−" : "+"} Why TaskFlow?
+      </button>
+      <div {...getContentProps()}>Because it ships.</div>
+
+      <div {...getToggleProps()}>…</div>
+      {/* ❌ Types of property 'ref' are incompatible. Type 'Ref<HTMLButtonElement> | undefined' is not assignable to type 'Ref<HTMLDivElement> | undefined'. */}
+      <button {...getToggleProps({ onClick: (e: number) => {} })} />
+      {/* ❌ Type '(e: number) => void' is not assignable to type 'MouseEventHandler<HTMLButtonElement>'. */}
+    </>
+  );
+}
+```
+
+The first error is the real value: spreading *button* props onto a `div` is rejected, so a getter can't be pointed at the wrong element. (The real message is much longer, since `ComponentProps` includes `ref` and hundreds of attributes; the last lines are the useful ones.) To keep errors shorter, libraries often return a narrower type than `ComponentProps`.
+
+The same idea builds the combobox's `getItemProps`. It merges `onClick` and `onMouseEnter` the same way:
+
+```tsx
+function getItemProps(item: T, index: number, overrides: ComponentProps<"li"> = {}): ComponentProps<"li"> {
+  return {
+    id: `${listId}-${index}`,
+    role: "option",
+    "aria-selected": index === highlighted,
+    ...overrides,
+    onMouseEnter: (e) => { overrides.onMouseEnter?.(e); setHighlighted(index); },
+    onClick: (e) => { overrides.onClick?.(e); choose(item); },
+  };
+}
+```
+
+> ⚠️ **Common mistake.** Spreading the caller's `overrides` *after* the handlers you own, which silently replaces your behavior. Spread overrides first for plain attributes, then compose each handler explicitly, as above.
+
+## 88.6 Slots, revisited
+
+Not every inversion needs a function. A **slot** is a named prop that takes a `ReactNode`, which is the lightest way to let callers supply a region:
+
+```tsx
+function Card({ header, footer, children }: {
+  header: ReactNode;      // required slot
+  footer?: ReactNode;     // optional slot
+  children: ReactNode;
+}) {
+  return (
+    <section className="card">
+      <header>{header}</header>
+      {children}
+      {footer ? <footer>{footer}</footer> : null}
+    </section>
+  );
+}
+
+<Card header={<h3>Sprint 12</h3>} footer={<Button>Archive</Button>}>…</Card>; // ✅
+<Card>body</Card>; // ❌ Property 'header' is missing in type '{ children: string; }' but required in type '{ header: ReactNode; footer?: ReactNode; children: ReactNode; }'.
+```
+
+Slots are plain data, so there's no callback to memoize, no state to hand over, and the types are one line each. They're the right rung when the caller needs to decide *what* goes in a region but needs no information from the component to do it. The moment the region needs the component's state (a row needs its `index`, a header needs `isOpen`), that slot should become a render prop.
+
+> ✅ **When is this useful?** Fixed layouts with a few customizable regions: cards, page shells, dialogs.
+
+> 🚫 **When is this unnecessary complexity?** One region only: that's just `children`. And a slot-heavy component with eight `ReactNode` props is a compound component ([Chapter 87](/chapter/87)) waiting to happen.
+
+## 88.7 ✅ Useful / 🚫 Unnecessary
+
+> ✅ **When is this useful?** **Libraries and design systems.** You can't know how consumers want to render, so you hand over behavior and let them own the markup: headless hooks, prop getters, and render props where the component must call back with per-item state. It's also right for complex, accessibility-heavy behavior (combobox, menu, date picker) that you want implemented *once*.
+
+> 🚫 **When is this unnecessary complexity?** **App code.** In a TaskFlow screen you own both the component and every caller, so you can simply change the markup. A headless `useTaskCard` used by exactly one `TaskCard` is indirection with no second customer: inline the logic, delete the getters, and keep a plain component. If a second UI appears, the extraction is a ten-minute refactor.
+
+```text
+Who are the callers?
+  one team, one look            → plain component (props / children)
+  one team, a few regions vary  → slots
+  per-item state is needed      → render prop
+  many UIs share hard behavior  → headless hook + prop getters
+```
+
+## Common mistakes
+
+> ⚠️ **Render props nested three deep.** `A` inside `B` inside `C` is the old "callback hell" for JSX. Convert to hooks.
+
+> ⚠️ **Not merging handlers in prop getters.** A caller's `onClick` replaces the hook's, and the toggle silently stops working.
+
+> ⚠️ **Typing getters as `any` or `object`.** The whole value of a getter is that the returned props are checked against the element they are spread on.
+
+> ⚠️ **Forgetting accessibility in a headless hook.** If the hook omits `role`, `aria-expanded`, and ids, every caller must remember them. Putting that wiring in the hook is the entire reason to have one.
+
+> ⚠️ **Building headless first.** Write the concrete component, then extract the hook when a second UI needs it.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** you author shared infrastructure, such as a design-system primitive, with many different looks, or when a component must call back with state at positions only it knows (virtualized rows, measured sizes).
+
+> 🚫 **When not to.** Application components with one look and one owner. Prefer props, `children`, and slots. If a custom hook is enough, don't wrap it in a render-prop component.
+
+## How it connects
+
+> 🔗 **Connection.** Custom hooks ([Chapter 56](/chapter/56)) are the engine here, `ComponentProps` ([Chapter 50](/chapter/50)) types the getters, and generic components ([Chapter 84](/chapter/84)) type `List<T>`. [Chapter 87](/chapter/87) inverted layout, and [Chapter 89](/chapter/89) puts every pattern on one ladder.
+
+> 🌍 **Real world.** Downshift pioneered prop getters for comboboxes; React Aria and TanStack Table are headless hooks; TanStack Virtual and `react-window` use render callbacks for rows; Radix primitives expose `asChild` for the same inversion ([Chapter 86](/chapter/86)).
+
+## Exercises
+
+### Level 1 — Recall
+
+Convert a render-prop component to a hook. Start from this one and write `useMousePosition()`, then rewrite its caller:
+
+```tsx
+function MouseTracker({ children }: { children: (pos: { x: number; y: number }) => ReactNode }) {
+  const [pos, setPos] = useState({ x: 0, y: 0 });
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => setPos({ x: e.clientX, y: e.clientY });
+    window.addEventListener("mousemove", onMove);
+    return () => window.removeEventListener("mousemove", onMove);
+  }, []);
+  return <>{children(pos)}</>;
+}
+```
+
+### Level 2 — Application
+
+Build a headless `useDisclosure` with typed `getToggleProps` and `getContentProps`. Write a test showing that a caller's `onClick` and the hook's toggle both run, and that `aria-expanded` and `aria-controls` are present.
+
+### Level 3 — Challenge
+
+Build a headless `useCombobox<T>` and **two different UIs** on top of it (a plain list, and one with avatars and a chevron). Both must support arrow keys, Enter, and Escape without any behavior code in the UI.
+
+*Hint: keep `highlightedIndex` and `isOpen` in the hook, and give `getItemProps` the item and its index.*
+
+### Level 4 — Real-world (de-abstraction)
+
+**Ticket TF-571: Remove the headless indirection from the task card.** `useTaskCard` returns `getRootProps`, `getTitleProps`, and `getMenuProps`, and exactly one component, `TaskCard`, uses it. Nobody has built a second UI in a year.
+
+- Replace the hook with a plain `TaskCard` component that has the logic inline, with the same behavior and the same tests passing.
+- Delete the getter types that become unused.
+- Add a short comment, or a note in the PR, describing what would justify extracting a headless hook again (for example, a second UI such as a board card or a compact card).
+
+## Key takeaways
+
+- Inversion of control means the component supplies behavior and the caller supplies rendering. It trades caller effort for flexibility.
+- A typed render prop is `(state: T) => ReactNode`, and the callback's parameter is contextually typed, so callers get autocomplete and errors.
+- Hooks replaced most render props, and render props still win for virtualization and measured layouts, where the component calls you at positions only it knows.
+- Headless components provide behavior and ARIA, with zero markup. Prop getters bundle handlers and attributes, and must merge with the caller's.
+- Slots (`ReactNode` props) are the lightest inversion, with no function and no state.
+- In app code, a headless pattern with one consumer is overhead: inline it.
+
+## What comes next
+
+You now have the whole toolbox: props, children, slots, compound components, render props, headless hooks, and polymorphism. The remaining question is *which one*. [Chapter 89: Reusable Component API Design](/chapter/89) puts all of them on a single complexity ladder, with a decision guide, conventions for consistency, and a practice every senior engineer needs: moving a component back **down** the ladder.

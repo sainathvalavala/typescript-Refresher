@@ -1,0 +1,385 @@
+> 📖 **The problem.** TaskFlow has three kinds of people: `AdminUser`, `GuestUser`, and `Customer`. Each type was written by a different developer in a different sprint, and about 70% of their properties are identical: `id`, `name`, `email`, `avatarUrl`, `createdAt`. Then product asks for email addresses to become optional for guests and to carry a `verified` flag for everyone else. The change has to be made in three places. Someone makes it in two. For a month, customers can be saved without the `verified` flag and nobody notices until the billing export breaks.
+
+Object types are the vocabulary of your application: every task, project, user, request, and setting is one. [Chapter 7](/chapter/7) and [Chapter 8](/chapter/8) showed how to write and name them. This chapter is about **designing** them: describing methods, dictionaries, and recursive data accurately, choosing between `interface` and `type` for a reason, and building big types out of small ones so that every fact about your domain is written exactly once.
+
+> 🧠 **Mental model.** **Build object types like LEGO.** Make small, named pieces (`Identifiable`, `Timestamps`, `Contactable`) and snap them together into larger ones with `extends` or `&`. When two types share fields, they should share a *piece*, not a copy-pasted list.
+
+## 12.1 Object types in depth
+
+Real objects aren't flat. A task has an assignee, a checklist, and a set of hooks that run when it changes. Object types nest naturally, and as soon as a nested piece is used in more than one place, it deserves its own name:
+
+```ts
+type ChecklistItem = { text: string; done: boolean };
+
+type TaskDetails = {
+  id: string;
+  title: string;
+  assignee: { id: string; name: string } | null; // inline: used only here
+  checklist: ChecklistItem[];                   // named: reused by other types
+  labels: readonly string[];
+};
+```
+
+Object types can also describe behavior, and there are two ways to write a function-valued member. **Method syntax** looks like a method declaration; **property syntax** is a property whose type is a function type. They read almost the same, but they're checked differently. For historical reasons, method parameters are checked *loosely*, so method syntax lets through some assignments that are genuinely unsafe:
+
+```ts
+type CompletedTask = Task & { completedAt: Date };
+const logCompletion = (task: CompletedTask) => console.log(task.completedAt.toISOString());
+
+type MethodStyle = { handle(task: Task): void };      // method syntax
+type PropertyStyle = { handle: (task: Task) => void }; // property syntax
+
+const m: MethodStyle = { handle: logCompletion };   // compiles, but handle(anyTask) will crash
+const p: PropertyStyle = { handle: logCompletion }; // ❌ Type '(task: CompletedTask) => void' is not assignable to type '(task: Task) => void'.
+```
+
+`logCompletion` needs a `completedAt` that ordinary tasks don't have, so the property-style check is right to reject it. Prefer **property syntax** for callbacks and handlers in your own types. ([Chapter 77](/chapter/77) explains the underlying rule, called variance.)
+
+Members can be optional too, including methods. An optional method might not exist, so you must check before calling it. Optional chaining does it in one step:
+
+```ts
+interface TaskHooks {
+  onArchive?: (task: Task) => void;
+}
+
+function archive(task: Task, hooks: TaskHooks) {
+  hooks.onArchive(task);   // ❌ Cannot invoke an object which is possibly 'undefined'.
+  hooks.onArchive?.(task); // ✅ calls it only if it exists
+}
+```
+
+## 12.2 Index signatures and Record
+
+Some objects aren't records with a fixed set of fields; they're **dictionaries**: lookup tables from keys you don't know in advance to values of one type. TaskFlow's client cache keeps tasks by id. You describe that with an **index signature**, `{ [key: string]: T }`, or with the built-in `Record<K, T>` utility, which says the same thing more readably:
+
+```ts
+type TaskCache = { [taskId: string]: Task }; // the name "taskId" is documentation only
+type SameCache = Record<string, Task>;       // equivalent; Record is covered fully in Chapter 21
+
+const cache: TaskCache = {};
+cache[task.id] = task;       // ✅ any string key is allowed
+
+function titleFromCache(id: string) {
+  const hit = cache[id];     // hit: Task | undefined
+  return hit.title;          // ❌ 'hit' is possibly 'undefined'.
+}
+```
+
+That `undefined` comes from `noUncheckedIndexedAccess` ([Chapter 7](/chapter/7)), and in a dictionary it's essential. An index signature claims that *every* string key maps to a `Task`, which is obviously false: most keys map to nothing. Without the flag, `cache["nope"].title` compiles and crashes. With it, every lookup is honest about the miss.
+
+`Record` becomes more powerful when the keys are a **finite** union. Then it's not a dictionary at all; it's a promise that *every* key is present, which makes it a great tool for exhaustive lookup tables:
+
+```ts
+const columnTitles: Record<TaskStatus, string> = {
+  todo: "To do",
+  doing: "In progress",
+  done: "Done",
+}; // add a status to TaskStatus and this object becomes an error until you add its title
+
+const columns: Record<TaskStatus, Task[]> = { todo: [], doing: [] }; // ❌ Property 'done' is missing in type '{ todo: never[]; doing: never[]; }' but required in type 'Record<TaskStatus, Task[]>'.
+```
+
+You can mix known properties with an index signature, but every known property must also fit the index signature's value type, since it's one of the "any string key" entries:
+
+```ts
+interface FeatureFlags {
+  version: number;          // ❌ Property 'version' of type 'number' is not assignable to 'string' index type 'boolean'.
+  [flag: string]: boolean;
+}
+
+interface FeatureFlagsFixed {
+  version: number;
+  flags: Record<string, boolean>; // ✅ put the open-ended part in its own property
+}
+```
+
+> 💡 **Tip.** If the keys are added and removed at runtime, a `Map<string, Task>` is often a better fit than a plain object: it has a real `size`, iterates in insertion order, and its `get` already returns `Task | undefined`.
+
+## 12.3 Interfaces vs type aliases
+
+You've seen both `interface Task { … }` and `type Task = { … }`. For plain object shapes they're nearly interchangeable, and teams waste a surprising amount of time arguing about them. Here are the differences that actually matter.
+
+**Only `type` can name things that aren't object shapes**: unions, tuples, function types, primitives, and the derived types you'll build in Part IV. An interface always describes an object.
+
+```ts
+type TaskStatus = "todo" | "doing" | "done";      // union: type only
+type Range = [start: Date, end: Date];             // tuple: type only
+type TaskPredicate = (task: Task) => boolean;      // function type: either works, type reads better
+
+interface Project { id: string; name: string }     // object shape: either works
+type ProjectAlias = { id: string; name: string };  // …same set of values
+```
+
+**Only `interface` can be reopened.** Declaring the same interface name twice merges the declarations (12.6). That's essential for augmenting library and global types, and occasionally a source of surprises. Declaring the same `type` twice is an error.
+
+**They report conflicts differently.** `interface X extends Y` checks compatibility immediately and gives a clear error. Combining types with `&` never errors; a conflicting property silently becomes `never` (12.5). For the same reason, the TypeScript team notes that interfaces with `extends` are a little cheaper for the compiler than large intersections, which can matter in very big codebases ([Chapter 95](/chapter/95)).
+
+```ts
+type TaskId = string;
+type TaskId = number; // ❌ Duplicate identifier 'TaskId'.
+
+interface Base { id: string }
+interface Broken extends Base { id: number } // ❌ Interface 'Broken' incorrectly extends interface 'Base'.
+```
+
+> 🧠 **Mental model.** A decision rule that works: use **`type`** for unions, tuples, functions, and anything derived from other types. For object shapes, prefer **`interface`** when the shape is meant to be extended or augmented (domain entities, public library types), and don't agonize otherwise. Whatever you choose, be consistent within a codebase.
+
+## 12.4 Extending interfaces
+
+Here is the problem from the start of the chapter, in code. Three types, one copy-pasted core:
+
+```ts
+interface AdminUser { id: string; name: string; email: string; avatarUrl?: string; permissions: string[] }
+interface GuestUser { id: string; name: string; email: string; avatarUrl?: string; expiresAt: Date }
+interface Customer  { id: string; name: string; email: string; avatarUrl?: string; plan: "free" | "pro" }
+// To change "email", edit three lines and hope you found them all.
+```
+
+`extends` lets an interface start from another interface and add to it. Pull the shared fields into a base, and each specific type lists only what makes it different:
+
+```ts
+interface Person {
+  id: string;
+  name: string;
+  email: string;
+  avatarUrl?: string;
+}
+
+interface AdminUser extends Person { permissions: string[] }
+interface GuestUser extends Person { expiresAt: Date }
+interface Customer extends Person { plan: "free" | "pro" }
+
+const admin: AdminUser = { id: "u1", name: "Ada", email: "ada@taskflow.dev", permissions: ["billing"] }; // ✅
+```
+
+Now `email` lives in exactly one place. An interface can extend **several** others at once, which is how you snap together independent pieces, and it can extend object-shaped type aliases too:
+
+```ts
+interface Timestamps { createdAt: Date; updatedAt: Date }
+type Billable = { stripeCustomerId: string };
+
+interface PayingCustomer extends Person, Timestamps, Billable {
+  plan: "pro";
+}
+```
+
+An extending interface may also **override** a property, but only by narrowing it: the new type must fit inside the old one. Narrowing keeps the rule from [Chapter 10](/chapter/10) intact, because every `ArchivedTask` is still a valid `Task`:
+
+```ts
+interface ArchivedTask extends Task {
+  status: "done";      // ✅ "done" fits inside TaskStatus
+  archivedAt: Date;
+}
+
+interface NumberedTask extends Task { // ❌ Interface 'NumberedTask' incorrectly extends interface 'Task'.
+  status: number;                       //      Types of property 'status' are incompatible.
+}
+```
+
+## 12.5 Composition with intersections
+
+The `type` world has its own way to combine shapes: the **intersection** operator `&`. `A & B` is a type whose values satisfy `A` *and* `B` at the same time, so in practice it has all the properties of both. It's especially handy for small, cross-cutting pieces you want to mix into many types:
+
+```ts
+type Identifiable = { id: string };
+type Timestamps = { createdAt: Date; updatedAt: Date };
+type SoftDeletable = { deletedAt: Date | null };
+
+type StoredTask = Task & Timestamps & SoftDeletable;
+type StoredProject = Project & Timestamps;
+
+function restore(item: Identifiable & SoftDeletable): void {
+  item.deletedAt = null; // ✅ item has both id and deletedAt
+}
+```
+
+Intersections also shine for one-off combinations that don't deserve a named interface, such as a view model for a single component: `Task & { assignee: User | null }`.
+
+The difference from `extends` appears when two pieces disagree. `extends` reports the conflict. An intersection doesn't: it quietly computes a property that must be a string *and* a number at once, which is impossible, so the property's type becomes `never`:
+
+```ts
+type LegacyId = { id: number };
+type Merged = Identifiable & LegacyId;
+
+const record: Merged = { id: "t1" }; // ❌ Type 'string' is not assignable to type 'never'.
+```
+
+The error appears only when you try to *create* a value, far from the line that caused it. The reason intersections behave this way is easiest to see with set diagrams, which is the first thing [Chapter 13](/chapter/13) draws.
+
+## 12.6 Declaration merging
+
+If you declare an interface with the same name twice in the same scope, TypeScript doesn't complain. It **merges** them into one interface containing the members of both. This is called *declaration merging*.
+
+```ts
+interface TaskFlowSettings {
+  theme: "light" | "dark";
+}
+interface TaskFlowSettings {
+  pageSize: number;
+}
+
+const settings: TaskFlowSettings = { theme: "dark", pageSize: 25 }; // ✅ needs both members
+```
+
+Writing both halves in one file like this would be odd. Merging exists for a different reason: it lets you **add to types you don't own**. Global browser types such as `Window` are interfaces, and so are many library types, so you can reopen them from your own code. In a module file, global augmentations go inside `declare global`:
+
+```ts
+declare global {
+  interface Window {
+    taskflowVersion: string; // merged into the DOM's own Window interface
+  }
+}
+
+window.taskflowVersion = "2.4.0"; // ✅ now part of Window
+```
+
+The same mechanism lets you add a `user` property to Express's `Request` type, or teach a test library about a custom matcher. [Chapter 28](/chapter/28) covers library augmentation in detail.
+
+> ⚠️ **Common mistake.** Merging can also happen by accident. In a file with no `import` or `export`, declarations are global, so `interface Comment { id: string; body: string }` merges with the DOM's built-in `Comment` interface. Suddenly your plain object needs 63 DOM properties, and the error makes no sense until you know why: "Type '`{ id: string; body: string; }`' is missing the following properties from type 'Comment': data, length, ownerDocument, appendData, and 59 more." Use modules, and choose specific names such as `TaskComment`.
+
+## 12.7 Recursive types
+
+Some data contains smaller copies of itself: a comment with replies that have replies, a project with sub-projects, a folder tree. A type can refer to itself to describe this, as long as the reference is inside an object or array (otherwise it would be infinitely large):
+
+```ts
+type TaskComment = {
+  id: string;
+  author: string;
+  body: string;
+  replies: TaskComment[]; // a comment contains comments
+};
+
+function countComments(comments: TaskComment[]): number {
+  return comments.reduce((total, c) => total + 1 + countComments(c.replies), 0);
+}
+```
+
+The recursive function mirrors the recursive type: one case for "this node", one recursive call for "its children". This pairing is common enough that it's worth practicing.
+
+The most useful recursive type in everyday code describes **JSON**. A JSON value is a primitive, `null`, an array of JSON values, or an object whose values are JSON values:
+
+```ts
+type Json = string | number | boolean | null | Json[] | { [key: string]: Json };
+
+const payload: Json = { title: "Ship it", tags: ["urgent"], meta: { estimate: 3, notes: null } }; // ✅
+
+const withDate: Json = { due: new Date() }; // ❌ Type '{ due: Date; }' is not assignable to type 'Json'.
+const withUndef: Json = { due: undefined }; // ❌ Type '{ due: undefined; }' is not assignable to type 'Json'.
+```
+
+Both rejections are correct: `JSON.stringify` turns a `Date` into a string and silently drops `undefined` properties, so neither value would survive a round trip. A `Json` type is a precise way to say "this value can be saved to `localStorage` or sent over the network unchanged".
+
+## 12.8 Modeling a domain
+
+With these tools you can model TaskFlow properly. Domain modeling starts by sorting things into two kinds. **Entities** have identity: a task stays the same task when its title changes, so it needs an `id`. **Value objects** have no identity: two date ranges with the same start and end are simply equal, so they don't get an id. Then you decide **relationships**: does a task *embed* its project, or *reference* it by id?
+
+```ts
+type UserId = string;
+type ProjectId = string;
+type TaskId = string;
+
+interface Entity { readonly id: string; createdAt: Date; updatedAt: Date } // identity + audit fields
+type DateRange = { start: Date; end: Date };                               // value object: no id
+
+interface User extends Entity { readonly id: UserId; name: string; email: string; role: "admin" | "member" | "guest" }
+interface Project extends Entity { readonly id: ProjectId; name: string; ownerId: UserId; memberIds: UserId[] }
+interface Task extends Entity {
+  readonly id: TaskId;
+  projectId: ProjectId;   // reference by id, not an embedded Project
+  title: string;
+  status: TaskStatus;
+  priority: Priority;
+  assigneeId: UserId | null; // "nobody yet" is a real state, so it's explicit
+  schedule?: DateRange;      // genuinely optional
+}
+```
+
+Each line encodes a decision. Ids are `readonly` because changing an identity is a bug. Tasks reference their project by id, so renaming a project can't leave stale copies inside thousands of tasks. `assigneeId` is `UserId | null` rather than optional, because "unassigned" is a state the UI displays, not a field someone forgot. And `schedule` is a value object, so it has no id of its own.
+
+When a screen needs related data together, *compose* a view type at the edge rather than bloating the entity:
+
+```ts
+type TaskCard = Task & { assignee: User | null; projectName: string };
+
+function toCard(task: Task, users: Map<UserId, User>, projects: Map<ProjectId, Project>): TaskCard {
+  return {
+    ...task,
+    assignee: task.assigneeId ? users.get(task.assigneeId) ?? null : null,
+    projectName: projects.get(task.projectId)?.name ?? "Unknown project",
+  };
+}
+```
+
+The id aliases (`UserId`, `ProjectId`) still don't stop you from mixing ids up, as [Chapter 10](/chapter/10) showed. They make signatures readable today, and [Chapter 78](/chapter/78) can make them strict later without changing a single call site.
+
+## Common mistakes
+
+> ⚠️ **Index signatures that make every property optional-in-disguise.** `type Task = { [key: string]: unknown }` accepts any object at all, typo'd keys included, and every read is a guess. If you know the fields, write them. Use index signatures only for genuine dictionaries, and keep `noUncheckedIndexedAccess` on.
+
+```ts
+type LooseTask = { [key: string]: string };
+const t: LooseTask = { titel: "Ship it" }; // ✅ compiles: the typo is just another key
+```
+
+> ⚠️ **Deep inheritance hierarchies.** `Entity → Person → User → StaffUser → AdminUser → SuperAdmin` makes every change ripple through six levels and makes the final type impossible to read. Keep `extends` chains shallow (one or two levels) and compose small pieces sideways instead.
+
+> ⚠️ **Interfaces accidentally merging.** A global `interface Comment` or `interface Event` merges with the DOM's types. Write your code in modules and give domain types specific names.
+
+> ⚠️ **Using `&` to merge conflicting shapes.** An intersection never reports a conflict; it produces `never` properties. When you mean "a version of this type with a different field", that's a job for `Omit` ([Chapter 21](/chapter/21)), not `&`.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** several types genuinely share a concept (every stored record has timestamps; every person has contact details). Name that concept as a piece and compose it with `extends` or `&`. Use `Record` with a finite key union for lookup tables that must cover every case, and recursive types for data that really is a tree.
+
+> 🚫 **When not to.** Don't create a base interface for two types that merely *look* alike today. If `Project` and `Invoice` both happen to have `name` and `ownerId`, a shared `Named` base couples two concepts that will evolve independently, and you'll be untangling them in a year. Duplication of *shape* is fine; duplication of *meaning* is what you remove.
+
+## How it connects
+
+> 🔗 **Connection.** Intersections get their full set-theory explanation in [Chapter 13](/chapter/13), alongside unions. Utility types like `Partial`, `Pick`, and `Omit` ([Chapter 21](/chapter/21)) let you derive variants such as "a task without its id" instead of writing them by hand, and mapped types ([Chapter 22](/chapter/22)) show how `Record` is built. Declaration merging powers library augmentation ([Chapter 28](/chapter/28)). In React, component props are object types, and composing them with `extends` and `&` is everyday work ([Chapter 50](/chapter/50)). The domain model from 12.8 is the heart of [P02](/projects/p02).
+
+> 🌍 **Real world.** Libraries lean on interfaces precisely because users can augment them: Express's `Request`, Vitest's matchers, and many UI libraries' theme types are designed to be reopened. Application code, by contrast, often prefers `type` everywhere for its consistency with unions. Both styles appear in well-run codebases; mixed styles with no rule are what cause friction.
+
+## Exercises
+
+### Level 1 — Recall
+
+These three types overlap heavily. Extract a base type (or several small pieces) and rewrite each one as an extension, so that no property is declared more than once:
+
+```ts
+interface Bug     { id: string; title: string; reporterId: string; createdAt: Date; severity: 1 | 2 | 3 }
+interface Feature { id: string; title: string; reporterId: string; createdAt: Date; votes: number }
+interface Chore   { id: string; title: string; createdAt: Date; recurring: boolean }
+```
+
+### Level 2 — Application
+
+TaskFlow's workspace settings have three known keys (`name: string`, `timezone: string`, `weekStartsOn: 0 | 1`) plus any number of integration settings added by plugins, each keyed by an arbitrary string and holding a string value. Write a type for it that type-checks all four example objects you write, and that rejects a misspelled `timezon` key. Explain why putting the plugin settings in their own property is safer than a top-level index signature.
+
+### Level 3 — Challenge
+
+Write the recursive `Json` type from 12.7 without looking, then write `countLeaves(value: Json): number`, which counts every primitive and `null` anywhere inside the value. `countLeaves({ a: [1, 2, { b: null }], c: "x" })` should return `4`.
+
+*Hint: handle arrays before objects, because an array is also an object.*
+
+### Level 4 — Real-world
+
+**Ticket TF-301: Domain model for the library-lending pilot.** A partner wants TaskFlow's engine to run a small library. Model **members**, **books** (a title can have several physical copies), **loans**, and **holds** (a queue of members waiting for a title).
+
+- Classify every type as an entity or a value object, and give each entity a readonly id.
+- Choose embed-vs-reference for every relationship and justify each choice in one sentence in a comment.
+- Model "a loan that is overdue" and "a hold that is ready for pickup" without adding boolean flags that can contradict other fields.
+- No property is declared in more than one place.
+
+## Key takeaways
+
+- Name nested pieces once they're reused. Prefer **property syntax** for function members; it's checked more strictly than method syntax.
+- **Index signatures and `Record<string, T>`** describe dictionaries; keep `noUncheckedIndexedAccess` on so lookups admit they can miss. `Record` over a finite union demands every key.
+- `type` names anything; `interface` names object shapes and can be **merged**. Choose by need, then be consistent.
+- **`extends`** builds on a base and catches conflicts; **`&`** composes pieces but turns conflicts into silent `never`.
+- **Declaration merging** lets you augment global and library types, and bites when it happens by accident.
+- **Recursive types** model trees and JSON; pair them with recursive functions.
+- Model a domain with **entities** (identity), **value objects** (no identity), and deliberate **references by id**.
+
+## What comes next
+
+`Task & Timestamps` has *more* properties than either piece, yet in set terms it's a *smaller* set. Meanwhile, TaskFlow's request state is still an object with `isLoading`, `error`, and `data` fields that can contradict each other. Both puzzles are solved by the same algebra. [Chapter 13: Unions & Intersections](/chapter/13) draws the diagrams and introduces the most important modeling tool in this book: the discriminated union.

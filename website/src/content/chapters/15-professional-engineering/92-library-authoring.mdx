@@ -1,0 +1,325 @@
+> 📖 **The problem.** You publish `@taskflow/utils` to npm. It works in your Vite app. A teammate tries it in a Node script using ESM, and gets `ERR_MODULE_NOT_FOUND`. A customer using CommonJS imports it and sees `any` for every function, because TypeScript can't find the declarations. A third consumer deep-imports `@taskflow/utils/dist/internal/cache` and, two weeks later, you move that file and break them. Your code was fine. Your *package* was wrong.
+
+Writing a library and **publishing** a library are different skills. The code is the easy half. The hard half is the package: files, entry points, module formats, declaration files, and version numbers, which together decide what every possible consumer environment can load, see, and trust. By the end of this chapter you'll be able to author a package whose types resolve correctly under every module mode, validate that claim with tools, version type changes honestly, and automate releases.
+
+> 🧠 **Mental model.** A package is a **contract with every possible consumer environment**. `exports` decides what they can *load*; declaration files decide what they *see*; semver decides what they can *trust*.
+
+## 92.1 Anatomy of a TypeScript package
+
+The most important field in a modern `package.json` is `exports`. It is a map from **entry points** (what consumers write after the package name) to **files**, and it blocks everything not listed, so `dist/internal/cache` becomes unreachable. Inside each entry you list **conditions**: `types` for TypeScript, `import` for ESM consumers, `require` for CommonJS.
+
+```json
+{
+  "name": "@taskflow/utils",
+  "version": "1.4.0",
+  "type": "module",
+  "files": ["dist"],
+  "exports": {
+    ".": {
+      "import": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
+      "require": { "types": "./dist/index.d.cts", "default": "./dist/index.cjs" }
+    },
+    "./dates": {
+      "types": "./dist/dates.d.ts",
+      "default": "./dist/dates.js"
+    },
+    "./package.json": "./package.json"
+  }
+}
+```
+
+Two rules matter. First, **`types` must come first** inside each condition block: TypeScript uses the first matching condition, so listing `default` before `types` hides your declarations. Second, ESM and CJS consumers need their *own* declaration files (`.d.ts` vs `.d.cts`), because TypeScript decides a declaration file's module format from its extension and nearest `"type"` field.
+
+> 🕰 **Legacy note.** Older packages used top-level `main`, `module`, and `types` fields. Keep `main` and `types` as fallbacks only if you must support ancient tooling. Modern resolution (`moduleResolution: "node16"`, `"nodenext"`, or `"bundler"`) reads `exports` first.
+
+## 92.2 ESM-first and dual publishing
+
+JavaScript has two module systems ([Chapter 25](/chapter/25)): ES modules (`import`) and CommonJS (`require`). As an author you choose which to ship.
+
+**ESM-only** is the modern default: one build, one set of declarations, no "dual package hazard" (the bug where a consumer loads *both* copies and ends up with two separate instances of your singletons and `instanceof` checks that fail). Since Node 22, `require()` of synchronous ES modules works, so ESM-only packages are now loadable from most CommonJS code too.
+
+**Dual publishing** (ESM and CJS) is still right when you must support older Node versions or CommonJS-only tooling. The cost is double the build output, double the declarations, and the hazard above.
+
+```json
+{
+  "name": "@taskflow/utils",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "engines": { "node": ">=20" }
+}
+```
+
+That's an ESM-only package: shorter, simpler, and easier to validate. For a dual package, you keep the `import`/`require` split from 92.1 and make sure your classes and singletons don't hold state that would be duplicated.
+
+> 🚫 **When not to.** Don't dual-publish "just in case". Look at who your real consumers are. An internal library for Vite apps should be ESM-only. A public SDK for a wide audience may justify dual output.
+
+## 92.3 Declaration output
+
+TypeScript can emit `.d.ts` files, the type-only mirror of your code that consumers see. Three options matter in the library's `tsconfig.json`:
+
+```json
+{
+  "compilerOptions": {
+    "declaration": true,
+    "declarationMap": true,
+    "isolatedDeclarations": true,
+    "emitDeclarationOnly": false,
+    "outDir": "dist",
+    "rootDir": "src",
+    "module": "NodeNext",
+    "strict": true
+  },
+  "include": ["src"]
+}
+```
+
+- **`declaration`** emits the `.d.ts` files.
+- **`declarationMap`** emits `.d.ts.map` files so that "Go to definition" in a consumer's editor jumps to your *source*, not the generated declaration (ship `src` in `files` for this to work).
+- **`isolatedDeclarations`** (TypeScript 5.5+) requires every exported function and variable to carry explicit types, so declarations can be generated file by file without whole-program inference. This is faster and makes your public contract explicit, which is exactly [Chapter 91](/chapter/91)'s advice, enforced.
+
+```ts
+export function summarize(tasks: readonly Task[]) { return tasks.length; }
+// ❌ Function must have an explicit return type annotation with --isolatedDeclarations.
+
+export function summarize2(tasks: readonly Task[]): number { return tasks.length; } // ✅
+```
+
+## 92.4 Build tools for libraries
+
+You have two reasonable approaches.
+
+**Plain `tsc`** compiles each file to a matching `.js` and `.d.ts`. It's simple, predictable, and your output mirrors your source, so deep paths and source maps are easy. It's a good choice for ESM-only packages that run in Node or are consumed by bundlers.
+
+**A library bundler** such as `tsdown` or `tsup` (both built on fast native bundlers) produces fewer, optimized files, can output ESM and CJS in one run, and generates bundled declarations. It's convenient for dual publishing.
+
+```sh
+# Plain tsc, ESM only
+tsc -p tsconfig.build.json
+
+# tsdown: ESM + CJS, with declarations, from one command
+tsdown src/index.ts --format esm,cjs --dts
+```
+
+```json
+{
+  "scripts": {
+    "build": "tsdown src/index.ts --format esm,cjs --dts --clean",
+    "typecheck": "tsc --noEmit"
+  }
+}
+```
+
+A subtle rule: **a bundler builds the JavaScript, but you still run `tsc --noEmit` for type checking** in CI. Bundlers strip types without checking them. Treat the build tool as a packaging step and `tsc` as the correctness step.
+
+> 💡 **Tip.** Mark dependencies your users will install themselves (`react`, for instance) as `peerDependencies`, not `dependencies`, so you don't bundle a second copy.
+
+## 92.5 Validating packages
+
+"It works on my machine" is not evidence. Packaging bugs only appear in the consumer's environment, so test them there. Two tools catch nearly all of them.
+
+**`@arethetypeswrong/cli`** (`attw`) packs your package and checks whether TypeScript resolves your types correctly under every module mode: `node10`, `node16` (CJS and ESM), and `bundler`. It reports problems like "masquerading as CJS" and "resolution failed".
+
+**`publint`** lints `package.json` and file layout for mistakes such as `types` after `default`, missing files, or `exports` pointing nowhere.
+
+```sh
+npm pack
+npx publint
+npx @arethetypeswrong/cli --pack .
+```
+
+```text
+@taskflow/utils v1.4.0
+┌───────────────────┬──────────────────────┐
+│                   │ "@taskflow/utils"    │
+├───────────────────┼──────────────────────┤
+│ node10            │ 🟢                   │
+│ node16 (from CJS) │ 🟢 (CJS)             │
+│ node16 (from ESM) │ 🟢 (ESM)             │
+│ bundler           │ 🟢                   │
+└───────────────────┴──────────────────────┘
+```
+
+Put both in CI so a broken `exports` map fails a pull request instead of a customer.
+
+## 92.6 Semantic versioning for types
+
+**Semantic versioning** gives version numbers meaning: `MAJOR.MINOR.PATCH`. A patch fixes bugs, a minor adds features compatibly, a major breaks compatibility. For a TypeScript library, "compatibly" includes **types**: if a consumer's code compiled before and fails to compile after, that's a break, even if the runtime is identical.
+
+The rule of thumb from [Chapter 91](/chapter/91): *inputs may widen, outputs may narrow; the reverse is breaking.*
+
+```ts
+// v1
+export function setStatus(task: Task, status: "todo" | "doing" | "done"): Task;
+
+// v1.1 (minor) ✅ widened input, existing calls still compile
+export function setStatus(task: Task, status: "todo" | "doing" | "done" | "blocked"): Task;
+
+// v2 (major) ❌ narrowed input: setStatus(t, "doing") still works, but setStatus(t, someTodoDoingDone) can fail
+export function setStatus(task: Task, status: "todo" | "done"): Task;
+```
+
+Some edge cases surprise people. Adding a member to a union that consumers `switch` on exhaustively is **breaking for them**: their `never` check now fails. Adding a required generic parameter without a default is breaking. Changing an inferred return type is breaking. A pragmatic policy: anything that can make *previously valid* code fail to compile is a major change, and you document your supported TypeScript versions, because new compiler releases occasionally tighten checks.
+
+> ⚠️ **Common mistake.** Shipping a fix that makes types "more correct" as a patch. If it can turn a green build red, it's not a patch.
+
+## 92.7 API reports and compatibility
+
+Humans miss type changes in diffs, since a one-character edit to a generic constraint looks harmless. An **API report** is a generated text file listing your whole public surface; you commit it, and CI regenerates it and fails when it differs. A change to the public API then shows up as an explicit, reviewable diff.
+
+Microsoft's API Extractor is the established tool. It reads your entry point's `.d.ts` and writes `etc/utils.api.md`.
+
+```sh
+npx api-extractor run --local   # developer: update the report
+npx api-extractor run           # CI: fail if the report is out of date
+```
+
+```text
+// etc/utils.api.md (committed)
+export function groupTasksBy<K extends keyof Task>(tasks: readonly Task[], key: K): Map<Task[K], Task[]>;
+
+export interface TaskSummary {
+    done: number;
+    total: number;
+}
+```
+
+When someone changes `done: number` to `done: bigint`, the report diff makes the break obvious in review, and the reviewer asks the right question: is this a major? Combine the report with a **consumer test**: a tiny project in `examples/` that installs the packed tarball and compiles against it in each module mode.
+
+## 92.8 Release automation
+
+Manual releases fail in boring ways: a forgotten changelog, a version bump typed wrong, a build from a dirty working tree. **Changesets** make releases a pull-request workflow. Each PR that affects users adds a small file saying which packages change and whether it's a patch, minor, or major, with a human-written note.
+
+```md
+---
+"@taskflow/utils": minor
+---
+
+Add `groupTasksBy`. Deprecate `groupBy`; it will be removed in v3.
+```
+
+A CI job collects pending changesets, opens a "Version Packages" PR that bumps versions and writes `CHANGELOG.md`, and publishing happens when you merge it. Add **provenance** so consumers can verify the package came from your repository's CI and not a stolen laptop:
+
+```yaml
+# .github/workflows/release.yml
+name: Release
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write   # required for npm provenance
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, registry-url: "https://registry.npmjs.org" }
+      - run: npm ci && npm run build && npm test
+      - uses: changesets/action@v1
+        with: { publish: "npx changeset publish" }
+        env:
+          NPM_CONFIG_PROVENANCE: "true"
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+```
+
+## 92.9 Maintaining declarations
+
+> ⏭ **Safe to skip.** This section matters if you publish a widely used library. Most application developers can skip it.
+
+Your consumers don't all use your TypeScript version. If you write types using a new feature (say, `const` type parameters from TypeScript 5.0), a consumer on 4.9 gets a syntax error *in your declarations*. Decide on a **support policy**, for example "the latest two minor versions of TypeScript", and test it.
+
+`typesVersions` lets you ship alternative declarations to older compilers, and a CI matrix proves that each supported version compiles your examples:
+
+```json
+{
+  "typesVersions": {
+    "<5.0": { "*": ["./dist/ts4.9/*"] }
+  }
+}
+```
+
+```yaml
+strategy:
+  matrix:
+    typescript: ["5.6", "5.8", "latest"]
+steps:
+  - run: npm i -D typescript@${{ matrix.typescript }}
+  - run: npx tsc --noEmit -p examples/consumer
+```
+
+Declare the policy in your README, and treat dropping support for an old TypeScript version as a **major** change.
+
+## Common mistakes
+
+> ⚠️ **`types` listed after `default`.** TypeScript takes the first matching condition. Put `types` first in every block, or consumers see `any`.
+
+> ⚠️ **Shipping `.d.ts` for ESM only to CJS consumers.** A `.d.ts` beside a `"type": "module"` package is treated as ESM. Provide `.d.cts` for the `require` condition.
+
+> ⚠️ **Forgetting `files`.** Without a `files` allowlist (or `.npmignore`), you can publish tests, fixtures, or `.env` files. Always run `npm pack --dry-run` and read the list.
+
+> ⚠️ **Trusting your own repo as the test.** Imports resolve through your `tsconfig` paths inside the repo and through `exports` in the consumer. Test against the **packed tarball**.
+
+```json
+{
+  "exports": {
+    ".": { "default": "./dist/index.js", "types": "./dist/index.d.ts" }
+  }
+}
+```
+
+The block above is the classic bug: `default` matches first, so TypeScript never reaches `types`.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** other teams or the public install your package. The full toolbox (exports map, `attw`, API report, changesets, provenance) is justified by the cost of a broken release.
+
+> 🚫 **When not to.** Inside a monorepo, internal packages consumed from source need none of this ([Chapter 94](/chapter/94)). Don't pay for dual publishing, API Extractor, and a TypeScript version matrix for a library with three known consumers, all of which you control.
+
+## How it connects
+
+> 🔗 **Connection.** [Chapter 25](/chapter/25) covered module formats and [Chapter 26](/chapter/26) the `tsconfig` options; [Chapter 28](/chapter/28) covered declaration files from the consumer's side. [Chapter 91](/chapter/91) is the design half; this is the packaging half. [Chapter 93](/chapter/93) applies it to a component library, and [Chapter 94](/chapter/94) to packages inside a monorepo.
+
+> 🌍 **Real world.** Widely used libraries such as TanStack Query, Zod, and Vue publish with `exports` maps, validate with `attw`, and release with Changesets or similar automation.
+
+## Exercises
+
+### Level 1 — Recall
+
+Write the `exports` map for a package `@taskflow/ids` that ships an ESM build (`dist/index.js`), a CJS build (`dist/index.cjs`), and matching declaration files, plus a subpath `@taskflow/ids/brand`. Then list two things that go wrong if `types` is placed last in a condition block.
+
+### Level 2 — Application
+
+Take your generic utility library from [P04](/projects/p04), add a build step, and publish it to a local registry (for example Verdaccio). Create two tiny consumer projects, one ESM and one CommonJS, install the package, and show `tsc` resolving the types in both.
+
+### Level 3 — Challenge
+
+Set up an API report with API Extractor so that CI fails when the public API changes without an updated report. Demonstrate it by changing one exported type and showing the red build, then the diff a reviewer would see. *Hint: use a `.d.ts` rollup as the entry point.*
+
+### Level 4 — Real-world
+
+**Ticket UI-48: First public release of `@taskflow/ui` ([P20](/projects/p20)).**
+
+- Add `exports` with `types`/`import` conditions and `sideEffects: false`, and a `files` allowlist.
+- CI runs `publint` and `attw` and fails on any problem.
+- Changesets generates the changelog; the release workflow publishes with provenance.
+- The first release notes include the TypeScript versions you support.
+
+## Key takeaways
+
+- A package is a contract with every consumer environment: `exports` controls loading, declarations control what's seen, semver controls trust.
+- Put `types` **first** in every `exports` condition, and ship `.d.cts` for CJS consumers.
+- Default to ESM-only; dual-publish only for a real reason.
+- Use `declaration`, `declarationMap`, and `isolatedDeclarations` so public types are explicit.
+- Validate the **packed** package with `publint` and `attw`, not your repo.
+- A type change that can break previously valid code is a major change. Track it with an API report and ship it with Changesets and provenance.
+
+## What comes next
+
+Libraries of *components* add a layer: tokens, themes, accessibility, documentation, and visual testing. That is a design system, the subject of [Chapter 93: Design Systems & Component Libraries](/chapter/93).

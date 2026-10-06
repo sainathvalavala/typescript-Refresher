@@ -1,0 +1,371 @@
+> 📖 **The problem.** A message arrives from a fictional product manager, Dana: *"We need something like a lightweight Jira for small teams. People should be able to create workspaces, invite teammates, track issues on a board, comment, and see what's going on. It has to feel fast, and it can't leak one team's data to another. We'd like a demo in a few weeks."* That's the whole brief. There's no mockup, no API, no database schema, and three words ("something like Jira") that could mean anything from a to-do list to a two-year project.
+
+Until now, this book has told you what to build and how. From here on the voice changes: I'm your senior colleague, and I'll mostly ask questions, hand you checklists, and review your decisions. This chapter is about the work that happens *before* the first component: turning a vague brief into stories, types, contracts, a package layout, a state map, a quality plan, and milestones. It's the cheapest phase of the project and the one with the highest leverage, because a mistake you find in a type costs minutes, and the same mistake found in production costs weeks.
+
+> 🧠 **Mental model.** **Design from the inside out:** domain types first, then contracts, then architecture, then UI. Types are the cheapest place to discover a bad design.
+
+## 98.1 Choosing your track
+
+There are three capstones, described in full in the project ladder. Choose by what you want to be able to do afterward, not by what looks most impressive.
+
+| Track | What you build | Choose it if |
+|---|---|---|
+| **C1 Teamboard** | Full-stack multi-tenant issue tracker (API, web, contracts, UI library) | You want the complete picture and have done Parts VI and XV. Recommended. |
+| **C2 Ledgerly** | Frontend-focused personal-finance analytics app | You took the fast-track path, skipped the backend chapters, or want to push the type system on a client-only app. |
+| **C3 Library track** | A published library with a real consumer (validation lib, design system, or SDK generator) | You're heading toward library, platform, or tooling work. |
+
+Decide with three questions: *Which skills do I want to show?* (breadth: C1; client depth: C2; API and type design: C3.) *How much time do I really have?* (Be honest: C1 is the biggest.) *Who will review it?* (A hiring manager will understand Teamboard's shape in a minute; a library needs documentation to be appreciated.)
+
+```md
+## Track decision (docs/adr/0001-track.md)
+
+- Chosen: C1 Teamboard.
+- Why: I want to practice boundaries between api, web, and shared contracts; my target roles are full-stack.
+- Not chosen: C2 (I'd skip the backend, which I most need to practice); C3 (no library consumer I care about).
+- Risk: scope. Mitigation: milestones M1–M8 below with cut-lines; real-time (M5) is the first thing I'd defer.
+```
+
+The rest of this chapter uses **Teamboard** for examples. If you chose another track, apply the same moves to your own domain.
+
+## 98.2 From brief to user stories
+
+A vague brief is not a requirement. Your job is to turn it into **user stories**, short statements of value ("As a member, I want to…, so that…"), each with **acceptance criteria** that a tester could check, and an explicit list of **non-goals**: things you've decided *not* to build. Non-goals are what protect your schedule.
+
+```md
+### Story 4: Move an issue between states
+As a **member**, I want to move an issue from `todo` to `in_progress`, so that my team sees what I'm working on.
+
+**Acceptance criteria**
+- Given an issue in `todo`, when I move it to `in_progress`, it appears in that column for everyone in the workspace.
+- An issue can only enter `in_review` if a reviewer is assigned; otherwise I'm shown why it can't move.
+- A guest can see the board but cannot move issues.
+- If someone else already moved it, I'm told and the board refreshes (no silent overwrite).
+
+**Non-goals (v1):** custom workflows per project; moving several issues at once.
+```
+
+Notice what the criteria already tell you: there's a *state machine* (which transitions are allowed), a *role check* (permissions), and a *concurrency rule* (stale updates). Those are design decisions hiding in a sentence. Writing stories is how you find them while they're still cheap.
+
+Keep a short **scope table** and update it as you learn:
+
+```md
+| In scope (v1)                            | Non-goals (v1)                      |
+|------------------------------------------|-------------------------------------|
+| Workspaces, invites (mock email), roles  | Real email delivery, SSO            |
+| Issues with a defined lifecycle          | Custom fields, custom workflows     |
+| Board + filtered list view               | Calendar and Gantt views            |
+| Comments with @mentions                  | Rich-text WYSIWYG editor            |
+```
+
+## 98.3 Modeling the domain in types
+
+Now the first real design work, and I want you to do it *before any UI*. Model the nouns, their states, and the transitions between states, so that illegal states can't be written. You've seen every tool here: branded IDs ([Chapter 78](/chapter/78)), discriminated unions ([Chapter 13](/chapter/13)), and state machines ([Chapter 55](/chapter/55)).
+
+Start with identities, so a `WorkspaceId` can never be passed where an `IssueId` is expected:
+
+```ts
+declare const brand: unique symbol;
+type Brand<T, B extends string> = T & { readonly [brand]: B };
+
+export type WorkspaceId = Brand<string, "WorkspaceId">;
+export type ProjectId = Brand<string, "ProjectId">;
+export type IssueId = Brand<string, "IssueId">;
+export type UserId = Brand<string, "UserId">;
+
+export type Role = "owner" | "admin" | "member" | "guest";
+```
+
+Then the issue, where each state carries only the data valid for it. The story said `in_review` requires a reviewer, so we encode that rather than leaving `reviewerId?: UserId` optional everywhere:
+
+```ts
+interface IssueBase {
+  id: IssueId;
+  projectId: ProjectId;
+  title: string;
+  createdBy: UserId;
+  createdAt: string; // ISO timestamp
+}
+
+export type Issue =
+  | (IssueBase & { status: "backlog" })
+  | (IssueBase & { status: "todo"; assigneeId: UserId | null })
+  | (IssueBase & { status: "in_progress"; assigneeId: UserId })
+  | (IssueBase & { status: "in_review"; assigneeId: UserId; reviewerId: UserId })
+  | (IssueBase & { status: "done"; completedAt: string })
+  | (IssueBase & { status: "cancelled"; reason: string });
+
+export type IssueStatus = Issue["status"];
+```
+
+An issue "in progress" with no assignee is now a compile error, not a bug report. A summary check for your own model: could someone build the product from these types alone? If you can't read a rule off the types, it's living in somebody's head.
+
+Next, the **transitions**. A table of allowed moves is data you can test, render in the UI, and share between API and web, and a pure function applies it:
+
+```ts
+const allowed = {
+  backlog: ["todo", "cancelled"],
+  todo: ["in_progress", "backlog", "cancelled"],
+  in_progress: ["in_review", "todo", "cancelled"],
+  in_review: ["done", "in_progress", "cancelled"],
+  done: [],
+  cancelled: ["backlog"],
+} as const satisfies Record<IssueStatus, readonly IssueStatus[]>;
+
+export type TransitionError =
+  | { kind: "not_allowed"; from: IssueStatus; to: IssueStatus }
+  | { kind: "missing_reviewer" }
+  | { kind: "missing_assignee" };
+
+export type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+export function canTransition(from: IssueStatus, to: IssueStatus): boolean {
+  return (allowed[from] as readonly IssueStatus[]).includes(to);
+}
+
+export function moveToReview(issue: Issue, reviewerId: UserId | undefined): Result<Issue, TransitionError> {
+  if (!canTransition(issue.status, "in_review")) {
+    return { ok: false, error: { kind: "not_allowed", from: issue.status, to: "in_review" } };
+  }
+  if (issue.status !== "in_progress") return { ok: false, error: { kind: "not_allowed", from: issue.status, to: "in_review" } };
+  if (!reviewerId) return { ok: false, error: { kind: "missing_reviewer" } };
+  return { ok: true, value: { ...issue, status: "in_review", reviewerId } };
+}
+```
+
+> 💡 **Tip.** Review the types against your stories line by line. Every acceptance criterion should map to a type, a function, or a test. Any criterion that maps to nothing is a gap in the model.
+
+## 98.4 Designing the API contract
+
+The web app and the API will talk across a network, which is exactly where types stop being true. The fix is [Chapter 94](/chapter/94)'s idea: one **contract package** holding the schemas, with TypeScript types *inferred* from them, so the validator and the type cannot disagree. Write the contract before any implementation. It forces you to decide what the API actually does.
+
+```ts
+// packages/contracts/src/issues.ts
+import { z } from "zod";
+
+export const IssueStatusSchema = z.enum(["backlog", "todo", "in_progress", "in_review", "done", "cancelled"]);
+
+export const IssueDto = z.object({
+  id: z.string().min(1),
+  projectId: z.string().min(1),
+  title: z.string().min(1).max(200),
+  status: IssueStatusSchema,
+  assigneeId: z.string().nullable(),
+  reviewerId: z.string().nullable(),
+  version: z.number().int().nonnegative(), // optimistic concurrency token
+  createdAt: z.iso.datetime(),
+});
+export type IssueDto = z.infer<typeof IssueDto>;
+
+export const MoveIssueRequest = z.object({
+  to: IssueStatusSchema,
+  reviewerId: z.string().optional(),
+  expectedVersion: z.number().int().nonnegative(),
+});
+export type MoveIssueRequest = z.infer<typeof MoveIssueRequest>;
+```
+
+Define the **error contract** here too, because every endpoint will return it and every client will switch on it:
+
+```ts
+export const ApiError = z.discriminatedUnion("code", [
+  z.object({ code: z.literal("validation_failed"), fieldErrors: z.record(z.string(), z.array(z.string())) }),
+  z.object({ code: z.literal("not_found") }),
+  z.object({ code: z.literal("forbidden"), permission: z.string() }),
+  z.object({ code: z.literal("conflict"), currentVersion: z.number() }),
+  z.object({ code: z.literal("transition_not_allowed"), from: IssueStatusSchema, to: IssueStatusSchema }),
+]);
+export type ApiError = z.infer<typeof ApiError>;
+```
+
+Notice two design decisions that came from the stories: the `version` field (a stale move produces `conflict`, not a silent overwrite) and the typed `transition_not_allowed`. Also notice that the **DTO is flatter than the domain type**. The wire format is a stable, simple shape. The API maps the domain model to it, and the web app maps it back, validating on the way in ([Chapter 61](/chapter/61)).
+
+> ⚠️ **Common mistake.** Making the contract a copy of your database tables. Contracts describe what clients need, not how you store it.
+
+## 98.5 Architecture and package boundaries
+
+You have domain types and a contract. Now decide where code lives, and, more importantly, **which direction dependencies may point**. This is [Chapter 90](/chapter/90) and [Chapter 94](/chapter/94) applied.
+
+```text
+teamboard/
+├── apps/
+│   ├── web/             # React SPA, feature folders
+│   └── api/             # Node API: http → services → repositories
+├── packages/
+│   ├── domain/          # pure logic: ids, state machines, permissions (no I/O, no React)
+│   ├── contracts/       # schemas, DTOs, error contract (depends on nothing internal)
+│   ├── ui/              # component library
+│   ├── tokens/          # design tokens
+│   └── config/          # tsconfig, eslint, prettier
+├── e2e/                 # Playwright
+└── docs/adr/            # decisions
+```
+
+Write the dependency rules as sentences first, then as lint rules:
+
+```md
+## Dependency rules (enforced by dependency-cruiser in CI)
+1. `apps/*` may depend on `packages/*`. Packages never depend on apps.
+2. `apps/web` never imports `apps/api`, and vice versa. They meet only in `contracts`.
+3. `packages/domain` and `packages/contracts` import no React, no Node APIs, and no other internal package except each other (domain may use contract-free ids).
+4. Inside `apps/api`: `http` calls `services`; `services` call `repositories` and `domain`; nothing calls upward.
+5. Inside `apps/web`: `features/*` do not import each other; shared code goes to `shared/`.
+```
+
+Two questions to answer in your design doc: *Where does the state machine live?* (In `domain`, so the API enforces it and the UI uses the same table to disable invalid moves.) *What would I extract if a second app appeared?* (The answer shows whether your boundaries are in the right places.)
+
+## 98.6 Planning state, data, and errors
+
+Before building screens, answer three planning questions on paper.
+
+**The state map.** For every piece of state, who owns it and where does it live? ([Chapter 60](/chapter/60).) Most state in a Teamboard-like app is *server state* (issues, comments), cached by a query library; the rest is small and local.
+
+```md
+| State                    | Kind          | Home                         | Why                                   |
+|--------------------------|---------------|------------------------------|---------------------------------------|
+| Issues, projects, members| server state  | TanStack Query cache         | Shared, async, can go stale           |
+| Board filters, sort      | URL state     | Search params (validated)    | Shareable, survives refresh           |
+| Open dialog, drag preview| local UI state| Component `useState`         | Nobody else cares                     |
+| Session / current user   | server state  | Query + context for the id   | Source of truth is the server         |
+| Draft comment text       | local UI state| Component, optionally storage| Unsent drafts are per-viewer          |
+```
+
+**The error contract.** You wrote the wire shape in 98.4. Now decide what the *user sees* for each code: `validation_failed` highlights fields, `conflict` offers "reload", `forbidden` hides the control in the first place and explains if reached anyway, and network failure offers retry. A table of `code → UI treatment` stops error handling from being improvised screen by screen ([Chapter 33](/chapter/33)).
+
+**The UI-states inventory.** For every screen, list the states it can be in. This is the cheapest way to avoid the "happy path only" rubric score:
+
+```ts
+// The board screen's states, written as a type before writing the component
+type BoardView =
+  | { kind: "loading" }
+  | { kind: "empty"; canCreate: boolean }                   // new project, no issues
+  | { kind: "error"; error: ApiError; retry: () => void }
+  | { kind: "ready"; columns: Record<IssueStatus, IssueDto[]>; stale: boolean }  // stale: a refetch is in flight
+  | { kind: "offline"; columns: Record<IssueStatus, IssueDto[]> };               // cached data, read-only
+```
+
+If you can't say what the user sees in `empty` or `offline`, you've found a design question to resolve now.
+
+## 98.7 Quality strategy
+
+Quality isn't a phase at the end; it's a plan you make now, with numbers, so that "done" isn't a feeling. Write down five things.
+
+**Test plan.** Which layers get which tests? Pure domain logic gets exhaustive unit tests (the state-machine table is a gift: test every pair). Each feature gets integration tests against the real handlers with a test database. Four **critical paths** get end-to-end tests, such as sign in, create an issue, move it through review, and comment with a mention.
+
+**Accessibility targets.** WCAG 2.2 AA, keyboard-complete board (every drag has a keyboard equivalent), visible focus, announced status changes ([Chapter 73](/chapter/73)).
+
+**Performance budgets.** Concrete numbers: initial JavaScript under 200 KB gzipped, interaction latency under 100 ms for moving a card, type-check under 45 seconds ([Chapter 95](/chapter/95)).
+
+**Security checklist.** Authorization enforced in the API for every endpoint, tenant isolation tested, input validated at each boundary, sanitized markdown, httpOnly sessions, CSP, rate limits on auth ([Chapter 74](/chapter/74)).
+
+```yaml
+# docs/quality-plan.yaml: reviewable, diffable, enforced where possible
+budgets:
+  js_initial_kb_gzip: 200
+  interaction_ms_p95: 100
+  typecheck_seconds: 45
+coverage:
+  domain: 90
+tests:
+  e2e_critical_paths:
+    - sign-in
+    - create-issue
+    - move-issue-through-review
+    - comment-with-mention
+security:
+  - tenant isolation test for every repository method
+  - markdown sanitized; CSP enabled; sessions httpOnly + sameSite=lax
+```
+
+> 🚫 **When not to.** Don't write a 40-page quality document. One page of numbers you will actually enforce in CI beats a binder of intentions.
+
+## 98.8 Milestones and scope control
+
+The riskiest way to build is layer by layer: "first the whole database, then the whole API, then the UI". You discover integration problems at the end, when they're expensive. Instead, build a **walking skeleton**, the thinnest possible end-to-end slice, deployed from day one, then grow it by thin vertical slices ([Chapter 99](/chapter/99)).
+
+```md
+| Milestone | Outcome                                             | Cut-line if late              |
+|-----------|-----------------------------------------------------|-------------------------------|
+| M1        | Walking skeleton: CI, deploy, one validated request | Never cut                     |
+| M2        | Auth and workspaces                                 | Invites become link-only      |
+| M3        | Projects and issues (API + list view)               | Never cut                     |
+| M4        | Board and state machine                             | Keyboard-only move, no drag   |
+| M5        | Comments, activity, real-time                       | Drop real-time; poll instead  |
+| M6        | Dashboards                                          | Cut to one chart              |
+| M7        | Hardening: security, a11y, performance              | Never cut                     |
+| M8        | Docs, review, presentation                          | Shorten, never skip           |
+```
+
+Scope control means **cutting scope without cutting quality**. When time runs short, you cut *features* (the table's cut-lines), never the tests, the validation, or the accessibility of what remains. A smaller product that's correct beats a larger one that isn't. Write the cut-lines down now, while you're calm.
+
+## Common mistakes
+
+> ⚠️ **Starting with the UI.** A beautiful board on top of loose objects hides the rules you'll need later. Types and contracts first.
+
+> ⚠️ **Boolean-and-optional modeling.** `isReviewing: boolean` and `reviewerId?: string` allow states the product forbids. Use a union where each state carries its own data.
+
+> ⚠️ **A contract that mirrors the database.** Then every schema migration is a breaking API change.
+
+> ⚠️ **No non-goals.** Without them, scope grows silently, and "just one more feature" eats the milestone that matters.
+
+> ⚠️ **Planning in the abstract forever.** Plan to the level where the first slice is clear, then build the skeleton. Plans improve once something runs.
+
+```ts
+// ❌ Compiles, means nothing: any combination of fields is "an issue"
+interface LooseIssue {
+  status: string;
+  isReviewing?: boolean;
+  reviewerId?: string;
+  assigneeId?: string;
+}
+```
+
+## When to use it, and when not to
+
+> ✅ **Use it when** the system has several parts, several people, or a lifetime beyond a few weeks. A one-hour design pass on types, contracts, and boundaries pays back repeatedly.
+
+> 🚫 **When not to.** Don't design a throwaway prototype to production standards. Do the lightest version of this chapter: stories and domain types on one page. Do the full version only for what you will keep.
+
+## How it connects
+
+> 🔗 **Connection.** Every step has a home in the book: modeling ([Chapter 55](/chapter/55), [Chapter 78](/chapter/78), [Chapter 90](/chapter/90)), contracts ([Chapter 32](/chapter/32), [Chapter 64](/chapter/64), [Chapter 94](/chapter/94)), state ([Chapter 60](/chapter/60)), quality ([Chapter 66](/chapter/66), [Chapter 73](/chapter/73), [Chapter 74](/chapter/74)). The ADRs you'll write come from [Chapter 97](/chapter/97).
+
+> 🌍 **Real world.** Companies call the output of this phase a design doc or RFC. A good one is short enough to read in 20 minutes and specific enough that someone else could start building from it.
+
+## Exercises
+
+### Level 1 — Recall
+
+Turn Dana's brief into ten user stories, each with at least three acceptance criteria and at least one explicit non-goal across the set. Mark which stories hide a permission rule, a state-machine rule, or a concurrency rule.
+
+### Level 2 — Application
+
+Write the domain types and state machines for your track: branded IDs, the entity unions, and the transition table. Then review them against your stories: for each acceptance criterion, point to the type or function that enforces it, and list the criteria that nothing enforces yet.
+
+### Level 3 — Challenge
+
+Write the `contracts` package (schemas plus inferred types plus the error contract) *before* any implementation, and write a test that rejects five malformed payloads. *Hint: if you can't decide what a field means, that's a story you haven't written.*
+
+### Level 4 — Real-world
+
+**Ticket CAP-1: Produce the capstone design document.** One document, in `docs/design.md`, containing:
+
+- The domain model, contract summary, architecture diagram, and dependency rules.
+- The state map, error-to-UI table, and UI-states inventory for the three most important screens.
+- A quality plan with budgets, and milestones M1–M8 with cut-lines.
+- Three ADRs for your riskiest decisions (for example: REST versus RPC, real-time transport, optimistic concurrency), each with alternatives considered.
+
+Acceptance: a developer who has not met you can answer "what would I build first, and how will I know it's done?" from the document alone.
+
+## Key takeaways
+
+- Design inside-out: domain types, then contracts, then architecture, then UI. Types are the cheapest place to find a bad design.
+- Turn a vague brief into stories with acceptance criteria, and write **non-goals** to protect scope.
+- Model states as unions where each state carries its own data, and keep the transition table as testable data.
+- The contract package is the single source of truth: schemas first, inferred types, and a typed error contract.
+- Write dependency rules as sentences, then enforce them with tools.
+- Plan state ownership, error treatment, and UI states before building screens.
+- Put numbers on quality, and cut features, never quality, when time runs short.
+
+## What comes next
+
+You have a design. Now ship it, in thin vertical slices, starting with a walking skeleton that is deployed on day one. That's [Chapter 99: Building, Shipping & Reviewing Your Capstone](/chapter/99).

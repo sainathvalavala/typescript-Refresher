@@ -1,0 +1,522 @@
+> 📖 **The problem.** In [Chapter 57](/chapter/57) you built a small generic `Table<T>` for TaskFlow. It was a success, so the requests started. First sorting, then per-column filters, then row selection with a bulk-actions bar, then custom cells: a colored badge for status, a red date when a task is overdue, an avatar for the assignee. The `columns` prop now has to describe a cell renderer, and nobody can work out what type that renderer's `value` argument should be. Someone writes `cell: (value: any) => ReactNode` with a `// TODO: type this properly` comment. Six months later the TODO is still there, the table is used on eleven screens, and `value.toLocaleDateString()` crashes on the first task without a due date.
+
+This chapter is about generic components at **library scale**: components that many screens use, with many rows types, built from several hooks, wrapped in refs and `memo`. At that scale, the type parameter has to survive a much longer journey than it did in Chapter 57, and every place it gets lost becomes a quiet `any`. By the end, you'll be able to type column definitions so each cell receives exactly the value its column reads, split table behavior into generic hooks, pass refs through generic components, keep generics alive through wrappers, and support both controlled and uncontrolled state. Just as important, you'll be able to tell when a generic component is the wrong tool.
+
+> 🧠 **Mental model.** Column definitions are a **typed contract** between the row type and the cells. Each column's accessor (a key such as `"dueDate"` or a function such as `(task) => task.assignee?.name`) fixes the value type, and that column's cell renderer receives exactly that type. Get the contract right, and sorting, filtering, and rendering all inherit the safety for free.
+
+## 84.1 Generic components, revisited
+
+Start with what you already know. A generic component is a generic function that returns UI. The `rows` you pass decide the type parameter, and every callback receives that type back. Nobody writes angle brackets at the call site:
+
+```tsx
+type TableProps<Row> = {
+  rows: readonly Row[];
+  getRowId: (row: Row) => string;
+  renderRow: (row: Row) => ReactNode;
+};
+
+function Table<Row>({ rows, getRowId, renderRow }: TableProps<Row>) {
+  return (
+    <table>
+      <tbody>
+        {rows.map((row) => (
+          <tr key={getRowId(row)}>{renderRow(row)}</tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+<Table rows={tasks} getRowId={(t) => t.id} renderRow={(t) => <td>{t.title}</td>} />;
+//                              ^ t: Task, inferred from rows
+```
+
+That pattern still holds. What changes at library scale is the **distance** the type parameter must travel. In a real data table, `Row` has to reach inside nested structures (an array of columns, where each column has a *different* value type), flow through the hooks the component is built from, survive wrappers such as refs, `memo`, and higher-order components, and work whether the parent owns the state or the table does. Each of these has a known solution and a known failure mode. The failure mode is almost always the same: somewhere along the way, `Row` or the value type gets replaced with `any` or `unknown`, and from that point on the compiler stops helping.
+
+Here is what the "temporary" version looks like, using TaskFlow's `Task` type:
+
+```tsx
+type Task = {
+  id: string;
+  title: string;
+  status: "todo" | "doing" | "done";
+  priority: 1 | 2 | 3;
+  dueDate: Date | null;
+  assignee: User | null;
+};
+
+type Column = {
+  key: string;
+  header: string;
+  cell?: (value: any) => ReactNode; // TODO: type this properly
+};
+
+const columns: Column[] = [
+  { key: "titel", header: "Title" },                                        // typo: compiles
+  { key: "dueDate", header: "Due", cell: (d) => d.toLocaleDateString() },   // compiles, crashes on null
+];
+```
+
+Two bugs, zero errors. The rest of this chapter replaces that `any` with a contract.
+
+> 💡 **Tip.** In a `.tsx` file, `function DataTable<Row>(…)` just works. If you prefer arrow functions, write `const DataTable = <Row,>(props: …) => …`. The trailing comma tells the parser that `<Row,>` is a type parameter list, not a JSX tag.
+
+## 84.2 Typed column definitions
+
+The core difficulty is that **one `Column` type can't say "the value type depends on the key"**. A column that reads `"title"` should hand its cell a `string`; one that reads `"dueDate"` should hand it a `Date | null`. So we start with a column type that is parameterized by its key:
+
+```tsx
+type KeyColumn<Row, K extends keyof Row> = {
+  accessorKey: K;
+  header: string;
+  cell?: (value: Row[K], row: Row) => ReactNode;
+};
+
+type DueColumn = KeyColumn<Task, "dueDate">;
+// cell?: (value: Date | null, row: Task) => ReactNode
+```
+
+That's correct for one column, but an array holds many columns, each with its own `K`. The fix is the mapped-type trick from [Chapter 22](/chapter/22): build an object type with one property per key, each holding the column type for that key, then index it with `[keyof Row]` to collect all those property types into a **union**:
+
+```tsx
+type ColumnDef<Row> = {
+  [K in keyof Row]-?: KeyColumn<Row, K>;
+}[keyof Row];
+
+// ColumnDef<Task> expands to:
+//   | KeyColumn<Task, "id">
+//   | KeyColumn<Task, "title">
+//   | KeyColumn<Task, "status">
+//   | KeyColumn<Task, "priority">
+//   | KeyColumn<Task, "dueDate">
+//   | KeyColumn<Task, "assignee">
+```
+
+The `-?` removes optionality from the mapped properties, so an optional field in `Row` doesn't sneak `undefined` into the union. Now `accessorKey` acts as a discriminant: when TypeScript checks each object literal in the array, it looks at the literal key you wrote, picks the matching member, and types `cell` from it.
+
+```tsx
+const taskColumns: ColumnDef<Task>[] = [
+  { accessorKey: "title", header: "Title" },
+  {
+    accessorKey: "status",
+    header: "Status",
+    cell: (status) => <StatusBadge status={status} />, // ✅ status: "todo" | "doing" | "done"
+  },
+  {
+    accessorKey: "dueDate",
+    header: "Due",
+    cell: (due) => due.toLocaleDateString(), // ❌ 'due' is possibly 'null'.
+  },
+  { accessorKey: "titel", header: "Oops" },
+  // ❌ Type '"titel"' is not assignable to type '"assignee" | "dueDate" | "id" | "priority" | "status" | "title"'. Did you mean '"title"'?
+];
+```
+
+Both bugs from 84.1 are now compile errors. Inside the table, rendering a cell stays generic and short:
+
+```tsx
+function renderCell<Row>(column: ColumnDef<Row>, row: Row): ReactNode {
+  const value = row[column.accessorKey];
+  return column.cell ? column.cell(value, row) : String(value);
+}
+```
+
+**Accessor functions** handle columns that aren't a single field: "Assignee" shows `task.assignee?.name`, and "Overdue" is computed from the due date. Here the value type comes from the function's *return* type. The catch is that a type annotation on an array can't say "some value type, different for each element", so there's nowhere for TypeScript to infer it. The solution libraries use is a **function call per column**, because function calls are where inference happens:
+
+```tsx
+type Column<Row> = { id: string; header: string; render: (row: Row) => ReactNode };
+
+function columnsFor<Row>() {
+  return {
+    accessor<Value>(
+      id: string,
+      getValue: (row: Row) => Value,
+      options: { header: string; cell?: (value: Value, row: Row) => ReactNode },
+    ): Column<Row> {
+      return {
+        id,
+        header: options.header,
+        render: (row) => {
+          const value = getValue(row);
+          return options.cell ? options.cell(value, row) : String(value);
+        },
+      };
+    },
+  };
+}
+```
+
+`columnsFor<Task>()` fixes `Row` once (an explicit type argument, because there's nothing to infer it from yet, as in [Chapter 16](/chapter/16)). Each `accessor` call then infers `Value` from `getValue` and checks `cell` against it:
+
+```tsx
+const col = columnsFor<Task>();
+
+const extraColumns: Column<Task>[] = [
+  col.accessor("assignee", (t) => t.assignee?.name ?? "Unassigned", {
+    header: "Assignee",
+    cell: (name) => <strong>{name}</strong>, // name: string
+  }),
+  col.accessor("overdue", (t) => t.dueDate !== null && t.dueDate < new Date(), {
+    header: "Overdue",
+    cell: (late) => (late ? "⚠️" : ""), // late: boolean
+  }),
+];
+```
+
+Notice the design decision hidden in the return type: `Column<Row>` has *forgotten* `Value`. That's deliberate. The value type has already done its job (checking `cell`), and the table only needs "render this row". **Erase a type parameter only after you've used it to check something.**
+
+> 🌍 **Real world.** TanStack Table's `createColumnHelper<Row>()` follows the same two-step shape: fix the row type once, then let each `helper.accessor(…)` call infer its own value type.
+
+## 84.3 Generic hooks for tables
+
+With typed columns, the component file is now mostly behavior: sort state, filter state, selection, paging. That behavior is reusable on its own, so it moves into hooks. Each hook should be generic **only if the row type flows through it**, which is the golden rule from [Chapter 16](/chapter/16) applied to hooks.
+
+`useSort` takes rows and gives rows back, so `Row` connects input to output:
+
+```tsx
+type SortState<Row> = { key: keyof Row; direction: "asc" | "desc" } | null;
+
+function compareValues(a: unknown, b: unknown): number {
+  if (a instanceof Date && b instanceof Date) return a.getTime() - b.getTime();
+  if (typeof a === "number" && typeof b === "number") return a - b;
+  return String(a).localeCompare(String(b));
+}
+
+function useSort<Row>(rows: readonly Row[], initial: SortState<Row> = null) {
+  const [sort, setSort] = useState(initial);
+  const sorted = useMemo(() => {
+    if (!sort) return rows;
+    const factor = sort.direction === "asc" ? 1 : -1;
+    return [...rows].sort((a, b) => factor * compareValues(a[sort.key], b[sort.key]));
+  }, [rows, sort]);
+
+  function toggle(key: keyof Row) {
+    setSort((current) =>
+      current?.key === key && current.direction === "asc"
+        ? { key, direction: "desc" }
+        : { key, direction: "asc" },
+    );
+  }
+  return { rows: sorted, sort, toggle };
+}
+```
+
+`useFilter` has the same shape (rows in, rows out), with the matching rule supplied by the caller as a predicate that receives the caller's own row type:
+
+```tsx
+function useFilter<Row>(rows: readonly Row[], matches: (row: Row, query: string) => boolean) {
+  const [query, setQuery] = useState("");
+  const filtered = useMemo(
+    () => (query ? rows.filter((row) => matches(row, query)) : rows),
+    [rows, query, matches],
+  );
+  return { rows: filtered, query, setQuery };
+}
+```
+
+`useSelection` needs the row type to know how to get an id, and a second type parameter keeps string and number ids distinct. It stores **ids, not row objects**: after a refetch, every row is a new object, but its id is the same. `usePagination`, by contrast, only needs a count. No type flows through it, so it isn't generic at all:
+
+```tsx
+function useSelection<Row, Id extends PropertyKey>(getId: (row: Row) => Id) {
+  const [selectedIds, setSelectedIds] = useState<ReadonlySet<Id>>(() => new Set());
+  const isSelected = (row: Row) => selectedIds.has(getId(row));
+  const toggle = (row: Row) =>
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      const id = getId(row);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  return { selectedIds, isSelected, toggle };
+}
+
+function usePagination(totalItems: number, pageSize = 20) {
+  const [page, setPage] = useState(0);
+  const pageCount = Math.max(1, Math.ceil(totalItems / pageSize));
+  const start = page * pageSize;
+  return {
+    page, pageCount, start, end: start + pageSize,
+    next: () => setPage((p) => Math.min(p + 1, pageCount - 1)),
+    prev: () => setPage((p) => Math.max(p - 1, 0)),
+  };
+}
+```
+
+Composed in a screen, the hooks read like a pipeline, and none of the calls need type arguments:
+
+```tsx
+const matchesTitle = (task: Task, query: string) =>
+  task.title.toLowerCase().includes(query.toLowerCase());
+
+function TaskTable({ tasks }: { tasks: readonly Task[] }) {
+  const filter = useFilter(tasks, matchesTitle);
+  const sorting = useSort(filter.rows, { key: "dueDate", direction: "asc" });
+  const selection = useSelection((task: Task) => task.id); // Id: string
+  const pages = usePagination(sorting.rows.length, 25);
+  const visible = sorting.rows.slice(pages.start, pages.end); // visible: readonly Task[]
+
+  sorting.toggle("prioirty"); // ❌ Argument of type '"prioirty"' is not assignable to parameter of type 'keyof Task'.
+  // …render visible rows with taskColumns
+}
+```
+
+> ⚠️ **Common mistake.** `useFilter(tasks, (t, q) => …)` with an inline function creates a new predicate every render, so a `useMemo` that depends on it recomputes every render. Define predicates outside the component (like `matchesTitle`) or wrap them in `useCallback`.
+
+Notice one weakness: `sorting.toggle("assignee")` compiles, even though sorting by an object compares `"[object Object]"` strings. `keyof Row` is too loose. Level 2 of the exercises asks you to tighten it.
+
+## 84.4 Generic components with refs
+
+TaskFlow wants "scroll to the task I just created". That needs a ref into the table. Before React 19, function components received refs only through `forwardRef`, and `forwardRef` **erased generics**: its return type is a fixed object type whose props are computed once, so `Row` became `unknown`.
+
+> 🕰 **Legacy note.** You'll still see this in older code. `forwardRef(function OldTable<Row>(props: OldTableProps<Row>, ref: Ref<HTMLTableElement>) { … })` has the type `ForwardRefExoticComponent<OldTableProps<unknown> & RefAttributes<HTMLTableElement>>`. The usual workaround was a cast back to a generic function type.
+
+In React 19, `ref` is an ordinary prop for function components. Put it in your props type, and the component stays an ordinary generic function. A table usually exposes a small **imperative handle** rather than the raw DOM node, and that handle is naturally generic in `Row`:
+
+```tsx
+type DataTableHandle<Row> = {
+  scrollToRow: (row: Row) => void;
+  getVisibleRows: () => readonly Row[];
+};
+
+type DataTableProps<Row> = {
+  rows: readonly Row[];
+  getRowId: (row: Row) => string;
+  renderRow: (row: Row) => ReactNode;
+  ref?: Ref<DataTableHandle<Row>>;
+};
+
+function DataTable<Row>({ rows, getRowId, renderRow, ref }: DataTableProps<Row>) {
+  const bodyRef = useRef<HTMLTableSectionElement>(null);
+
+  useImperativeHandle(ref, () => ({
+    scrollToRow(row) {
+      const selector = `[data-row-id="${CSS.escape(getRowId(row))}"]`;
+      bodyRef.current?.querySelector(selector)?.scrollIntoView({ block: "nearest" });
+    },
+    getVisibleRows: () => rows,
+  }), [rows, getRowId]);
+
+  return (
+    <table>
+      <tbody ref={bodyRef}>
+        {rows.map((row) => (
+          <tr key={getRowId(row)} data-row-id={getRowId(row)}>{renderRow(row)}</tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+```
+
+The `ref` takes part in inference just like any other prop, so a mismatched handle is caught:
+
+```tsx
+const tableRef = useRef<DataTableHandle<Task>>(null);
+<DataTable rows={tasks} getRowId={(t) => t.id} renderRow={(t) => <td>{t.title}</td>} ref={tableRef} />; // ✅
+tableRef.current?.scrollToRow(newTask); // ✅ expects a Task
+
+const numberRef = useRef<DataTableHandle<number>>(null);
+<DataTable rows={tasks} getRowId={(t) => t.id} renderRow={(t) => <td>{t.title}</td>} ref={numberRef} />;
+// ❌ Type 'Task[]' is not assignable to type 'readonly number[]'.
+```
+
+> 🔗 **Connection.** [Chapter 53](/chapter/53) covered `useImperativeHandle` and ref-as-prop for non-generic components. The only new idea here is that the handle's type can mention `Row`.
+
+## 84.5 Generics and wrappers
+
+Wrapping a generic component is where generics most often disappear silently. The classic case is `memo`:
+
+```tsx
+const MemoDataTable = memo(DataTable);
+
+<MemoDataTable rows={tasks} getRowId={(t) => t.id} renderRow={(t) => t.title} />;
+// ❌ 't' is of type 'unknown'.
+```
+
+`memo` doesn't return a function; it returns an object type (`MemoExoticComponent`) whose props are *computed* from your component's props. Computing the props of a generic function forces TypeScript to pick one `Row`, and it picks `unknown`. Since `memo` never changes the props, the honest, widely used fix is to cast the result back to the original type:
+
+```tsx
+const MemoDataTable = memo(DataTable) as typeof DataTable;
+
+<MemoDataTable rows={tasks} getRowId={(t) => t.id} renderRow={(t) => t.title} />; // ✅ t: Task
+```
+
+Your own **higher-order components** (functions that take a component and return a component) have the same problem if you type them with `ComponentType<P>`. But TypeScript has a feature called *higher-order function type inference*: when a generic function takes a plain function type and returns a plain function type, TypeScript can carry the argument's type parameters through to the result. So type HOCs with plain function types:
+
+```tsx
+// Loses the generic: ComponentType<P> is not a plain function type
+function withBorder<P extends object>(Component: ComponentType<P>) { /* … */ }
+
+// Keeps the generic: plain function types in and out
+function withLoading<P extends object>(Component: (props: P) => ReactNode) {
+  return function WithLoading(props: P & { loading: boolean }): ReactNode {
+    const { loading, ...rest } = props;
+    return loading ? <Spinner /> : <Component {...(rest as P)} />;
+  };
+}
+
+const LoadingTable = withLoading(DataTable);
+// LoadingTable: <Row>(props: DataTableProps<Row> & { loading: boolean }) => ReactNode
+```
+
+The `rest as P` cast is an honest limit: TypeScript can't prove that "`P` plus `loading`, minus `loading`" is `P` when `P` is generic. Often the simplest option is no wrapper at all: a small generic component that renders the other one keeps everything inferred, with no casts.
+
+```tsx
+function LoadingDataTable<Row>({ loading, ...props }: DataTableProps<Row> & { loading: boolean }) {
+  return loading ? <Spinner /> : <DataTable {...props} />;
+}
+```
+
+> 🆕 **Modern note.** With the React Compiler enabled, you'll rarely need `memo` on a table at all, since the compiler memoizes for you. The wrapper problem still matters for HOCs and for codebases that don't use the compiler.
+
+## 84.6 Controlled and uncontrolled generic components
+
+A component is **controlled** when its parent owns a piece of state and passes it down with a change callback (`selected` plus `onSelectedChange`). It's **uncontrolled** when the component owns the state itself and the parent only provides a starting value (`defaultSelected`). Library components should support both: a simple screen wants "just work" selection, while a screen with a bulk-actions toolbar needs to know which rows are selected.
+
+The prop types should allow either configuration but never a mix. The `?: never` markers here forbid the other configuration's props. [Chapter 85](/chapter/85) covers that technique in depth.
+
+```tsx
+type SelectionProps<Row> =
+  | { selected: readonly Row[]; onSelectedChange: (rows: readonly Row[]) => void; defaultSelected?: never }
+  | { selected?: never; defaultSelected?: readonly Row[]; onSelectedChange?: (rows: readonly Row[]) => void };
+
+type SelectableListProps<Row> = SelectionProps<Row> & {
+  rows: readonly Row[];
+  getRowId: (row: Row) => string;
+  renderRow: (row: Row) => ReactNode;
+};
+```
+
+The implementation logic is the same every time, so it lives in a generic hook. If a `value` is provided, the component is controlled; otherwise it uses internal state:
+
+```tsx
+function useControllableState<T>(options: {
+  value: T | undefined;
+  defaultValue: T;
+  onChange?: (next: T) => void;
+}) {
+  const { value, defaultValue, onChange } = options;
+  const [internal, setInternal] = useState(defaultValue);
+  const isControlled = value !== undefined;
+  const current = isControlled ? value : internal;
+
+  const setValue = useCallback((next: T) => {
+    if (!isControlled) setInternal(() => next);
+    onChange?.(next);
+  }, [isControlled, onChange]);
+
+  return [current, setValue] as const;
+}
+```
+
+Inside the component, `T` is inferred as `readonly Row[]` and the call sites are checked against the union:
+
+```tsx
+function SelectableList<Row>(props: SelectableListProps<Row>) {
+  const [selected, setSelected] = useControllableState({
+    value: props.selected,
+    defaultValue: props.defaultSelected ?? [],
+    onChange: props.onSelectedChange,
+  });
+  // …toggle rows with setSelected(…)
+}
+
+<SelectableList rows={tasks} getRowId={(t) => t.id} renderRow={(t) => t.title} />;                        // ✅ uncontrolled
+<SelectableList rows={tasks} getRowId={(t) => t.id} renderRow={(t) => t.title} selected={picked} onSelectedChange={setPicked} />; // ✅ controlled
+<SelectableList rows={tasks} getRowId={(t) => t.id} renderRow={(t) => t.title} selected={picked} />;
+// ❌ Type '{ …; selected: readonly Task[]; }' is not assignable to type 'IntrinsicAttributes & SelectableListProps<Task>'.
+```
+
+The last call would have produced a list whose clicks do nothing, since the parent never updates `selected`. The type makes that impossible.
+
+> ⚠️ **Common mistake.** Switching a component between controlled and uncontrolled during its lifetime (passing `selected={undefined}` sometimes). Decide once per usage. React's own `input` warns about exactly this.
+
+## 84.7 ✅ Useful / 🚫 Unnecessary
+
+Everything in this chapter costs something: type parameters that readers must trace, mapped types in error messages, helper functions with explicit type arguments, casts around wrappers. That cost is worth paying when many callers with many row types share the component. It isn't worth paying for a component with one caller.
+
+> ✅ **When is this useful?** A table, select, list, or picker used by **several screens with different row types** (tasks, projects, users), where callbacks must hand back the caller's own type. Library and design-system components. Behavior hooks (`useSort`, `useSelection`) that more than one component composes. Anywhere a column or option definition would otherwise be typed with `any`.
+
+> 🚫 **When is this unnecessary complexity?** A component used in **one place** with **one type**. A "generic" whose type parameter is always `Task`. A hook that doesn't pass a type through (like `usePagination`). Typed column machinery for a three-column table that never changes. In these cases, a concrete `TaskTable` is shorter, easier to read, and produces better error messages.
+
+The tell is a generic used exactly once, often with explicit type arguments because it was designed in advance:
+
+```tsx
+// 🚫 Designed for "future reuse", used once
+<ItemGrid<Project, "name"> items={archivedProjects} titleKey="name" getKey={(p) => p.id} columns={3} />
+
+// ✅ What the one caller actually needs
+function ArchivedProjectsGrid({ projects }: { projects: readonly Project[] }) {
+  return (
+    <ul className="grid grid-cols-3">
+      {projects.map((p) => <li key={p.id}>{p.name}</li>)}
+    </ul>
+  );
+}
+```
+
+Extract the generic version when the **second** real caller with a different type appears, not before.
+
+## Common mistakes
+
+> ⚠️ **The "temporary" `any` in column definitions.** `cell: (value: any) => ReactNode` turns every column into an unchecked assertion. Use the mapped-union `ColumnDef<Row>` for keys and a helper call for accessor functions.
+
+> ⚠️ **Wrapping a generic component in `memo` or a `ComponentType` HOC without noticing.** The result silently becomes `Row = unknown`. Cast `memo(Component) as typeof Component`, type HOCs with plain function types, or write a small generic wrapper component.
+
+> ⚠️ **Writing type arguments at every call site.** `<DataTable<Task> rows={tasks} … />` is redundant. Let `rows` decide `Row`. If inference fails, that's a signal your props don't mention `Row` where they should.
+
+> ⚠️ **Making every hook generic.** `usePagination<T>` with a `T` that appears once connects nothing. Generic hooks are for hooks that receive and return the caller's type.
+
+> ⚠️ **Storing selected rows as objects.** Selection keyed by object identity breaks on every refetch. Store ids, and look rows up when you need them.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** a component or hook is shared across **different row types** and its callbacks must return the caller's type: P19's data table, a generic `Select`, a typed `useSelection`. Typed column definitions pay off as soon as a table has custom cells.
+
+> 🚫 **When not to.** One caller, one type: write the concrete component. A hook with no type flowing through it: drop the type parameter. A wrapper that only exists to add a prop: prefer a small component over a HOC. Generalize on the second real use, not the first imagined one.
+
+## How it connects
+
+> 🔗 **Connection.** This chapter builds on generic components ([Chapter 57](/chapter/57)), mapped types that collect into unions ([Chapter 22](/chapter/22)), the golden rule of type parameters ([Chapter 16](/chapter/16)), ref-as-prop and `useImperativeHandle` ([Chapter 53](/chapter/53)), and `memo` ([Chapter 47](/chapter/47)). The `?: never` trick in the selection props is the subject of [Chapter 85](/chapter/85). The hooks in 84.3 are a *headless core*, an idea [Chapter 88](/chapter/88) names and develops. Everything here comes together in [P19](/projects/p19), the Generic Data Table.
+
+> 🌍 **Real world.** TanStack Table is the reference design for this chapter: a headless, generic core (`useReactTable<Row>`), column helpers that infer value types per column, and controlled or uncontrolled state for sorting, filtering, and selection. Libraries such as MUI and AG Grid expose similar column-definition contracts.
+
+## Exercises
+
+### Level 1 — Recall
+
+Given TaskFlow's `Project` type (`id: string`, `name: string`, `ownerId: string`, `archived: boolean`, `createdAt: Date`), write `KeyColumn<Row, K>` and `ColumnDef<Row>` from memory. Then write a `ColumnDef<Project>[]` with three valid columns, including one whose `cell` uses a `Date` method, and two invalid columns marked with `// @ts-expect-error`: a misspelled `accessorKey`, and a `cell` that treats `archived` as a string.
+
+### Level 2 — Application
+
+`useSort` currently accepts any `keyof Row`, so `toggle("assignee")` compiles and sorts by `"[object Object]"`. Write a `SortableKey<Row>` type that keeps only keys whose values are `string`, `number`, or `Date` (allowing `null`), and use it in `useSort` and `SortState`. Verify that `toggle("dueDate")` and `toggle("priority")` compile and `toggle("assignee")` fails. Then make a column's sort button appear only for columns whose `accessorKey` is sortable.
+
+### Level 3 — Challenge
+
+Make one `columns` array mix key columns and accessor-function columns, with correctly typed cell values for both, and make the table able to sort by either kind. Extend `columnsFor<Row>()` with a `key(accessorKey, options)` method next to `accessor(id, getValue, options)`. Both should return the same erased column type, which must carry everything the table needs (a renderer, and a sort value when the value is sortable). Prove with `// @ts-expect-error` lines that a mistyped `cell` fails for both kinds.
+
+*Hint: erase the value type only after you've used it. The returned column should already know how to render a row and how to produce its sort value.*
+
+### Level 4 — Real-world
+
+**Ticket TF-311: Remove `Anything<T>`.** Two years ago someone wrote a generic `Anything<T, K extends keyof T>` component with nine props (`items`, `titleKey`, `getKey`, `renderBadge`, `layout`, …) "so we can reuse it everywhere". It is used in exactly one place: the Archived Projects page. Inline it.
+
+- The Archived Projects page renders identically, and its existing tests pass unchanged.
+- No type parameters remain in the replacement component, and no props remain that the page doesn't use.
+- The PR description lists what the generic version would have been needed for, and explains why none of those requirements exists today.
+- The diff removes more lines than it adds.
+
+## Key takeaways
+
+- At library scale, a type parameter must survive nested structures, hooks, refs, and wrappers. Every place it's lost becomes a silent `any` or `unknown`.
+- **Typed column definitions** use a mapped type that collects into a union, so each `accessorKey` fixes the type its `cell` receives.
+- Accessor functions need a **function call per column** to give inference a place to work. Erase the value type only after it has checked the cell.
+- Make hooks generic only when the row type **flows through** them; `usePagination` doesn't need a type parameter.
+- In React 19, `ref` is a prop, so generic components keep their generics. `memo` and `ComponentType` HOCs still erase them unless you cast or use plain function types.
+- Support controlled and uncontrolled state with a union of configurations and a small `useControllableState` hook.
+- A generic used once, with one type, is a cost with no benefit. Inline it.
+
+## What comes next
+
+The selection props in 84.6 hinted at a bigger idea: some props only make sense *together*, and some must never appear together. A `Button` that accepts `href`, `onClick`, and `type="submit"` all at once has the same disease. [Chapter 85: Discriminated & Conditional Props](/chapter/85) shows how to make a props type a **union of valid configurations**, so impossible combinations don't compile.

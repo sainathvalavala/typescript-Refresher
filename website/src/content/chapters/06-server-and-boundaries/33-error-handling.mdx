@@ -1,0 +1,465 @@
+> 📖 **The problem.** You open the production log. Thousands of lines, all the same: `Error: Something went wrong`. A customer reported that their task "disappeared", and the response they got was `500 Internal Server Error`. You dig for an hour and discover it was a plain "task not found": the client asked for an id that had been deleted. That's a `404`, a normal event, and it was logged and paged as an outage. Meanwhile, a genuine database failure appeared in the same log with exactly the same text.
+
+Errors are part of your program's design, not an afterthought. A well-designed API has **names** for the ways it can fail, tells the caller which failures are their fault and which are yours, and keeps enough detail in the logs to find the cause. This chapter builds that: a clear split between failures you expect and failures you don't, a typed error hierarchy, `Result` types for the cases where they help, exhaustive translation to HTTP, and one public error contract that a frontend can rely on.
+
+> 🧠 **Mental model.** *Errors are part of your API.* **Expected** failures (not found, invalid input, conflict) are **data**: named, typed, and handled. **Unexpected** failures (bugs, outages) are **exceptions**: caught once at the top, logged with full detail, and reported generically. Each layer translates errors into the language of the layer above.
+
+## 33.1 Expected vs unexpected failures
+
+Every failure falls into one of two families, and almost every design decision in this chapter follows from which one you're in.
+
+An **expected failure** is something that can happen during correct operation of a correct program. A user asks for a task that doesn't exist. A client sends an empty title. Someone moves a task from `todo` straight to `done`, which your rules forbid. Your code is working; the *request* can't be satisfied. These deserve names, and callers should be able to react to each.
+
+An **unexpected failure** means something is broken: a null pointer from a bug, the database is unreachable, the disk is full, a dependency threw. The caller can't fix these, and neither can the function that hit them. The right response is to stop, record everything, and tell the client only "something went wrong on our side".
+
+```ts
+// Expected: part of the function's contract. The caller should handle each.
+getTask("t_404");         // task doesn't exist          → 404
+createTask({ title: "" }); // input invalid               → 400
+transition(task, "done");  // todo → done not allowed     → 409
+
+// Unexpected: not part of the contract. Nobody up the stack can do much.
+repo.save(task);          // ECONNREFUSED: database down → 500, page someone
+tasks.map((t) => t.owner.name); // TypeError: owner is undefined → a bug, fix the code
+```
+
+A quick test: *"If I wrote a unit test for this, would the failing case be a normal scenario?"* If yes, it's expected, and it should be visible in the function's signature or documentation.
+
+> ⚠️ **Common mistake.** Treating every failure as an exception. A `500` for "task not found" teaches clients to retry, floods your alerts, and hides real incidents among noise.
+
+## 33.2 Exceptions in TypeScript
+
+JavaScript lets you `throw` anything: a string, a number, an object, `undefined`. And a function's signature says nothing about what it throws. TypeScript has no checked exceptions, so this is not tracked:
+
+```ts
+function getTask(id: string): Task {
+  throw new Error("not found"); // the return type says Task. It does not say "or throws"
+}
+
+throw "oops";          // ✅ legal JavaScript, and legal TypeScript
+throw { code: 42 };    // ✅ also legal
+```
+
+So what type does the `catch` variable have? Since anything can be thrown, honesty demands `unknown`. With `useUnknownInCatchVariables` (on in `strict`), that's what you get:
+
+```ts
+try {
+  await service.getTask(id);
+} catch (e) {          // e: unknown
+  e.message;           // ❌ 'e' is of type 'unknown'.
+}
+```
+
+You must **narrow** before using it ([Chapter 14](/chapter/14)). `instanceof` is the workhorse:
+
+```ts
+try {
+  await service.getTask(id);
+} catch (e: unknown) {
+  if (e instanceof Error) {
+    console.error(e.message, e.stack); // e: Error
+  } else {
+    console.error("Non-Error thrown:", e); // somebody threw a string. It happens.
+  }
+}
+```
+
+A small helper keeps the narrowing in one place, so the rest of your code never has to guess:
+
+```ts
+export function toError(value: unknown): Error {
+  if (value instanceof Error) return value;
+  return new Error(typeof value === "string" ? value : JSON.stringify(value));
+}
+```
+
+> ⚠️ **Common mistake.** Writing `catch (e: any)` or `(e as Error).message`. The first turns off checking, and the second claims something unverified. This is the same lie as in [Chapter 32](/chapter/32), at a different boundary.
+
+## 33.3 Custom error hierarchies
+
+A plain `Error` carries only a message, so callers are tempted to inspect that string (`if (e.message.includes("not found"))`), which breaks the day someone rewords it. Instead, define a **class per kind of failure**, with a stable machine-readable `code` and the data that explains the failure.
+
+```ts
+export abstract class AppError extends Error {
+  abstract readonly code: string;
+
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);          // options carries `cause`
+    this.name = new.target.name;      // "TaskNotFoundError" in logs and stack traces
+  }
+}
+
+export class TaskNotFoundError extends AppError {
+  readonly code = "TASK_NOT_FOUND";
+  constructor(readonly taskId: string) {
+    super(`Task ${taskId} not found`);
+  }
+}
+
+export class InvalidTransitionError extends AppError {
+  readonly code = "INVALID_TRANSITION";
+  constructor(readonly from: string, readonly to: string) {
+    super(`Cannot move a task from ${from} to ${to}`);
+  }
+}
+```
+
+Each subclass narrows `code` to a **literal type**, which makes the union of all domain errors a discriminated union ([Chapter 13](/chapter/13)). That's what will make the HTTP translation exhaustive in a moment.
+
+```ts
+export class ProjectFullError extends AppError {
+  readonly code = "PROJECT_FULL";
+  constructor(readonly projectId: string, readonly limit: number) {
+    super(`Project ${projectId} already has ${limit} open tasks`);
+  }
+}
+
+export type DomainError = TaskNotFoundError | InvalidTransitionError | ProjectFullError;
+// DomainError["code"] is "TASK_NOT_FOUND" | "INVALID_TRANSITION" | "PROJECT_FULL"
+```
+
+**`cause`** is the other half. When you catch a low-level error and throw a higher-level one, keep the original attached, so the log shows both stories:
+
+```ts
+export class StorageError extends AppError {
+  readonly code = "STORAGE_FAILURE";
+}
+
+async function save(task: Task) {
+  try {
+    await db.run(/* … */);
+  } catch (e: unknown) {
+    throw new StorageError(`Could not save task ${task.id}`, { cause: e }); // ✅ original preserved
+  }
+}
+// err.cause: unknown. Narrow before use, like any caught value.
+```
+
+> 🕰 **Legacy note.** Targeting ES5 breaks `instanceof` for subclasses of `Error`, and old codebases call `Object.setPrototypeOf(this, new.target.prototype)` to patch it. On the ES2022 target from [Chapter 26](/chapter/26), it just works.
+
+## 33.4 Result types
+
+Exceptions have one big weakness: they're **invisible** in signatures. `transition(task, "done"): Task` doesn't tell a caller that it can fail with an `InvalidTransitionError`, so nothing stops them forgetting. The `Result<T, E>` type you built in [Chapter 18](/chapter/18) moves expected failure into the return type:
+
+```ts
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+const ok = <T>(value: T): Result<T, never> => ({ ok: true, value });
+const err = <E>(error: E): Result<never, E> => ({ ok: false, error });
+
+function transition(task: Task, to: TaskStatus): Result<Task, InvalidTransitionError> {
+  if (!allowed[task.status].includes(to)) return err(new InvalidTransitionError(task.status, to));
+  return ok({ ...task, status: to });
+}
+```
+
+Now the compiler won't let the caller touch `value` without handling the failure:
+
+```ts
+const result = transition(task, "done");
+result.value;              // ❌ Property 'value' does not exist on type 'Result<Task, InvalidTransitionError>'.
+                           //    Property 'value' does not exist on type '{ ok: false; error: InvalidTransitionError; }'.
+if (!result.ok) {
+  return showError(result.error.from, result.error.to); // error: InvalidTransitionError
+}
+result.value; // ✅ Task
+```
+
+So when should you reach for `Result` rather than `throw`? A useful rule:
+
+| Use `Result` when | Use exceptions when |
+|---|---|
+| The failure is expected and the **immediate caller** can decide what to do | The failure is a bug or an outage nobody nearby can fix |
+| You want the compiler to enforce handling | The failure should unwind many layers to one top-level handler |
+| The error carries information for the user (validation, parsing) | You are at an I/O edge where libraries already throw |
+
+Compare the call sites for a service method that can fail in two expected ways:
+
+```ts
+// Exceptions: the failures are invisible. Both `try` and `catch` are on you.
+try {
+  const task = await service.transition(id, "done");
+  reply(task);
+} catch (e: unknown) {
+  if (e instanceof TaskNotFoundError) return notFound();
+  if (e instanceof InvalidTransitionError) return conflict();
+  throw e; // everything else
+}
+
+// Result: the failures are in the type, and the unexpected ones still throw.
+const result = await service.transition(id, "done"); // Result<Task, TaskNotFoundError | InvalidTransitionError>
+if (!result.ok) return result.error instanceof TaskNotFoundError ? notFound() : conflict();
+reply(result.value);
+```
+
+> 🚫 **When not to.** Don't use `Result` for genuinely exceptional cases like "database unreachable". Wrapping those makes every function return `Result`, and callers just pass the error up by hand. That's exceptions with extra steps.
+
+## 33.5 Translating errors between layers
+
+Each layer of the Chapter 31 architecture speaks its own language, and an error should be **translated** as it crosses each seam, so no layer leaks another's vocabulary. The repository knows about SQL, the service knows about business rules, the route knows about HTTP.
+
+```text
+ repository          service                 route / middleware
+ ───────────         ───────────────         ──────────────────────
+ SQLITE_CONSTRAINT → ProjectFullError      → 409 + code "PROJECT_FULL"
+ row not found     → TaskNotFoundError     → 404 + code "TASK_NOT_FOUND"
+ ECONNREFUSED      → StorageError(cause)   → 500 + generic message (details only in logs)
+```
+
+The repository converts driver errors into domain terms (keeping the original as `cause`), and the service never mentions status codes:
+
+```ts
+// repository: SQL language → storage language
+async findById(id: string): Promise<Task | undefined> {
+  try {
+    return rowToTask(this.db.prepare("SELECT * FROM tasks WHERE id = ?").get(id));
+  } catch (e: unknown) {
+    throw new StorageError(`Could not read task ${id}`, { cause: e });
+  }
+}
+
+// service: storage language → business language
+async getTask(id: string): Promise<Task> {
+  const task = await this.repo.findById(id);
+  if (!task) throw new TaskNotFoundError(id); // replaces `throw new Error("not found")` from Chapter 31
+  return task;
+}
+```
+
+The last translation, domain → HTTP, belongs in **one place**, and it should be **exhaustive**: add a new `DomainError` and the compiler must refuse to build until you've decided its status code.
+
+```ts
+function assertNever(value: never): never {
+  throw new Error(`Unhandled case: ${JSON.stringify(value)}`);
+}
+
+function statusFor(error: DomainError): number {
+  switch (error.code) {
+    case "TASK_NOT_FOUND":     return 404;
+    case "INVALID_TRANSITION": return 409;
+    case "PROJECT_FULL":       return 409;
+    default:                   return assertNever(error); // ✅ compiles only if every code is handled
+  }
+}
+```
+
+Add `class DuplicateTitleError` to the `DomainError` union, forget the case, and the build fails:
+
+```ts
+// ❌ Argument of type 'DuplicateTitleError' is not assignable to parameter of type 'never'.
+```
+
+> 🔗 **Connection.** This is the `never` exhaustiveness check from [Chapter 14](/chapter/14), now guarding a production behavior instead of a toy example.
+
+## 33.6 Async error handling
+
+Async code has failure modes sync code doesn't. A rejected promise that nobody awaits or catches becomes an **unhandled rejection**, and in modern Node that **terminates the process**. A forgotten `await` is the classic cause:
+
+```ts
+async function archiveProject(id: string) {
+  tasks.forEach(async (t) => {        // ❌ forEach ignores the returned promises: errors vanish into the void
+    await repo.save({ ...t, archived: true });
+  });
+}
+
+async function archiveProjectFixed(id: string) {
+  await Promise.all(tasks.map((t) => repo.save({ ...t, archived: true }))); // ✅ rejection propagates to the caller
+}
+```
+
+`Promise.all` rejects on the **first** failure and drops the rest. When you want every outcome, use `Promise.allSettled`, which never rejects and gives you a discriminated union per item:
+
+```ts
+const results = await Promise.allSettled(ids.map((id) => service.getTask(id)));
+// results: PromiseSettledResult<Task>[]
+
+for (const r of results) {
+  if (r.status === "fulfilled") console.log(r.value.title); // r.value: Task
+  else console.warn("failed:", r.reason);                    // r.reason: any (so narrow it)
+}
+```
+
+In Express 5, errors thrown in `async` handlers reach **error-handling middleware** automatically. That middleware is the single place unexpected failures end up, identified by its four parameters:
+
+```ts
+import type { ErrorRequestHandler } from "express";
+
+function isDomainError(e: unknown): e is DomainError {
+  return e instanceof TaskNotFoundError || e instanceof InvalidTransitionError || e instanceof ProjectFullError;
+}
+
+export const errorMiddleware: ErrorRequestHandler = (err: unknown, _req, res, _next) => {
+  if (isDomainError(err)) {
+    res.status(statusFor(err)).json({ code: err.code, message: err.message }); // expected: tell the client
+    return;
+  }
+  logger.error({ err }, "unhandled error");                                      // unexpected: full detail to the log
+  res.status(500).json({ code: "INTERNAL", message: "Something went wrong" });   // never to the client
+};
+```
+
+As a last line of defense, register process-level handlers that log and exit, so a bug can't leave the server in an unknown state:
+
+```ts
+process.on("unhandledRejection", (reason: unknown) => {
+  console.error("Unhandled rejection", reason);
+  process.exit(1); // let the process manager restart a clean process
+});
+```
+
+## 33.7 Logging errors usefully
+
+The log is where unexpected failures live, so each entry must answer: *what happened, to whom, and where?* Free-text lines (`"Error saving task"`) can't be searched. **Structured logs** are JSON objects with a stable message and the context as fields, so a tool can filter by `taskId` or `requestId`.
+
+```ts
+// ❌ Unsearchable, no context, loses the stack and the cause
+console.log("Error: " + e);
+
+// ✅ Stable message, context as fields, the whole error object
+logger.error(
+  { err: e, taskId, userId, requestId },
+  "failed to save task",
+);
+// {"level":"error","msg":"failed to save task","taskId":"t_42","userId":"u_7","requestId":"r_9f2",
+//  "err":{"type":"StorageError","message":"Could not save task t_42","stack":"…","cause":{"type":"Error","message":"SQLITE_BUSY"}}}
+```
+
+Three habits matter more than the choice of library (Pino is the usual one on Node):
+
+1. **Log once, at the top.** If every layer catches, logs, and rethrows, one failure produces five lines. Let the error propagate and log it in the error middleware, with `cause` chains intact.
+2. **Keep secrets out.** Never log passwords, tokens, full request bodies, or `Authorization` headers. Use your logger's redaction feature for known sensitive paths.
+3. **Add a correlation id.** Generate a `requestId` per request, put it in every log line, and return it to the client so support can say "send me the request id".
+
+```ts
+const logger = pino({
+  level: config.LOG_LEVEL, // validated in Chapter 32
+  redact: ["req.headers.authorization", "*.password", "*.token"],
+});
+```
+
+> ⚠️ **Common mistake.** Swallowing errors: `catch (e) {}` or `catch (e) { return null }`. The failure still happened, and now nobody will ever know. At minimum, log it. Better, handle it deliberately.
+
+## 33.8 Designing error responses
+
+Your public error responses are an **API** just like your success responses, and a frontend will write code against them ([Chapter 61](/chapter/61)). If every endpoint invents its own shape (`{ error: "..." }` here, `{ message: "..." }` there, plain text elsewhere), clients end up with a mess of special cases. Define **one contract**.
+
+TaskFlow's contract has four fields. `code` is stable and machine-readable (clients branch on it), `message` is for humans (never branch on it), `details` carries structured extras, and `requestId` links to the logs.
+
+```ts
+export type ApiErrorCode =
+  | "VALIDATION_FAILED"
+  | "TASK_NOT_FOUND"
+  | "INVALID_TRANSITION"
+  | "PROJECT_FULL"
+  | "INTERNAL";
+
+export interface ApiError {
+  code: ApiErrorCode;
+  message: string;
+  details?: Record<string, string[]>; // field → problems, used by VALIDATION_FAILED
+  requestId: string;
+}
+```
+
+Status codes are derived from the code in exactly one table, typed so a missing entry won't compile:
+
+```ts
+const STATUS: Record<ApiErrorCode, number> = {
+  VALIDATION_FAILED: 400,
+  TASK_NOT_FOUND: 404,
+  INVALID_TRANSITION: 409,
+  PROJECT_FULL: 409,
+  INTERNAL: 500,
+};
+```
+
+The `Record<ApiErrorCode, number>` annotation is the exhaustiveness check: add `"DUPLICATE_TITLE"` to the union and this object errors until you add it. And now Chapter 32's validation failure fits into the same funnel. Define the error once, throw it from the parse step, and let the middleware translate:
+
+```ts
+export class ValidationError extends AppError {
+  readonly code = "VALIDATION_FAILED";
+  constructor(readonly fieldErrors: Record<string, string[]>) {
+    super("Request validation failed");
+  }
+}
+
+function parseBody<S extends z.ZodType>(schema: S, body: unknown): z.output<S> {
+  const r = schema.safeParse(body);
+  if (!r.success) throw new ValidationError(z.flattenError(r.error).fieldErrors as Record<string, string[]>);
+  return r.data;
+}
+```
+
+On the other side of the wire, the client can use the contract as a discriminated union, with the `code` as the tag, and handle each case with full type support. That is the subject of [Chapter 61](/chapter/61).
+
+```ts
+// frontend
+if (!response.ok) {
+  const error: ApiError = await response.json(); // 🌍 validate this too, per Chapter 32
+  if (error.code === "VALIDATION_FAILED") showFieldErrors(error.details ?? {});
+  else if (error.code === "TASK_NOT_FOUND") showToast("That task no longer exists");
+  else showToast(`Something went wrong. Reference: ${error.requestId}`);
+}
+```
+
+## Common mistakes
+
+> ⚠️ **Swallowing errors.** An empty `catch` block turns a visible failure into silent data loss. Handle it, or let it propagate.
+
+> ⚠️ **String-matching error messages.** `if (e.message.includes("not found"))` breaks the first time someone edits the text. Branch on `instanceof` or a `code`.
+
+> ⚠️ **Exposing stack traces to clients.** A response with `stack` or SQL text hands an attacker a map of your system. Log it, return a generic message and a `requestId`.
+
+> ⚠️ **`Result` for genuinely exceptional cases.** Use `Result` for failures the caller can act on. Outages and bugs should throw.
+
+> ⚠️ **Log-and-rethrow at every layer.** One failure, five identical log lines. Log once, where the error is finally handled.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** your system has callers that behave differently by failure type (an API with status codes, a UI with different messages), when you operate it in production and need to tell bugs from business outcomes, or when a frontend consumes your errors.
+
+> 🚫 **When not to.** A one-off script can `throw new Error("…")` and crash, and that's a fine error strategy. A five-class hierarchy for an app with two failure modes is ceremony. Start with a plain `Error` plus `cause`, and introduce a named error the first time two call sites need to react differently.
+
+## How it connects
+
+> 🔗 **Connection.** The `Result<T, E>` type is from [Chapter 18](/chapter/18), the narrowing and `never` exhaustiveness from [Chapter 14](/chapter/14), and `unknown` in `catch` from [Chapter 9](/chapter/9). Validation errors from [Chapter 32](/chapter/32) now flow through this system, replacing the plain `Error`s thrown by the Chapter 31 service. In React, an **error boundary** ([Chapter 71](/chapter/71)) is the UI's version of the top-level error middleware, and [Chapter 61](/chapter/61) consumes the contract you just defined. [P07](/projects/p07) and [P08](/projects/p08) both use it.
+
+## Exercises
+
+### Level 1 — Recall
+
+Classify each failure as **expected** or **unexpected**, and give the HTTP status you would return: (1) a user opens a deleted task, (2) the database connection pool is exhausted, (3) a `title` of 300 characters, (4) `undefined is not a function` inside the mapper, (5) moving `done` back to `todo` when rules forbid it, (6) the payment API times out, (7) a duplicate project name, (8) a malformed JSON body, (9) the disk is full, (10) the user lacks permission.
+
+### Level 2 — Application
+
+Implement the error middleware for the TaskFlow API so that it maps every `DomainError` to an HTTP response **exhaustively**. Prove exhaustiveness: add a fourth error class, observe the compile error, then fix it. Unknown errors must produce a generic `500` and log the full error.
+
+### Level 3 — Challenge
+
+Convert one service (`TaskService.transition`) from exceptions to `Result<Task, TaskNotFoundError | InvalidTransitionError>`. Update the route that calls it. Write both versions of the call site side by side, and list what each version makes easier and harder.
+
+*Hint: decide which failures stay exceptions (storage) and which become part of the `Result` type.*
+
+### Level 4 — Real-world
+
+**Ticket TF-318: One error contract for the whole API.** The web team is tired of three different error shapes.
+
+- Define `ApiError` with `code`, `message`, `details`, and `requestId`, and export it from the contract module so the client can import the type.
+- Every error response (validation, domain, unexpected) uses it, with the status code taken from a single exhaustive table.
+- Unexpected errors never reveal messages, stack traces, or SQL to the client, but the log contains the full `cause` chain and the `requestId`.
+- Tests assert the response for: invalid body, missing task, illegal transition, and a simulated storage failure.
+
+## Key takeaways
+
+- **Expected** failures are data, named and handled. **Unexpected** failures are exceptions, caught once at the top and logged.
+- `throw` is untyped, so `catch` variables are `unknown`: narrow with `instanceof` before use.
+- A custom error hierarchy gives each failure a **class**, a stable **code**, relevant fields, and a `cause` to preserve the original story.
+- `Result<T, E>` makes expected failures visible in signatures. Use it for failures the immediate caller can act on, not for outages.
+- Translate errors at each seam, and map domain errors to HTTP in one place, with an **exhaustive** switch or `Record`.
+- Log once, structured, with a request id and no secrets. Never return stack traces.
+- One public **error contract** makes the frontend simple, and the type for it can be shared.
+
+## What comes next
+
+That completes Part VI: you can build a layered, validated, well-failing TypeScript server. Now the book turns toward the browser. Before you meet React, you'll write a to-do app with **no framework at all**, using the DOM's own types, and keep a log of every bug you hit. [Chapter 34: The Bridge](/chapter/34) shows how much of React you already know, and [Chapter 35](/chapter/35) gives you the pain that makes React make sense.
+
+

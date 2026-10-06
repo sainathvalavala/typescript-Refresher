@@ -1,0 +1,323 @@
+> 📖 **The problem.** Each TaskFlow row now has a small input for a quick note. You start typing "call Sam about…" into the second task, "Pay invoice", then realize it's already paid and click its delete button instead. The row vanishes and "Book flights" slides up into second place, with your half-typed note *sitting in its input*. You never typed anything there. Nothing in your code moves notes between tasks. Yet the note has jumped onto a different task, and the note you'd started on "Book flights" earlier has disappeared.
+
+This chapter is about rendering *collections* and *conditions*, the two things every real screen does, and about the hidden question underneath both: **when the list changes, how does React know which old row is which new row?** The bug above comes from answering that question wrongly. The fix is one attribute.
+
+By the end, you'll be able to choose the right conditional pattern for each situation, render filtered and sorted lists, choose correct keys (and explain why the wrong ones corrupt state), use a key to reset a component on purpose, and design for "nothing to show".
+
+> 🧠 **Mental model.** **A key is an item's identity across renders.** When React compares the new description with the old one, it matches children by their position and their key, never by their content. Whatever state and DOM belonged to the old match stay with the new one.
+
+## 40.1 Conditional rendering patterns
+
+Conditional rendering is just JavaScript choosing which description to return. There's no special directive like `v-if`; you use the tools you already have from [Chapter 14](/chapter/14). Four patterns cover almost every case, and each fits a different shape of condition.
+
+**Early return** when the whole component depends on the condition. It reads like a guard clause, and TypeScript narrows everything after it:
+
+```tsx
+type TaskDetailsProps = { task: Task | undefined };
+
+function TaskDetails({ task }: TaskDetailsProps) {
+  if (!task) return <p className="hint">Select a task to see its details.</p>;
+  // task: Task from here on
+  return <h2>{task.title}</h2>;
+}
+```
+
+A **ternary** when you're choosing between **two** alternatives inside some markup, and **`&&`** when it's **something or nothing**:
+
+```tsx
+<li className="task">
+  {task.done ? <s>{task.title}</s> : <strong>{task.title}</strong>}
+  {isOverdue && <Badge label="Overdue" tone="warning" />}
+</li>
+```
+
+A **lookup object** when there are **many** cases keyed by a union value. Instead of a chain of ternaries, map each value to its result, and TypeScript makes sure you didn't forget one:
+
+```tsx
+type Filter = "all" | "active" | "done";
+
+const emptyMessages = {
+  all: "No tasks yet. Add your first one above.",
+  active: "Nothing left to do. Nice work!",
+  done: "Nothing completed yet.",
+};
+
+type EmptyTasksProps = { filter: Filter };
+
+function EmptyTasks({ filter }: EmptyTasksProps) {
+  return <p className="empty">{emptyMessages[filter]}</p>;
+}
+```
+
+When the logic doesn't fit any of these neatly, fall back to plain statements: declare `let content`, assign it in an `if`/`else`, and render `{content}`. Clear beats clever.
+
+## 40.2 The `&&` pitfall
+
+`&&` doesn't return `true` or `false`. It returns its **left operand** if that's falsy, otherwise its right operand. That's fine when the left side is a boolean, because `false` renders nothing. It goes wrong when the left side is a **number**, because `0` is falsy *and* renders as text ([Chapter 38](/chapter/38)):
+
+```tsx
+function TaskSection({ tasks }: TaskListProps) {
+  return (
+    <section>
+      {tasks.length && <TaskList tasks={tasks} />}     {/* empty list: renders "0" */}
+      {tasks.length > 0 && <TaskList tasks={tasks} />} {/* empty list: renders nothing */}
+    </section>
+  );
+}
+```
+
+TypeScript can't warn you, because `0` is a perfectly valid thing to render. The same trap catches other falsy non-booleans. `NaN` renders as "NaN". An empty string renders nothing visible in the browser, but crashes in React Native, which requires all text inside a `Text` component. The rule that avoids all of them: **make the left side of `&&` a real boolean.**
+
+```tsx
+{count > 0 && <Badge label={`${count} new`} />}         // ✅ a comparison
+{Boolean(note) && <p className="note">{note}</p>}        // ✅ explicit conversion
+{selectedTask ? <TaskDetails task={selectedTask} /> : null} // ✅ ternary with null
+```
+
+> 💡 **Tip.** The `react/jsx-no-leaked-render` lint rule from `eslint-plugin-react` flags non-boolean conditions on the left of `&&`. It's worth enabling in TaskFlow.
+
+## 40.3 Rendering lists
+
+To render a list, turn an array of data into an array of elements with `map`. React renders arrays by rendering each item in order, so this is all it takes:
+
+```tsx
+function TaskTitles({ tasks }: TaskListProps) {
+  return (
+    <ul>
+      {tasks.map((task) => (
+        <li key={task.id}>{task.title}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+(Ignore `key` for a moment; it's the rest of this chapter.) Real lists are rarely rendered raw. You filter them, sort them, maybe group them. Do that work **before the `return`**, in named variables, and keep the JSX a simple `map` over the result. Remember from [Chapter 37](/chapter/37) that `sort` mutates, so copy first:
+
+```tsx
+type TaskBoardProps = { tasks: Task[]; filter: Filter; onToggle: (id: string) => void };
+
+function TaskBoard({ tasks, filter, onToggle }: TaskBoardProps) {
+  const visible = tasks.filter((t) =>
+    filter === "all" ? true : filter === "done" ? t.done : !t.done,
+  );
+  const sorted = [...visible].sort(
+    (a, b) => Number(a.done) - Number(b.done) || a.title.localeCompare(b.title),
+  );
+
+  return (
+    <ul className="task-board">
+      {sorted.map((task) => (
+        <TaskRow key={task.id} task={task} onToggle={onToggle} />
+      ))}
+    </ul>
+  );
+}
+```
+
+Notice that `visible` and `sorted` are **computed on every render**, not stored. When `tasks` or `filter` changes, they're recalculated automatically. That's "UI = f(state)" applied to lists, and it's the main idea of [Chapter 42](/chapter/42).
+
+> 💡 **Tip.** ES2023 added non-mutating array methods: `tasks.toSorted(compare)`, `toReversed()`, and `with(index, value)`. They need `"ES2023"` (or later) in your tsconfig's `lib`. `[...tasks].sort(compare)` works everywhere.
+
+## 40.4 Keys and identity
+
+Now the opening bug. After every render, React **reconciles**: it compares the new list of children with the previous one and decides, for each new element, which old element it corresponds to. The match decides what happens to everything attached to that element: its DOM node, the text typed in an input, its focus, and any state (from [Chapter 41](/chapter/41)) inside the component. Matched elements keep all of it. Unmatched old elements are destroyed; unmatched new ones are created fresh.
+
+Without keys, React matches **by position**: first with first, second with second. Here's the note-taking row and the buggy list, keyed by array index (which is the same thing as position):
+
+```tsx
+function TaskRow({ task, onDelete }: TaskRowProps) {
+  return (
+    <li>
+      {task.title}
+      <input placeholder="Quick note" />
+      <button onClick={() => onDelete(task.id)}>Delete</button>
+    </li>
+  );
+}
+
+tasks.map((task, index) => <TaskRow key={index} task={task} onDelete={onDelete} />);
+```
+
+Trace what React sees when "Pay invoice" is deleted:
+
+```txt
+Before                        After (index keys)
+key=0  Write docs   [      ]  key=0  Write docs    [      ]   matched key 0: kept
+key=1  Pay invoice  [call S…] key=1  Book flights  [call S…]  matched key 1: kept, new title
+key=2  Book flights [pack… ]                                  key 2 is gone: destroyed
+```
+
+React did exactly what it was told. Position 1 still exists, so it kept the row at position 1, with its input and its half-typed note, and gave it new props. Position 2 disappeared, so it destroyed that row along with the "Book flights" note. Now key each row by the task's **id**, which is its identity:
+
+```tsx
+tasks.map((task) => <TaskRow key={task.id} task={task} onDelete={onDelete} />);
+// Before: t1, t2, t3   After: t1, t3
+// t1 kept · t2 destroyed (with its note) · t3 kept and moved up, with its own note
+```
+
+Keys only need to be **unique among siblings**, not across the whole app. And `key` is not a prop: React consumes it, so `TaskRow` never receives a `key` in its props. If the component needs the id, pass it separately (here, it's already in `task`).
+
+> ⚠️ **Common mistake.** The key goes on the element **in the `map`**, not inside the child component. Putting `key` on the `li` inside `TaskRow` is too late; React looks for it on the elements in the array. Forget it and the console warns: *Each child in a list should have a unique "key" prop.*
+
+## 40.5 Key mistakes
+
+There are three ways to get keys wrong, and each fails in a different way.
+
+**Index keys** tie identity to position. They're harmless when a list is static: never reordered, filtered, or inserted into, and its rows hold no state. A footer of fixed links is fine. A task list, which you add to, delete from, sort, and filter, is not, as 40.4 showed. Sorting with index keys is especially sneaky: every row keeps its state but gets a *different task's* props.
+
+**Random keys** are the opposite failure. A key generated during render is different every render, so React never finds a match and **destroys and recreates every row on every render**:
+
+```tsx
+tasks.map((t) => <TaskRow key={Math.random()} task={t} />);        // ❌ new identity every render
+tasks.map((t) => <TaskRow key={crypto.randomUUID()} task={t} />);  // ❌ same problem
+// Symptoms: inputs lose focus after each keystroke, animations restart, rendering gets slow
+```
+
+**Unstable or non-unique keys** come from data that isn't really an identity. A title can change (which remounts the row when the user edits it) and can repeat (two tasks called "Review PR"):
+
+```tsx
+tasks.map((t) => <TaskRow key={t.title} task={t} />);
+// ⚠️ Encountered two children with the same key, `Review PR`.
+```
+
+The fix is always the same: use an id that belongs to the item and **never changes**. Data from a server usually has one. For items created in the browser, generate the id **once, when the item is created**, in the event handler, not during render:
+
+```tsx
+function handleAdd(title: string) {
+  const task: Task = { id: crypto.randomUUID(), title, done: false }; // ✅ id created once, stored with the task
+  setTasks([...tasks, task]);
+}
+```
+
+## 40.6 Keys as a reset tool
+
+Keys aren't only for lists. You can put a `key` on **any** element, and the rule is the same: same key, same identity, state preserved; different key, different identity, state destroyed and created fresh. That makes a key the cleanest way to say "this is a *different thing* now, start over".
+
+Here's a bug it fixes. TaskFlow has a detail pane with an editor whose draft starts as the selected task's title:
+
+```tsx
+type TaskEditorProps = { task: Task };
+
+function TaskEditor({ task }: TaskEditorProps) {
+  const [draft, setDraft] = useState(task.title); // the draft starts from the task
+  return <input value={draft} onChange={(e) => setDraft(e.target.value)} />;
+}
+
+<TaskEditor task={selectedTask} />;
+// Bug: select "Write docs", type a few characters, then select "Fix bug".
+// The editor still shows the "Write docs" draft: same position, same type, so React kept its state.
+```
+
+From React's point of view, nothing changed identity: a `TaskEditor` at the same place in the tree, with new props. Tell it that a different task means a different editor:
+
+```tsx
+<TaskEditor key={selectedTask.id} task={selectedTask} />;
+// Switching tasks changes the key, so React discards the old editor and mounts a new one,
+// whose draft starts from the newly selected task. ✅
+```
+
+This is a deliberate reset, so it has a cost: the whole subtree under `TaskEditor` is recreated, DOM included. That's exactly right for "a form for a different record" (`key={userId}` on a profile form is the textbook case), and wrong as a general-purpose "refresh" button. [Chapter 42](/chapter/42) gives the full rule for when state is preserved or reset, and [Chapter 44](/chapter/44) shows why this beats resetting state in an effect.
+
+## 40.7 Empty states
+
+Every list has a state you didn't design if you didn't think about it: **nothing to show**. A blank rectangle tells the user nothing. Is the app broken? Still loading? Did a filter hide everything? Good apps treat "empty" as a first-class screen, and the right time to design it is when you write the list, not after a bug report.
+
+There are usually several *kinds* of empty, and they deserve different messages and different next actions:
+
+- **Empty for real:** no tasks exist yet. Explain what the list is for and offer the first action.
+- **Empty because of a filter:** tasks exist, but none match. Say so, and offer to clear the filter.
+- **Empty because of a search:** echo the query, so a typo is easy to spot.
+
+```tsx
+type TaskListViewProps = { tasks: Task[]; filter: Filter; onClearFilter: () => void };
+
+function TaskListView({ tasks, filter, onClearFilter }: TaskListViewProps) {
+  const visible = tasks.filter((t) =>
+    filter === "all" ? true : filter === "done" ? t.done : !t.done,
+  );
+
+  if (tasks.length === 0) {
+    return <EmptyState title="No tasks yet" body="Add your first task to get started." />;
+  }
+  if (visible.length === 0) {
+    return (
+      <EmptyState title={emptyMessages[filter]} body="Your other tasks are hidden by the filter.">
+        <button onClick={onClearFilter}>Show all tasks</button>
+      </EmptyState>
+    );
+  }
+  return <ul>{visible.map((t) => <TaskRow key={t.id} task={t} />)}</ul>;
+}
+```
+
+The early returns make each case impossible to miss, and the order matters: check "no data at all" before "no matches". Later, loading and error become two more states in the same list ([Chapter 52](/chapter/52) models them as a union).
+
+## Common mistakes
+
+> ⚠️ **Numbers on the left of `&&`.** `{count && ...}` renders `0`. Compare explicitly (`count > 0`) or use a ternary.
+
+> ⚠️ **Index keys on dynamic lists.** Anything that can be added to, removed from, sorted, or filtered needs keys from the data. Index keys make state and DOM follow positions instead of items.
+
+> ⚠️ **Keys generated during render.** `Math.random()` or `crypto.randomUUID()` in the `map` remounts every row on every render. Generate ids when items are created.
+
+> ⚠️ **Sorting or filtering in place.** `tasks.sort()` in a component mutates props. Copy first, or use `toSorted`.
+
+> ⚠️ **Forgetting the empty case.** A list that renders an empty `ul` when there's nothing to show is a bug report waiting to happen.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** choosing a pattern: early return for "the whole component depends on it", ternary for "one of two", `&&` with a boolean for "something or nothing", and a lookup object for "one of many values of a union". Use a `key` reset when a component should start fresh for a different record.
+
+> 🚫 **When not to.** Don't nest ternaries more than one level deep in JSX; pull the decision into a variable or a small component. Don't use index keys "because the list is small"; size has nothing to do with it. And don't reach for a key reset to fix a value that should simply be **computed** from props during render. That's usually the simpler answer, and it's [Chapter 42](/chapter/42)'s subject.
+
+## How it connects
+
+> 🔗 **Connection.** Conditional rendering is narrowing from [Chapter 14](/chapter/14) wearing JSX, and the "what renders" rules from [Chapter 38](/chapter/38) explain the `&&` pitfall. The identity rules you learned here govern *all* state preservation, which [Chapter 42](/chapter/42) generalizes. In Part IX, [Chapter 52](/chapter/52) models loading, error, empty, and ready as a discriminated union, and [Chapter 57](/chapter/57) builds a generic `List` component that takes a `getKey` function.
+
+> 🌍 **Real world.** Virtualized list libraries (TanStack Virtual, react-window) render only the visible rows of a 10,000-item list, which makes stable keys essential: rows are constantly mounted and unmounted as you scroll, and any state keyed by index would land on the wrong item.
+
+## Exercises
+
+### Level 1 — Recall
+
+Choose a key for each data set, or say why it needs one added. Explain any case where an index key would be acceptable:
+
+1. Tasks loaded from the TaskFlow API, each with a database `id`.
+2. The five fixed links in the site footer, which never change.
+3. Tags on a task, stored as an array of unique strings like `["urgent", "frontend"]`.
+4. Search results that are re-fetched and re-ordered on every keystroke, each with a `url`.
+5. Rows the user adds to an "import tasks" form before saving; they have no id yet.
+
+### Level 2 — Application
+
+Give tasks a `status: "todo" | "doing" | "done"` field and render them **grouped by status**, with a heading for each group showing its count ("Doing · 2"). Each group must show its own empty message when it has no tasks, the groups must appear in a fixed order, and the tasks within a group must be sorted by title without mutating the original array.
+
+### Level 3 — Challenge
+
+Reproduce the opening bug: a list of tasks with an uncontrolled note input in each row and a delete button, keyed by index. Write down the exact sequence of actions that makes a note "jump", and explain it in terms of matching. Then make it worse on purpose: add a "Sort A–Z" button and describe what happens to the notes. Finally, fix it with proper keys and confirm both scenarios behave.
+
+*Hint: type a different note in every row before you delete or sort, so you can see where each one goes.*
+
+### Level 4 — Real-world
+
+**Ticket TF-245: Team directory.** TaskFlow needs a page listing team members so users can find someone to assign.
+
+- A search box filters members by name or email, case-insensitively, and the matching part of the name is highlighted (for example, wrapped in a `mark` element), without using `dangerouslySetInnerHTML`.
+- A sort control switches between "Name A–Z" and "Recently active", without mutating the source array.
+- Distinct empty states for "no members yet" and "no members match ‘query’".
+- Every list uses stable keys from the data; no index keys and no keys created during render.
+
+## Key takeaways
+
+- Conditional rendering is plain JavaScript: **early return**, **ternary**, **`&&`**, and **lookup objects**, each for a different shape of condition.
+- `&&` returns its left side when falsy, so **`0` leaks onto the screen**. Keep the left side boolean.
+- Render lists with `map`; **filter and sort before the `return`**, on a copy.
+- A **key is identity**. React matches old and new children by key (or position), and state and DOM follow the match.
+- **Index keys** break dynamic lists; **random keys** remount everything; use stable ids created **once**.
+- Changing a component's key **resets** it, which is the clean way to start over for a different record.
+- Design **empty states** up front, with a different message for each reason the list is empty.
+
+## What comes next
+
+Every list in this chapter has been fed by tasks that, somehow, change: rows get deleted, filters switch, editors hold drafts. We've been using `useState` on faith to make that happen. Why doesn't a plain `let` variable work? Why does `console.log` right after an update print the old value? [Chapter 41: Interactivity, Events & State](/chapter/41) opens the box.

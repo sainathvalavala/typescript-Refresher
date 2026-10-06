@@ -1,0 +1,401 @@
+> 📖 **The problem.** TaskFlow's `Task` has six fields. Over a few months the codebase grows `UpdateTaskInput` (same fields, all optional), `CreateTaskInput` (same fields minus `id`), `TaskPreview` (three fields), and `TaskWithoutId`, each hand-copied. Then someone renames `title` to `name` in `Task`. Three copies update. One doesn't, and a form quietly keeps sending the old field.
+
+Hand-copied types are duplicated facts, and [Chapter 20](/chapter/20) showed what duplicated facts do. This chapter introduces TypeScript's **built-in utility types**: small, named transformations that turn one type into another, so a single `Task` definition feeds every variation. For each utility we'll follow the same four beats: **Problem → Naive solution → Utility type → Why it's better.**
+
+> 🧠 **Mental model.** **Utility types are functions from types to types, shipped with the language.** `Partial<Task>` is "call `Partial` with `Task`, get a new type back." Learn them as tools first; [Chapters 22](/chapter/22) and [23](/chapter/23) open the box and rebuild them.
+
+## 21.1 Partial and Required
+
+**Problem.** A task-update endpoint receives only the fields the user changed: `{ done: true }` or `{ title: "New" }`.
+
+**Naive solution.** Write a second interface with every field optional:
+
+```ts
+interface Task {
+  id: string;
+  title: string;
+  done: boolean;
+  priority: number;
+}
+
+interface UpdateTaskInput { // hand-copied: must be edited whenever Task changes
+  id?: string;
+  title?: string;
+  done?: boolean;
+  priority?: number;
+}
+```
+
+**Utility type.** `Partial<T>` makes every property optional, and its mirror `Required<T>` makes every property mandatory.
+
+```ts
+type UpdateTaskInput = Partial<Task>;
+// { id?: string; title?: string; done?: boolean; priority?: number }
+
+function updateTask(task: Task, changes: Partial<Task>): Task {
+  return { ...task, ...changes };
+}
+
+updateTask(task, { done: true });      // ✅
+updateTask(task, { done: "yes" });     // ❌ Type 'string' is not assignable to type 'boolean | undefined'.
+
+interface Settings { theme?: "light" | "dark"; pageSize?: number }
+type ResolvedSettings = Required<Settings>; // { theme: "light" | "dark"; pageSize: number }
+```
+
+**Why it's better.** Rename or retype a field in `Task` and every derived type follows. `Required` is the natural last step after you fill in defaults: the "raw" options are optional, the "resolved" ones are not.
+
+> ⚠️ **Common mistake.** `Partial<Task>` also makes `id` optional, which is rarely what an update means. Section 21.9 shows how to keep some fields required.
+
+## 21.2 Readonly
+
+**Problem.** A configuration object or a piece of state must never be changed after creation. A stray `config.apiUrl = "…"` three files away causes a bug nobody can trace.
+
+**Naive solution.** Put `readonly` in front of every property by hand, and remember to do it for each new field.
+
+```ts
+interface AppConfig {
+  readonly apiUrl: string;
+  readonly retries: number; // easy to forget on the next field you add
+  timeoutMs: number;
+}
+```
+
+**Utility type.** `Readonly<T>` marks every property read-only. (For arrays, `readonly string[]` or `ReadonlyArray<string>` is the equivalent.)
+
+```ts
+interface MutableConfig { apiUrl: string; retries: number }
+
+const config: Readonly<MutableConfig> = { apiUrl: "/api", retries: 3 };
+config.retries = 5; // ❌ Cannot assign to 'retries' because it is a read-only property.
+
+function render(tasks: readonly Task[]): void {
+  tasks.push(newTask); // ❌ Property 'push' does not exist on type 'readonly Task[]'.
+}
+```
+
+**Why it's better.** One word freezes a whole type, and `readonly` parameters document and enforce "this function won't mutate your array." Be aware that `Readonly` is **shallow** and **compile-time only**: nested objects remain mutable, and nothing stops JavaScript from mutating the object at runtime (use `Object.freeze` for that).
+
+```ts
+const frozen: Readonly<{ tags: string[] }> = { tags: ["a"] };
+frozen.tags.push("b"); // ✅ compiles: only the property `tags` is read-only, not the array inside
+```
+
+## 21.3 Pick and Omit
+
+**Problem.** A list view needs only `id`, `title`, and `done`. A create form needs everything except the server-generated `id`.
+
+**Naive solution.** Copy the wanted fields into a new interface each time.
+
+```ts
+interface TaskPreview { // copy #1
+  id: string;
+  title: string;
+  done: boolean;
+}
+interface CreateTaskInput { // copy #2
+  title: string;
+  done: boolean;
+  priority: number;
+}
+```
+
+**Utility type.** `Pick<T, K>` keeps the listed keys. `Omit<T, K>` drops the listed keys.
+
+```ts
+type TaskPreview = Pick<Task, "id" | "title" | "done">;
+type CreateTaskInput = Omit<Task, "id">;
+// { title: string; done: boolean; priority: number }
+
+const preview: TaskPreview = { id: "t1", title: "Docs", done: false }; // ✅
+const wrong: Pick<Task, "id" | "titel"> = { id: "t1" };
+// ❌ Type '"id" | "titel"' does not satisfy the constraint 'keyof Task'.
+```
+
+**Why it's better.** A rename in `Task` flows into every preview and DTO. Use `Pick` when you want a **few** fields, `Omit` when you want **almost all**.
+
+> ⚠️ **Common mistake.** `Omit` is loose: its key parameter is just `string | number | symbol`, so a typo is **not** an error. `Omit<Task, "idd">` compiles and silently removes nothing, leaving `id` in your type.
+
+```ts
+type Oops = Omit<Task, "idd">; // ✅ compiles, but it is just Task: nothing was omitted
+```
+
+If you want typo protection, either use `Pick` with the fields you want, or define a stricter helper (you'll write one in [Chapter 22](/chapter/22)).
+
+## 21.4 Record
+
+**Problem.** The board groups tasks by status, so you need an object with exactly one array per status.
+
+**Naive solution.** An interface with a property for each status, kept in sync with the `Status` union by hand, or a loose index signature that accepts anything.
+
+```ts
+type Status = "todo" | "doing" | "done";
+
+interface Board { // adding "blocked" to Status? You must remember to edit this too.
+  todo: Task[];
+  doing: Task[];
+  done: Task[];
+}
+
+const loose: { [key: string]: Task[] } = {}; // accepts "banana" as a key. No help at all.
+```
+
+**Utility type.** `Record<K, V>` builds an object type whose keys are `K` and whose values are `V`. When `K` is a union of literals, **every member becomes a required key**.
+
+```ts
+const board: Record<Status, Task[]> = {
+  todo: [],
+  doing: [],
+  done: [],
+};
+
+const incomplete: Record<Status, Task[]> = { todo: [], doing: [] };
+// ❌ Property 'done' is missing in type '{ todo: never[]; doing: never[]; }' but required in type 'Record<Status, Task[]>'.
+
+board.banana; // ❌ Property 'banana' does not exist on type 'Record<Status, Task[]>'.
+```
+
+**Why it's better.** Add `"blocked"` to `Status` and every `Record<Status, …>` in the app reports a missing key, which is exactly the "update everything that cares" list you want. With a plain `Record<string, V>`, by contrast, any key is allowed and lookups return `V` (not `V | undefined`) unless `noUncheckedIndexedAccess` is on.
+
+## 21.5 Exclude, Extract and NonNullable
+
+**Problem.** You have a union and need a *smaller* union: all statuses except `"done"`, or a union without `null`.
+
+**Naive solution.** Retype the remaining members by hand.
+
+```ts
+type Status = "todo" | "doing" | "done";
+type ActiveStatus = "todo" | "doing"; // copy of Status minus one member: drifts
+
+type MaybeName = string | null | undefined;
+type Name = string; // forgot that the original might gain more members later
+```
+
+**Utility type.** These three filter unions member by member:
+
+```ts
+type ActiveStatus = Exclude<Status, "done">;        // "todo" | "doing"
+type OnlyDone = Extract<Status, "done" | "archived">; // "done" (keeps members assignable to the second argument)
+type Name = NonNullable<string | null | undefined>;  // string
+
+type Shape = string | number | (() => void);
+type NotFunctions = Exclude<Shape, Function>; // string | number
+type Primitives = Extract<Shape, string | number>; // string | number
+```
+
+`Exclude<T, U>` removes members of `T` that are assignable to `U`; `Extract<T, U>` keeps only those; `NonNullable<T>` removes `null` and `undefined`.
+
+**Why it's better.** The smaller union stays derived from the bigger one: add `"blocked"` to `Status` and it appears in `ActiveStatus` automatically. These utilities operate on **union members**, not on object properties (for that, use `Omit`/`Pick`).
+
+```ts
+function label(status: ActiveStatus): string {
+  return status === "todo" ? "To do" : "In progress"; // ✅ no "done" case to handle
+}
+```
+
+## 21.6 ReturnType and Parameters
+
+**Problem.** A library function returns a complex object, and you need to name that type for your own variables. The library doesn't export it.
+
+**Naive solution.** Retype it by hand and hope it matches. When the library updates, your copy lies.
+
+```ts
+function createStore() {
+  return { tasks: [] as Task[], add(t: Task) { this.tasks.push(t); } };
+}
+// The return type is not exported; copying it by hand is fragile:
+type Store = { tasks: Task[]; add(t: Task): void }; // ❌ will drift from createStore
+```
+
+**Utility type.** `ReturnType<F>` gives a function's return type; `Parameters<F>` gives its parameter list as a **tuple**. Both need `typeof` because they take a function *type*, not a function value.
+
+```ts
+type Store = ReturnType<typeof createStore>;
+// { tasks: Task[]; add(t: Task): void }
+
+function connect(url: string, retries: number, secure?: boolean): void {}
+
+type ConnectArgs = Parameters<typeof connect>; // [url: string, retries: number, secure?: boolean | undefined]
+type FirstArg = Parameters<typeof connect>[0];  // string
+
+function connectWithLogging(...args: Parameters<typeof connect>) {
+  console.log("connecting", args);
+  connect(...args); // ✅ args forwarded with exact types
+}
+```
+
+**Why it's better.** The derived type can't go stale: change `createStore` and `Store` changes with it. `Parameters` is especially useful for wrappers that must accept "whatever the wrapped function accepts."
+
+## 21.7 ConstructorParameters and InstanceType
+
+**Problem.** The same need as before, but for **classes**: you want the type of an *instance* made by a class you don't control, or the arguments its constructor takes.
+
+**Naive solution.** Re-declare an interface to match the class, or retype the constructor's parameters.
+
+```ts
+class TaskRepository {
+  constructor(public baseUrl: string, public retries: number) {}
+  fetchAll(): Promise<Task[]> { return Promise.resolve([]); }
+}
+
+interface RepoLike { baseUrl: string; retries: number; fetchAll(): Promise<Task[]> } // copy of the class shape
+```
+
+**Utility type.**
+
+```ts
+type RepoArgs = ConstructorParameters<typeof TaskRepository>; // [baseUrl: string, retries: number]
+type Repo = InstanceType<typeof TaskRepository>;              // TaskRepository
+
+function makeRepo(...args: RepoArgs): Repo {
+  return new TaskRepository(...args);
+}
+
+const repo = makeRepo("/api", 3); // repo: TaskRepository
+makeRepo("/api");                 // ❌ Expected 2 arguments, but got 1.
+```
+
+Notice `typeof TaskRepository`: the *class value* is a constructor (so we ask about its constructor), while the plain name `TaskRepository` already works as the instance type in type position.
+
+**Why it's better.** These two shine in factories, dependency-injection containers, and test helpers that must stay in lock-step with a class they didn't write.
+
+## 21.8 Awaited
+
+**Problem.** An async function returns `Promise<Task[]>`, and you want the type of the data you get *after* awaiting it, not the promise.
+
+**Naive solution.** Hand-unwrap it. That works for one level, and it breaks for async functions that return other promises.
+
+```ts
+async function loadTasks(): Promise<Task[]> { return []; }
+
+type Loaded = Task[]; // copy of the unwrapped type: drifts when loadTasks changes
+```
+
+**Utility type.** `Awaited<T>` unwraps a promise recursively, exactly as `await` does at runtime.
+
+```ts
+type Loaded = Awaited<ReturnType<typeof loadTasks>>; // Task[]
+
+type A = Awaited<Promise<string>>;           // string
+type B = Awaited<Promise<Promise<number>>>;  // number (nested promises are unwrapped all the way)
+type C = Awaited<string>;                    // string (non-promises pass through unchanged)
+
+async function main() {
+  const results = await Promise.all([loadTasks(), Promise.resolve(42)]);
+  // results: [Task[], number]. Promise.all's own signature uses Awaited internally
+}
+```
+
+**Why it's better.** `ReturnType` alone would give `Promise<Task[]>`, and a hand-written `T extends Promise<infer U> ? U : T` doesn't handle nested promises or "thenable" objects. The built-in does. The pairing `Awaited<ReturnType<typeof fn>>` is the standard way to name "what this async function produces".
+
+## 21.9 Combining utilities
+
+Utility types are ordinary type expressions, so they nest. A realistic update payload for TaskFlow says "everything except `id` may be provided, but `id` is required to know which task":
+
+```ts
+type UpdateTaskInput = Partial<Omit<Task, "id">> & Pick<Task, "id">;
+// { title?: string; done?: boolean; priority?: number } & { id: string }
+
+const ok: UpdateTaskInput = { id: "t1", done: true }; // ✅
+const noId: UpdateTaskInput = { done: true };
+// ❌ Property 'id' is missing in type '{ done: true; }' but required in type 'Pick<Task, "id">'.
+```
+
+Read from the inside out: `Omit<Task, "id">` drops the id, `Partial<…>` makes the rest optional, `& Pick<Task, "id">` puts a required `id` back. Combining is powerful, but there is a readability limit. Once a type needs three or four stacked utilities, **give the intermediate steps names**:
+
+```ts
+type TaskFields = Omit<Task, "id">;          // everything the user edits
+type TaskPatch = Partial<TaskFields>;        // …some of it
+type UpdateTaskInput = TaskPatch & Pick<Task, "id">; // …plus the id that says which task
+```
+
+Hovering `UpdateTaskInput` in your editor will show a bare intersection of object types. If you want the editor to show one flat object, a small helper like `type Prettify<T> = { [K in keyof T]: T[K] } & {}` does it, and you'll understand why it works in [Chapter 22](/chapter/22).
+
+> 🚫 **When not to.** If you can't explain a stacked utility type in one sentence, don't ship it. Write the plain interface, or name the pieces.
+
+## 21.10 Utility types in the wild
+
+Once you know the vocabulary, library type definitions become readable. Here are real patterns you'll meet:
+
+```ts
+// React: props of any DOM element, minus the ones you override
+type ButtonProps = Omit<React.ComponentProps<"button">, "onClick"> & {
+  onClick: (id: string) => void;
+};
+
+// Redux-style: the shape of an action creator's output
+const addTask = (title: string) => ({ type: "tasks/add" as const, payload: { title } });
+type AddTaskAction = ReturnType<typeof addTask>; // { type: "tasks/add"; payload: { title: string } }
+
+// Wrapper helpers: the argument list of a function you did not write
+type TimerArgs = Parameters<typeof setTimeout>[1]; // the type of the delay argument
+
+// A settings screen: all fields known, but the saved copy may be incomplete
+type SavedSettings = Partial<Required<Settings>>;
+```
+
+When a tooltip shows something like `Omit<Pick<…>, …>`, read it as plain English from the inside out. Most of the surprising types in a library are two or three utilities from this chapter composed together.
+
+> 🌍 **Real world.** `Awaited` shows up inside `Promise.all`'s signature, `Parameters` and `ReturnType` power wrapper functions in test utilities, and `Omit<ComponentProps<"x">, …>` is the idiom for wrapping a DOM element in a design-system component ([Chapter 50](/chapter/50)).
+
+## Common mistakes
+
+> ⚠️ **`Partial` on everything.** Making all fields optional loses required fields such as `id`. Combine with `Pick` (section 21.9) or define a dedicated input type.
+
+> ⚠️ **Stacked utilities nobody can read.** `Partial<Omit<Required<Pick<…>>, …>>` is a puzzle, not a type. Name the intermediate steps.
+
+> ⚠️ **`Omit` with typos in keys.** `Omit<Task, "idd">` compiles and removes nothing. Prefer `Pick` for small selections, and check the hover result after writing an `Omit`.
+
+> ⚠️ **Forgetting `typeof`.** `ReturnType<createStore>` is an error because `createStore` is a value, not a type.
+
+```ts
+type Bad = ReturnType<createStore>; // ❌ 'createStore' refers to a value, but is being used as a type here. Did you mean 'typeof createStore'?
+```
+
+## When to use it, and when not to
+
+> ✅ **Use it when** a type is a *variation* of another type you already maintain: update payloads, previews, DTOs, read-only views, dictionaries keyed by a union, or types you need from functions and classes you don't own.
+
+> 🚫 **When not to.** When the variation is really a different concept (a `Task` in your database vs a `Task` in a form), write a separate interface and map between them explicitly. Don't force two things that merely look similar today to be derived from each other, because they'll diverge.
+
+## How it connects
+
+> 🔗 **Connection.** Every utility here is defined in `lib.es5.d.ts` using the tools in the next two chapters: **mapped types** ([Chapter 22](/chapter/22)) for `Partial`, `Readonly`, `Pick`, `Record`, and **conditional types** ([Chapter 23](/chapter/23)) for `Exclude`, `Extract`, `ReturnType`, and `Awaited`. Later, the API DTOs in [Chapter 31](/chapter/31) and the reducers in [Chapter 55](/chapter/55) lean on these utilities heavily.
+
+## Exercises
+
+### Level 1 — Recall
+
+Name the utility type for each description: (1) make all fields optional, (2) make all fields required, (3) keep only some keys of an object type, (4) remove some keys, (5) build an object type from a key union and a value type, (6) remove `null` and `undefined` from a union, (7) get the type a function returns, (8) get the type a promise resolves to.
+
+### Level 2 — Application
+
+TaskFlow has four hand-copied types: `UpdateTaskInput`, `CreateTaskInput`, `TaskPreview`, and `TaskWithoutId`. Replace each with a type derived from `Task`. Rename `title` to `name` in `Task` and confirm that all four update without further edits.
+
+### Level 3 — Challenge
+
+A third-party `lib` exposes `lib.on(event: string, handler: (payload: unknown, meta: { at: number }) => void)`, but doesn't export the handler type. Declare `type Handler = ...` using `Parameters<typeof lib.on>[1]`, and write a handler that uses `meta.at`.
+
+*Hint: index into the tuple that `Parameters` returns.*
+
+### Level 4 — Real-world
+
+**Ticket TF-217: Types for the upcoming API.** The backend team is about to expose `/tasks`. Starting from `Task`:
+
+- Define `CreateTaskDto` (no `id`, no `createdAt`), `UpdateTaskDto` (all optional except it must carry `id`), and `TaskSummary` (only `id`, `title`, `done`).
+- No field may be typed twice: each DTO derives from `Task`.
+- Add a `Record<Status, TaskSummary[]>` for the board response.
+- Adding a field to `Task` must flow into the DTOs automatically, and adding a status must produce a compile error where the board is built.
+
+## Key takeaways
+
+- Utility types are built-in functions from types to types. One source type feeds many variations.
+- `Partial`/`Required` and `Readonly` flip modifiers; `Pick`/`Omit` choose fields; `Record` builds dictionaries (required keys when the key type is a literal union).
+- `Exclude`/`Extract`/`NonNullable` filter **union members**; `ReturnType`/`Parameters`/`ConstructorParameters`/`InstanceType`/`Awaited` derive from functions, classes, and promises.
+- `Omit` does not check its keys, so a typo silently removes nothing.
+- Combine utilities, but name intermediate steps once the type is hard to read.
+
+## What comes next
+
+These utilities feel like magic until you see inside them. In [Chapter 22: Mapped Types](/chapter/22) you will rebuild `Partial`, `Readonly`, `Pick`, and `Record` from scratch with a single loop over keys, and write new ones the standard library doesn't have.
+

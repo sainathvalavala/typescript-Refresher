@@ -1,0 +1,387 @@
+> 📖 **The problem.** Day one of "learning React" arrives, and someone shows you a 25-line component. It has angle brackets in the middle of JavaScript, a function that starts with a capital letter, something called a hook, and a type written inside what looks like an HTML tag. It feels like a new language. You close the tab and wonder whether you should have started with a different framework, or a different career.
+
+Here's the secret this chapter proves: **you already understand most of that component.** You spent six parts of this book learning TypeScript, and nearly every idea in a React component is one of those ideas wearing a costume. Functions, objects, destructuring, modules, interfaces, unions, narrowing, generics, utility types, inference: they're all there.
+
+By the end, you'll be able to read a typical React + TypeScript component and name which chapter each piece came from, which means the genuinely new material (rendering, state, effects) is a much smaller list than it looks.
+
+> 🧠 **Mental model.** *React is "just" TypeScript.* Components are **functions**, props are **parameter objects**, hooks are **generic functions**, and UI states are **unions**. What's new in React isn't the language. It's *when* your functions run, and who calls them.
+
+## 34.1 From language to interfaces
+
+Until now, your code produced **values**: numbers, strings, objects, results of API calls. You ran a program, it computed something, and it printed it or returned it. A *user interface* is also something a program produces, but it has two properties values don't. It's **visual** (the output is pixels people look at), and it's **alive** (the user clicks, types, and scrolls, and the output must change in response).
+
+That second property is the whole difficulty of front-end development, and it's the reason Part VII and VIII exist. But the *mechanics* of describing a UI turn out to be ordinary TypeScript. Here is the component from the problem statement, in full:
+
+```tsx
+import { useState } from "react";
+import type { Task, TaskStatus } from "../types";
+
+interface TaskListProps {
+  tasks: Task[];
+  onToggle: (id: string) => void;
+}
+
+export function TaskList({ tasks, onToggle }: TaskListProps) {
+  const [filter, setFilter] = useState<TaskStatus | "all">("all");
+  const visible = filter === "all" ? tasks : tasks.filter((t) => t.status === filter);
+
+  if (visible.length === 0) return <p>Nothing here yet.</p>;
+
+  return (
+    <ul>
+      {visible.map((t) => (
+        <li key={t.id} onClick={() => onToggle(t.id)}>
+          {t.title}
+        </li>
+      ))}
+    </ul>
+  );
+}
+```
+
+Take a pencil and circle everything that is *not* from the first six parts of this book. You'll find two things: the angle-bracket syntax that looks like HTML (called JSX, the subject of [Chapter 38](/chapter/38)), and the `useState` call (the subject of [Chapter 41](/chapter/41)). Everything else is a function, an interface, a union, a `map`, a ternary, and an arrow function.
+
+> 💡 **Tip.** Don't try to understand how React *works* yet. In this chapter, only notice how much of the code is already familiar. The mechanics come, one idea per chapter, in [Part VIII](/part/viii).
+
+## 34.2 Functions become components
+
+A **component** is a function that takes some input (called **props**) and returns a description of UI. That's the entire definition. The capital letter at the start of the name isn't magic syntax. It's a convention React uses to tell a component (`<TaskList />`) apart from a plain HTML tag (`<ul>`).
+
+Compare a function you might have written in [Chapter 11](/chapter/11) with a component:
+
+```ts
+// Part IV style: a function from data to a string
+function renderTaskLine(task: Task): string {
+  return `${task.title} (${task.status})`;
+}
+```
+
+```tsx
+// React style: a function from data to a description of UI
+function TaskLine({ task }: { task: Task }) {
+  return <li>{task.title} ({task.status})</li>;
+}
+```
+
+The shape is identical: parameters in, a return value out. The difference is only the return value. Instead of a `string`, the component returns **JSX**, which describes elements. And instead of *you* calling the function, **React** calls it, at times of its choosing, whenever it needs fresh output for the screen.
+
+```tsx
+// You write the function; React calls it.
+<TaskLine task={myTask} />   // "please call TaskLine({ task: myTask }) and show whatever it returns"
+```
+
+This inversion, where you hand your function to a framework and it decides when to run it, is the single largest conceptual shift in this book. The rest is what you already know.
+
+## 34.3 Objects and destructuring become props
+
+In JavaScript, you've seen the "options object" pattern: instead of a function with six positional parameters, pass one object. Components are built entirely on this pattern. React always calls your component with **exactly one argument**: an object of everything the caller passed. That object is called `props`.
+
+```tsx
+// React calls this as: TaskLine({ title: "Write docs", done: false })
+function TaskLine(props: { title: string; done: boolean }) {
+  return <li>{props.title}</li>;
+}
+
+// The same, with the destructuring you learned in Chapter 7. This is how everyone writes it.
+function TaskLine({ title, done }: { title: string; done: boolean }) {
+  return <li>{title}</li>;
+}
+```
+
+At the call site, the JSX attributes become the properties of that object:
+
+```tsx
+<TaskLine title="Write docs" done={false} />
+// ≈ TaskLine({ title: "Write docs", done: false })
+```
+
+Everything you know about objects applies. Optional properties use `?`, defaults use the destructuring default syntax, and extra properties are excess-property errors ([Chapter 10](/chapter/10)):
+
+```tsx
+function TaskLine({ title, done = false }: { title: string; done?: boolean }) {
+  return <li>{title}{done ? " ✓" : ""}</li>;
+}
+
+<TaskLine title="Write docs" />                    // ✅ done defaults to false
+<TaskLine title="Write docs" priority="high" />    // ❌ Type '{ title: string; priority: string; }' is not assignable to type 'IntrinsicAttributes & { title: string; done?: boolean | undefined; }'.
+                                                   //    Property 'priority' does not exist on type 'IntrinsicAttributes & { title: string; done?: boolean | undefined; }'.
+```
+
+> 🔗 **Connection.** The strange `IntrinsicAttributes &` in that message is just React adding the special `key` prop to the type you wrote. Ignore it when reading errors.
+
+## 34.4 Modules become component files
+
+Components live in ES modules, exactly as in [Chapter 25](/chapter/25). The convention is **one component per file** (plus small private helpers), named after the component, with a named export:
+
+```text
+src/
+  types.ts                  // Task, TaskStatus: shared domain types
+  components/
+    TaskList.tsx            // export function TaskList
+    TaskLine.tsx            // export function TaskLine
+  App.tsx                   // composes them
+```
+
+The `.tsx` extension is how TypeScript knows that the file may contain JSX. Use `.ts` for anything that doesn't render. And the `import type` form from Chapter 25 matters here, because props types are only ever used for checking:
+
+```tsx
+// TaskLine.tsx
+import type { Task } from "../types"; // erased at runtime: no extra JavaScript shipped
+
+export interface TaskLineProps {
+  task: Task;
+}
+
+export function TaskLine({ task }: TaskLineProps) {
+  return <li>{task.title}</li>;
+}
+```
+
+```tsx
+// TaskList.tsx
+import { TaskLine, type TaskLineProps } from "./TaskLine"; // a value and a type in one statement
+```
+
+Notice you can import the *props type* of another component, which is useful when a wrapper component needs to pass props through. We'll use that heavily in [Part IX](/part/ix).
+
+> 🚫 **When not to.** Don't split every five-line helper into its own file. A component file is a unit of *understanding*, not a unit of *typing*. Split when a piece has its own name in your head ("the task row"), not when the file hits an arbitrary length.
+
+## 34.5 Interfaces and aliases become contracts
+
+When you wrote `interface Task { … }` in [Chapter 12](/chapter/12), you were defining a contract between code that makes tasks and code that uses them. A component's **props type** is the same idea at a larger scale: it's the component's public API. Anyone using `<TaskLine>` must satisfy that contract, and the compiler checks every use.
+
+```tsx
+export interface TaskLineProps {
+  task: Task;
+  onToggle: (id: string) => void;  // a callback: the component *asks* its parent to act
+  highlighted?: boolean;           // optional: callers may omit it
+}
+```
+
+Read it as documentation. A newcomer opening this file learns, without reading the body, what the component needs, what it can do, and what's optional. And when the contract changes (say `onToggle` gains a second argument), every caller that no longer fits is flagged:
+
+```tsx
+<TaskLine task={t} />
+// ❌ Property 'onToggle' is missing in type '{ task: Task; }' but required in type 'TaskLineProps'.
+
+<TaskLine task={t} onToggle={(id) => toggle(id)} highlighted="yes" />
+// ❌ Type 'string' is not assignable to type 'boolean | undefined'.
+```
+
+Prefer `interface` for props of ordinary components (clearer error messages and easy to extend), and `type` when you need a union or a mapped type. [Chapter 50](/chapter/50) covers the details of typing props.
+
+## 34.6 Unions and narrowing become UI states
+
+Most real components must show different things in different situations: loading, failed, empty, or showing data. Now recall the discriminated union from [Chapter 13](/chapter/13) and the narrowing from [Chapter 14](/chapter/14). They are exactly the right tool, because a UI state is a **set of mutually exclusive situations**, each with its own data:
+
+```ts
+type TasksState =
+  | { status: "loading" }
+  | { status: "error"; message: string }
+  | { status: "ready"; tasks: Task[] };
+```
+
+And **conditional rendering is narrowing**. You write `if` and `switch` statements on the tag, and TypeScript narrows what's available in each branch:
+
+```tsx
+function TaskPanel({ state }: { state: TasksState }) {
+  switch (state.status) {
+    case "loading":
+      return <p>Loading…</p>;
+    case "error":
+      return <p role="alert">{state.message}</p>;  // ✅ message exists only in this branch
+    case "ready":
+      return <TaskList tasks={state.tasks} />;      // ✅ tasks exists only here
+  }
+}
+```
+
+The alternative, which you'll see in a lot of beginner code, is a bag of booleans:
+
+```ts
+// ❌ Four booleans allow sixteen combinations, but only four make sense.
+interface Bad { isLoading: boolean; isError: boolean; message?: string; tasks?: Task[] }
+// What does { isLoading: true, isError: true, tasks: [...] } mean? Nobody knows, and the compiler can't tell.
+```
+
+> ✅ **Use it when** a component can be in more than one "mode". Model the modes as a union first, then render with `switch`. [Chapter 40](/chapter/40), [Chapter 52](/chapter/52), and [Chapter 55](/chapter/55) pick this up.
+
+## 34.7 Generics appear in hooks and components
+
+In Part IV you learned that a generic is a function (or type) with a type parameter that TypeScript usually infers. React's hooks are exactly that. Look at the signature of `useState`, simplified:
+
+```ts
+function useState<S>(initial: S): [S, (next: S) => void];
+```
+
+`S` is the type of the state, and the return value is a **tuple** ([Chapter 7](/chapter/7)): the current value and a function to replace it. When inference has enough information you pass no type argument; when it doesn't, you supply one, exactly as in [Chapter 16](/chapter/16):
+
+```tsx
+const [count, setCount] = useState(0);                 // S inferred as number
+const [title, setTitle] = useState("");                // S inferred as string
+const [selected, setSelected] = useState<Task | null>(null); // initial null says nothing about Task: say it explicitly
+const [filter, setFilter] = useState<TaskStatus | "all">("all"); // widen to the union you intend
+
+setCount("five"); // ❌ Argument of type 'string' is not assignable to parameter of type 'SetStateAction<number>'.
+```
+
+`useRef<T>` works the same way, and **components themselves can be generic** (a `<List<T>>` that renders any kind of item), a topic that gets a whole chapter in [Chapter 57](/chapter/57). For now, the lesson is that the generics chapters pay off immediately: you can read these signatures.
+
+```tsx
+const inputRef = useRef<HTMLInputElement>(null);   // a box that will hold an input element (Chapter 45)
+```
+
+## 34.8 Utility types shape props
+
+You can derive prop types from existing types instead of rewriting them, with the utility types from [Chapter 21](/chapter/21). Three patterns cover most use:
+
+```tsx
+// 1. A form edits part of a Task: Pick exactly what it needs.
+type TaskFormProps = { initial: Pick<Task, "title" | "priority"> };
+
+// 2. An "update" callback receives only some fields: Partial.
+type OnUpdate = (id: string, changes: Partial<Omit<Task, "id">>) => void;
+
+// 3. A wrapper around a native element accepts all of its attributes: ComponentProps.
+import type { ComponentProps } from "react";
+
+type ButtonProps = ComponentProps<"button"> & { variant?: "primary" | "ghost" };
+
+function Button({ variant = "primary", ...rest }: ButtonProps) {
+  return <button data-variant={variant} {...rest} />; // onClick, disabled, type… all work
+}
+
+<Button onClick={() => save()} disabled={saving}>Save</Button>; // ✅
+```
+
+`ComponentProps<"button">` is one of those types you'll use weekly: it says "whatever a native `<button>` accepts". It's a **conditional type** under the hood ([Chapter 23](/chapter/23)), but you don't need to read it to use it.
+
+> 🔗 **Connection.** A design-system wrapper like `Button` uses `Omit` to *remove* props it controls itself (`Omit<ComponentProps<"button">, "type">`). That's covered in [Chapter 50](/chapter/50) and [Chapter 86](/chapter/86).
+
+## 34.9 Inference does the heavy lifting
+
+A first-time reader of React + TypeScript expects annotations everywhere. Instead there are very few, because of everything you learned about inference in [Chapter 6](/chapter/6). **Contextual typing** gives an inline handler its parameter type from the place it's used:
+
+```tsx
+<input
+  value={title}
+  onChange={(e) => setTitle(e.target.value)}  // e inferred as ChangeEvent<HTMLInputElement>
+/>
+
+tasks.map((t) => <li key={t.id}>{t.title}</li>); // t inferred as Task, from tasks: Task[]
+
+const visible = tasks.filter((t) => t.status === "done"); // visible: Task[]
+const total = tasks.length;                                // number
+```
+
+Guidelines that match what experienced React developers actually write:
+
+| Annotate | Let inference handle |
+|---|---|
+| Props (always: it's the public contract) | Local variables and `useState(0)` |
+| `useState<T>` when the initial value is too narrow (`null`, `[]`) | Inline event handlers |
+| Function return types at module boundaries (optional) | Results of `map`, `filter`, `reduce` |
+| Types of values from outside (`unknown` + a schema, [Chapter 32](/chapter/32)) | JSX itself |
+
+```tsx
+const [tasks, setTasks] = useState([]);       // tasks: never[]  ❌ almost never what you want
+const [tasks2, setTasks2] = useState<Task[]>([]); // ✅ tasks2: Task[]
+```
+
+## 34.10 Bridge self-check
+
+Here's the mapping from everything you've learned to where it reappears. Skim it now, and come back to it any time a React feature feels foreign: it probably isn't.
+
+| TypeScript concept | Where it appears in React | Chapter |
+|---|---|---|
+| Functions, callbacks | Components, event handlers, callback props | [39](/chapter/39), [41](/chapter/41), [51](/chapter/51) |
+| Objects, destructuring | Props, state objects | [39](/chapter/39), [50](/chapter/50) |
+| Modules, `import type` | Component files, shared types | [38](/chapter/38), [58](/chapter/58) |
+| Interfaces / aliases | Props contracts, context values | [50](/chapter/50), [54](/chapter/54) |
+| Unions, narrowing | Conditional rendering, UI states, reducers | [40](/chapter/40), [52](/chapter/52), [55](/chapter/55) |
+| Generics | `useState<T>`, `useRef<T>`, custom hooks, generic components | [52](/chapter/52), [53](/chapter/53), [56](/chapter/56), [57](/chapter/57) |
+| Utility types | `ComponentProps`, `Omit` for wrappers, `Partial` for updates | [50](/chapter/50), [52](/chapter/52) |
+| Inference | Hooks, inline handlers (contextual typing) | [51](/chapter/51), [52](/chapter/52) |
+
+Now test yourself. For each snippet, name the TypeScript idea you recognize:
+
+```tsx
+function Badge({ label, tone = "info" }: { label: string; tone?: "info" | "warn" }) {} // (1)
+const [open, setOpen] = useState(false);                                               // (2)
+{state.status === "ready" && <TaskList tasks={state.tasks} />}                         // (3)
+type CardProps = Omit<ComponentProps<"div">, "title"> & { title: string };             // (4)
+import type { Task } from "../types";                                                  // (5)
+```
+
+The answers: (1) destructuring with a default, plus a literal union; (2) generic inference and a tuple; (3) narrowing on a discriminant; (4) utility types and intersection; (5) type-only import. If you got four or five, you're ready for the next chapter.
+
+## Common mistakes
+
+> ⚠️ **Treating React as a new language.** If a line looks alien, look for the TypeScript underneath: it's usually a function call or an object. Only JSX syntax and the rules of hooks are genuinely new.
+
+> ⚠️ **Annotating everything.** `const total: number = tasks.length` adds noise. Annotate props and ambiguous initial state, and let inference do the rest.
+
+> ⚠️ **Modeling UI with booleans.** `isLoading`, `isError`, and `data` as independent fields allow impossible combinations. Use a discriminated union.
+
+> ⚠️ **`useState([])` without a type argument.** The state becomes `never[]` and nothing can be added to it. Write `useState<Task[]>([])`.
+
+## How it connects
+
+> 🔗 **Connection.** This chapter is an index into the whole TypeScript half of the book: [Part III](/part/iii) (the type system), [Part IV](/part/iv) (generics and transformations), and [Part V](/part/v) (modules and tooling). In return, [Part IX](/part/ix) will type React properly: props, events, state, refs, context, and custom hooks.
+
+## Exercises
+
+### Level 1 — Recall
+
+Copy the `TaskList` component from 34.1 into a scratch file. Annotate every line with a comment naming the TypeScript concept it uses (function, destructuring, interface, union, generic, narrowing, inference, `import type`) and the chapter where you learned it. Circle the two things that are new.
+
+### Level 2 — Application
+
+Here is a function-based helper from an old project:
+
+```ts
+function renderTaskCard(title: string, status: string, priority?: string): string {
+  return `<div class="card ${status}"><h3>${title}</h3>${priority ? `<span>${priority}</span>` : ""}</div>`;
+}
+```
+
+Rewrite it as a component-like function with a typed props object (`TaskCardProps`), using the real `TaskStatus` and `Priority` unions instead of `string`, and returning JSX. Identify which line of the original becomes conditional rendering.
+
+### Level 3 — Challenge
+
+Predict the type of every variable, and whether each marked line compiles. Then check in your editor:
+
+```tsx
+function Board({ tasks }: { tasks: Task[] }) {
+  const [selected, setSelected] = useState(null);
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState<Task[]>([]);
+  const titles = tasks.map((t) => t.title);
+  const handle = (e: React.ChangeEvent<HTMLInputElement>) => setQuery(e.target.value);
+  setSelected(tasks[0]);
+  setOpen(titles);
+  return <input value={query} onChange={handle} />;
+}
+```
+
+### Level 4 — Real-world
+
+**Ticket TF-401: Learn from the field.** Find a small open-source React + TypeScript component (a button, a dropdown, a card, under 80 lines) on GitHub.
+
+- Write a "what I recognize vs what's new" list with at least eight items in the first column.
+- For each *new* item, note which chapter of this book teaches it.
+- Identify one place where the author relied on inference and one where they annotated, and say whether you agree.
+
+## Key takeaways
+
+- React is TypeScript: components are functions, props are an options object, hooks are generics, and UI states are unions.
+- What's genuinely new is JSX, the rule that **React** calls your functions, and the hooks that give them memory.
+- Props types are a component's contract. Annotate them, and let inference handle the rest.
+- Conditional rendering is narrowing. Model UI states as discriminated unions, not boolean piles.
+- `useState<T>`, `useRef<T>`, and `ComponentProps<"button">` are generics and utility types you can already read.
+
+## What comes next
+
+Before React, we deliberately meet the browser **without** it. The DOM has its own type system, a big class hierarchy that TypeScript knows well, and `document.querySelector("#email").value` produces two compile errors on a single line, both correct. [Chapter 35: TypeScript in the Browser](/chapter/35) teaches you to speak the DOM's types, and you'll build a framework-free TaskFlow whose bugs set up the question of [Chapter 36](/chapter/36): *why does anyone need React?*
+
+

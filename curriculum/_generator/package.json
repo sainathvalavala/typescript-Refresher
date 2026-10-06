@@ -1,0 +1,13 @@
+{
+  "name": "typed-interfaces-curriculum-tools",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "toc": "node generate.mjs",
+    "site": "node build-site.mjs"
+  },
+  "devDependencies": {
+    "highlight.js": "^11.11.1",
+    "marked": "^15.0.12"
+  }
+}

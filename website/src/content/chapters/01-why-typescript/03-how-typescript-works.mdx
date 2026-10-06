@@ -1,0 +1,355 @@
+> 📖 **The problem.** TaskFlow's settings page crashed in production with `TypeError: Cannot read properties of undefined (reading 'toLowerCase')`. The stack trace points at `user.email.toLowerCase()`. But `user` is typed as `User`, and `User` clearly says `email: string`. The code compiled with zero errors in strict mode. A junior developer asks the question everyone eventually asks: "If TypeScript checks types, why did my app crash on a `User` with no `email`?"
+
+The answer is the single most important idea in Book One, and you'll meet it again in more than a dozen chapters. TypeScript checks your code *before* it runs, and then **it gets out of the way completely**. The types are removed, and plain JavaScript runs with no knowledge that they ever existed. Nothing checks the data that arrives while the program is running unless you write code that does.
+
+By the end of this chapter, you'll be able to describe what the compiler actually does, predict what JavaScript it emits, explain exactly which bugs TypeScript can and cannot catch, and say why you still need to know JavaScript deeply.
+
+> 🧠 **Mental model.** **Two worlds.** At **compile time**, TypeScript reads your code and checks its *internal consistency*: do the pieces agree with each other? At **runtime**, JavaScript executes with *no types at all*. The `tsc` pipeline is *check → erase → emit*, and the checker never touches running data.
+
+## 3.1 The compiler pipeline
+
+A **compiler** is a program that reads source code and produces something else, here JavaScript. TypeScript's compiler, `tsc`, works in three stages:
+
+1. **Parse.** Read the text of your files and build a tree that represents the program's structure.
+2. **Type-check.** Walk that tree, work out the type of every expression, and report every place where the pieces disagree.
+3. **Emit.** Write out JavaScript: your code with the type syntax removed.
+
+The surprising part is that **checking and emitting are independent**. By default, a type error does *not* stop `tsc` from writing the JavaScript file:
+
+```sh
+$ cat greet.ts
+function greet(name: string): string {
+  return `Hello, ${name}!`;
+}
+
+greet(42);
+
+$ npx tsc greet.ts
+greet.ts:5:7 - error TS2345: Argument of type 'number' is not assignable to parameter of type 'string'.
+
+5 greet(42);
+        ~~
+
+Found 1 error in greet.ts:5
+
+$ ls
+greet.js  greet.ts        # the JavaScript was emitted anyway
+```
+
+This is deliberate. TypeScript's errors are *advice about your program*, not a gate that the output must pass. If you want a gate, you can ask for one with the `noEmitOnError` option, and in practice teams make type errors fail the build in CI ([Chapter 27](/chapter/27)). But the separation explains a lot: the emit step doesn't need the checker's results, which is why other tools can strip types without checking them at all ([Chapter 5](/chapter/5)).
+
+## 3.2 Type erasure
+
+**Type erasure** means the type-level parts of your code are removed during emit. Annotations, `type` aliases, and `interface` declarations exist only for the checker; the JavaScript that runs contains none of them. Here is a TypeScript file and the JavaScript `tsc` emits for it:
+
+```ts
+// task.ts: what you write
+type TaskStatus = "todo" | "doing" | "done";
+
+interface Task {
+  id: string;
+  title: string;
+  status: TaskStatus;
+}
+
+export function complete(task: Task): Task {
+  return { ...task, status: "done" };
+}
+
+export const first: Task = { id: "t1", title: "Write docs", status: "todo" };
+```
+
+```js
+// task.js: what runs
+export function complete(task) {
+    return { ...task, status: "done" };
+}
+export const first = { id: "t1", title: "Write docs", status: "todo" };
+```
+
+Read the two side by side. The `type` alias is gone. The `interface` is gone. Every `: Task` annotation is gone. What's left is exactly the JavaScript you would have written by hand, which is one of TypeScript's design goals ([Chapter 2](/chapter/2)).
+
+So when the opening's crash happened, there was no `User` type anywhere in the running program to check against. The annotation `user: User` was a claim the compiler used to check *your code*, and then it was deleted.
+
+## 3.3 Compile time vs runtime
+
+Because of erasure, every name in a TypeScript program lives in one of two worlds, or occasionally both:
+
+| Exists at compile time only | Exists at runtime |
+|---|---|
+| `type` aliases, `interface` declarations | Variables, functions, objects |
+| Annotations like `: string` | Classes (they're real JavaScript values) |
+| Generic type parameters like `T` | Values you can test: `typeof x`, `Array.isArray(x)`, `"id" in x` |
+
+This explains a rule that confuses many beginners. You can check whether a value is an **instance of a class** at runtime, because a class is a real JavaScript function that still exists after compilation. You *cannot* check whether a value "is" a type alias or interface, because by then there's nothing left to check against:
+
+```ts
+class TaskError extends Error {}
+type User = { id: string; email: string };
+
+function handle(value: unknown) {
+  if (value instanceof TaskError) { /* ✅ TaskError is a real value at runtime */ }
+
+  if (value instanceof User) { /* … */ } // ❌ 'User' only refers to a type, but is being used as a value here.
+}
+```
+
+If you need to know at runtime whether some data has a `User` shape, you have to write code that inspects the data: check that `email` exists and is a string. You'll learn to do that safely with **narrowing** in [Chapter 14](/chapter/14) and **runtime validation** in [Chapter 32](/chapter/32).
+
+## 3.4 What TypeScript can catch
+
+At compile time, TypeScript sees your entire program at once. That makes it excellent at one specific job: finding places where **your code disagrees with itself**. Each line below is a different kind of mistake, and each is caught before anything runs:
+
+```ts
+type TaskStatus = "todo" | "doing" | "done";
+type Task = { id: string; title: string; status: TaskStatus; assignee?: { name: string } };
+
+declare const task: Task;
+declare function findTask(id: string): Task | undefined;
+
+task.titel;            // ❌ Property 'titel' does not exist on type 'Task'. Did you mean 'title'?
+findTask(42);          // ❌ Argument of type 'number' is not assignable to parameter of type 'string'.
+findTask("t1").title;  // ❌ Object is possibly 'undefined'.
+task.assignee.name;    // ❌ 'task.assignee' is possibly 'undefined'.
+
+const draft: Task = { id: "t2", title: "Plan sprint" }; // ❌ Property 'status' is missing in type '{ id: string; title: string; }' but required in type 'Task'.
+```
+
+That's typos, wrong arguments, missing properties, and two kinds of nullability. It also catches **unhandled cases**. Here the function promises to return a `string` for every status, but one status was forgotten:
+
+```ts
+function label(status: TaskStatus): string { // ❌ Function lacks ending return statement and return type does not include 'undefined'.
+  switch (status) {
+    case "todo":
+      return "To do";
+    case "doing":
+      return "In progress";
+    // "done" was forgotten
+  }
+}
+```
+
+And it catches **refactor misses**: rename `title` to `name` in the `Task` type, and every line in every file that still says `.title` turns red at once. That's the safety net from [Chapter 2](/chapter/2), and it works because all of these are questions about the *code*, which the checker can see in full.
+
+## 3.5 What TypeScript cannot catch
+
+The checker can only reason about what it can see, and it can't see the running program. That rules out a whole category of problems.
+
+**Data from outside your code.** Network responses, `localStorage`, files, environment variables, and user input arrive at runtime. A type annotation on that data is a *claim*, not a check. This is exactly the bug from the opening:
+
+```ts
+type User = { id: string; email: string };
+
+async function loadUser(id: string): Promise<User> {
+  const response = await fetch(`/api/users/${id}`);
+  return (await response.json()) as User; // TypeScript believes you. The server may disagree.
+}
+
+const user = await loadUser("u1");
+user.email.toLowerCase(); // ✅ compiles. 💥 TypeError if the server sent { id: 1, mail: "…" }
+```
+
+**Wrong logic with correct types.** The types below are perfect; the business rule is wrong:
+
+```ts
+function applyDiscount(price: number, percent: number): number {
+  return price - percent; // ✅ compiles. 10% off $200 should be $180; this returns $190.
+}
+```
+
+**Lies you tell it.** A **type assertion** (`as`) tells the compiler "trust me", and an `any` turns checking off. Both make the checker agree with whatever you said:
+
+```ts
+const count = "twelve" as unknown as number; // ✅ compiles; count is a string at runtime
+const data: any = JSON.parse('{"tasks": null}');
+data.tasks.length;                          // ✅ compiles; 💥 TypeError at runtime
+```
+
+And **runtime-only failures**: the network is down, storage is full, the user's clock is wrong, a loop is too slow. TypeScript has no opinion about any of them. Knowing this list is what separates people who *use* TypeScript from people who are *fooled* by it.
+
+## 3.6 The language service
+
+The type checker doesn't only run when you type `tsc`. TypeScript ships a **language service**: a long-running process that your editor talks to while you type. It's the *same* checker, kept warm in memory, answering questions like "what's the type here?" and "where is this used?" in milliseconds.
+
+Every editor feature you'll rely on in this book comes from it:
+
+```ts
+type Task = { id: string; title: string; status: "todo" | "doing" | "done" };
+
+const task: Task = { id: "t1", title: "Write docs", status: "todo" };
+
+// Hover over `task`           → const task: Task
+// Type `task.` and pause      → suggests id, status, title (read from the type)
+// F2 on `title`               → renames the property here AND at every use, in every file
+// Ctrl+. (Cmd+. on a Mac)     → quick fixes such as "Change spelling to 'title'" or "Add missing import"
+const heading = task.title.toUpperCase();
+```
+
+Even if you write plain JavaScript in Visual Studio Code, its autocomplete for `.js` files is powered by TypeScript's language service, reading inferred types and published type definitions behind the scenes. You've probably been using TypeScript for years without knowing it.
+
+> 🆕 **Modern note.** TypeScript 7 is a native port of the compiler and language service (rewritten in Go). Microsoft reports type-checking around ten times faster on large codebases. The language, the error messages, and the commands in this book are the same.
+
+## 3.7 Why JavaScript is still fundamental
+
+Because TypeScript erases to JavaScript, **everything that happens at runtime is JavaScript's behavior**, not TypeScript's. TypeScript changes none of these:
+
+- **Debugging.** The browser and Node run the emitted JavaScript. Source maps let your debugger show the `.ts` lines, but the values you inspect are JavaScript values.
+- **`this`.** How `this` is bound depends on how a function is *called*, exactly as in JavaScript.
+- **Closures, scope, hoisting, coercion, the prototype chain.** All unchanged.
+- **The event loop.** When callbacks, promises, and timers run is decided by the runtime.
+
+Here's code that type-checks perfectly and still misbehaves, purely because of JavaScript rules:
+
+```ts
+class TaskTimer {
+  seconds = 0;
+  tick() {
+    this.seconds++;
+  }
+}
+
+const timer = new TaskTimer();
+setInterval(timer.tick, 1000);         // ✅ compiles, but `this` inside tick is no longer `timer`
+setInterval(() => timer.tick(), 1000); // ✅ the JavaScript fix: call tick ON timer
+
+console.log("1: start");
+setTimeout(() => console.log("4: timer"), 0);
+Promise.resolve().then(() => console.log("3: microtask")); // types say nothing about ordering
+console.log("2: end");
+```
+
+If you can't explain why the first `setInterval` never updates `timer.seconds`, or why the logs print 1, 2, 3, 4, no amount of TypeScript will help you. That's why the next chapter checks your JavaScript before you go further.
+
+## 3.8 The layered safety model (preview)
+
+If types can't catch everything, what does? **Layers.** Professional teams combine four kinds of checks, each catching a category the others miss:
+
+| Layer | Runs | Catches | Misses |
+|---|---|---|---|
+| **Types** (TypeScript) | Compile time | Inconsistent code: typos, wrong arguments, nullability | Bad data, wrong logic |
+| **Lint** (ESLint + typescript-eslint) | Compile time | Risky patterns: unhandled promises, unused code | Most logic errors |
+| **Tests** (Vitest, Testing Library) | Before deploy | Wrong logic and behavior for chosen examples | Inputs you didn't think of |
+| **Runtime validation** (Zod and similar) | At runtime | Bad data at the boundaries | Everything inside the boundary |
+
+Here is a preview of all four protecting one small piece of TaskFlow. Don't worry about the libraries yet; each gets its own chapter:
+
+```ts
+import { z } from "zod";
+import { expect, test } from "vitest";
+
+// Layer 1, types: callers must pass a Task and a Date, and get a string back.
+type Task = { id: string; title: string; dueDate: string };
+function dueLabel(task: Task, today: Date): string {
+  return new Date(task.dueDate) < today ? "Overdue" : "Upcoming";
+}
+
+// Layer 2, lint: a rule like no-floating-promises flags a forgotten `await saveTask(task)`.
+
+// Layer 3, tests: check the logic the types can't see.
+test("past due dates are overdue", () => {
+  const task = { id: "t1", title: "Docs", dueDate: "2026-01-01" };
+  expect(dueLabel(task, new Date("2026-02-01"))).toBe("Overdue");
+});
+
+// Layer 4, runtime validation: check outside data before trusting it.
+const TaskSchema = z.object({ id: z.string(), title: z.string(), dueDate: z.string() });
+const response = await fetch("/api/tasks/t1");
+const task = TaskSchema.parse(await response.json()); // throws if the shape is wrong
+```
+
+You'll build these layers properly in [Chapter 27](/chapter/27) (lint and tests), [Chapter 32](/chapter/32) (runtime validation), and [Chapter 66](/chapter/66) (what each layer is for).
+
+## Common mistakes
+
+> ⚠️ **Believing annotations validate data.** `const user: User = await response.json()` checks nothing at runtime. It's a promise *you* made to the compiler. Data from outside your program must be validated with real code ([Chapter 32](/chapter/32)).
+
+> ⚠️ **Thinking TypeScript makes code faster.** The emitted JavaScript is essentially the code you wrote, minus the types. TypeScript can't optimize anything, and it can't warn you about a slow algorithm.
+
+> ⚠️ **Expecting types to exist at runtime.** You can't test a value against a type alias or interface, and you can't branch on a generic `T`. If behavior must depend on a type, check the *value* (`typeof`, `instanceof`, a property check) instead.
+
+```ts
+type Task = { id: string; title: string };
+
+function isTask(value: unknown) {
+  return typeof value === Task; // ❌ 'Task' only refers to a type, but is being used as a value here.
+}
+```
+
+> ⚠️ **Treating "it compiled" as "it works".** Compiling proves your code is internally consistent. It says nothing about the data it will meet or whether the logic does what the product needs.
+
+## When to use it, and when not to
+
+> ✅ **Rely on types when** the question is about your own code: does this call match that function, does this property exist, can this value be `undefined`, did I handle every case? Types answer these completely and for free.
+
+> 🚫 **Don't rely on types when** data crosses a boundary into your program: HTTP responses, `JSON.parse`, `localStorage`, URL parameters, form input, environment variables. There, a type annotation is just a guess. Validate first, then let the types take over.
+
+## How it connects
+
+> 🔗 **Connection.** Compile time vs runtime is the first of the book's five threads. Next it shows up as `unknown`, the honest type for outside data ([Chapter 9](/chapter/9)), then as narrowing ([Chapter 14](/chapter/14)), runtime validation ([Chapter 32](/chapter/32)), API data in React ([Chapter 61](/chapter/61)), and the split between what types and tests catch ([Chapter 66](/chapter/66)).
+
+> 🌍 **Real world.** Codebases that take this seriously have a simple rule in their review checklist: "no `as` on external data." Every network response is parsed by a schema at the edge of the app, and everything inside can trust its types.
+
+## Exercises
+
+### Level 1 — Recall
+
+Write the JavaScript that `tsc` would emit for each snippet. Then check your answers in the Playground's ".JS" tab.
+
+```ts
+// 1
+let count: number = 0;
+
+// 2
+type Point = { x: number; y: number };
+const origin: Point = { x: 0, y: 0 };
+
+// 3
+interface User { id: string; name: string }
+function greet(user: User): string { return `Hi ${user.name}`; }
+
+// 4
+const input = document.getElementById("title") as HTMLInputElement;
+
+// 5
+function first<T>(items: T[]): T | undefined { return items[0]; }
+```
+
+### Level 2 — Application
+
+Write a short program that **type-checks with zero errors in strict mode but crashes at runtime**, where the only source of the problem is JSON input. Use `JSON.parse` on a string literal that you control. Then add one runtime check that turns the crash into a clear error message.
+
+### Level 3 — Challenge
+
+Most TypeScript syntax disappears on emit, but not all of it. Compile the code below and compare the output with the input. Explain why `enum` and the `private readonly id` **parameter property** are *not* simple erasure, and why tools that only strip types (like Node's built-in TypeScript support) reject them.
+
+```ts
+enum Priority { Low, Medium, High }
+
+class TaskRef {
+  constructor(private readonly id: string) {}
+}
+```
+
+*Hint: ask "if I deleted only the type syntax, would the program still behave the same?"*
+
+### Level 4 — Real-world
+
+**Ticket TF-003: Map TaskFlow's runtime boundaries.** The team wants a picture of everywhere types can't protect the app.
+
+- Pick an app you use daily (or TaskFlow as you imagine it) and draw its runtime boundaries: network calls, storage, URL and query parameters, user input, environment variables, and third-party scripts.
+- Mark each boundary with what data crosses it and what would happen if that data had the wrong shape.
+- Pick the two most dangerous boundaries and describe the runtime check you'd add at each.
+
+## Key takeaways
+
+- `tsc` **parses, type-checks, and emits**. Checking and emitting are independent, so errors don't block output by default.
+- **Type erasure** removes annotations, `type` aliases, and interfaces. The JavaScript that runs has no types.
+- **Compile time** is about your code's internal consistency; **runtime** is about the data the code actually meets.
+- TypeScript catches **typos, wrong arguments, missing properties, nullability, unhandled cases, and refactor misses**.
+- It can't catch **bad outside data, wrong logic, `as` lies, `any`, or runtime failures**. Those need tests and validation.
+- The **language service** is the same checker running inside your editor.
+- Runtime behavior (`this`, closures, the event loop) is **pure JavaScript**, so JavaScript knowledge stays essential.
+
+## What comes next
+
+TypeScript changes nothing about how JavaScript runs, so every gap in your JavaScript becomes a gap in your TypeScript. Before you install anything, [Chapter 4: JavaScript Readiness Checkpoint](/chapter/4) lets you test yourself on the JavaScript this book assumes, and tells you exactly which later chapters each concept unlocks.

@@ -1,0 +1,491 @@
+> 📖 **The problem.** A teammate's `TaskBoard` component stores four things in state: `tasks`, `doneTasks`, `doneCount`, and `hasTasks`. Every time a task is toggled there are four `setState` calls to keep in step. In one handler, someone updates three of them and forgets the fourth. Now the board shows "2 done" while the list shows three checked boxes, and the "empty" message is visible above a full list. Four pieces of state that disagree, produced by one missed line.
+
+You now know how to *store* anything in state ([Chapter 41](/chapter/41)). This chapter is about the harder skill: deciding **what** to store, **where** it should live, and **what to compute instead**. These decisions matter more than any hook API. Get them right and a whole class of bugs (the ones in your pain log from [Chapter 35](/chapter/35)) can't occur. Get them wrong, and no amount of careful `setState` calls will save you.
+
+> 🧠 **Mental model.** *Store the minimum; derive the rest. Every piece of data has exactly one owner, the closest common parent of everything that needs it.* If a value can be computed from state you already have, computing it is always safer than storing it.
+
+## 42.1 Minimal state
+
+Start with a test. For each value in a component, ask: **can I compute it from something I already have?** If yes, it is not state. The React docs list the questions precisely, and they are worth memorising:
+
+1. Does it **stay unchanged** over time? Then it's a constant, not state.
+2. Is it **passed in from a parent** via props? Then it's not *your* state.
+3. Can you **compute it** from other state or props? Then it isn't state.
+
+What's left (data that changes, isn't passed in, and can't be derived) is genuine state. Apply it to the problem component:
+
+```tsx
+function TaskBoard() {
+  const [tasks, setTasks] = useState<Task[]>([]);        // ✅ state: the source of truth
+  const [doneTasks, setDoneTasks] = useState<Task[]>([]); // ❌ computable: tasks.filter(t => t.done)
+  const [doneCount, setDoneCount] = useState(0);          // ❌ computable: doneTasks.length
+  const [hasTasks, setHasTasks] = useState(false);        // ❌ computable: tasks.length > 0
+  // …
+}
+```
+
+Three of the four are **redundant state**: copies of facts that already exist. Redundancy is the root of state bugs, since two copies of one fact can *disagree*, and then the question "which one is right?" has no answer.
+
+```tsx
+function TaskBoard() {
+  const [tasks, setTasks] = useState<Task[]>([]); // ✅ the only state
+
+  const doneTasks = tasks.filter((t) => t.done);  // derived, always consistent
+  const doneCount = doneTasks.length;
+  const hasTasks = tasks.length > 0;
+  // …
+}
+```
+
+The rewrite has fewer lines, fewer `set` calls, and *no way to be inconsistent*. When something looks wrong on screen, there is exactly one place the truth lives.
+
+> ⚠️ **Common mistake.** Copying props into state: `const [title, setTitle] = useState(props.title)`. After the first render, the state ignores later prop changes, so the two silently disagree. Use the prop directly unless you deliberately want an editable *draft* ([42.4](#424-controlled-and-uncontrolled-inputs)).
+
+## 42.2 Derived values
+
+A **derived value** is computed during render from state and props. You do not need an effect, a second state variable, or a synchronization step. You write ordinary code:
+
+```tsx
+function TaskBoard({ tasks, filter, query }: BoardProps) {
+  const visible = tasks
+    .filter((t) => filter === "all" || (filter === "done") === t.done)
+    .filter((t) => t.title.toLowerCase().includes(query.toLowerCase()));
+
+  const remaining = tasks.filter((t) => !t.done).length;
+  const summary = `${remaining} of ${tasks.length} left`;
+
+  return (
+    <>
+      <p>{summary}</p>
+      <ul>{visible.map((t) => <TaskRow key={t.id} task={t} />)}</ul>
+    </>
+  );
+}
+```
+
+The counter and the list cannot disagree, because they're recomputed from the same `tasks` on every render. Compare this with the imperative version from [Chapter 36](/chapter/36) where every mutation had to remember to update the counter.
+
+The most common wrong turn is reaching for an **effect** to "keep them in sync":
+
+```tsx
+// ❌ Anti-pattern: an effect that synchronizes state with other state
+const [visible, setVisible] = useState<Task[]>([]);
+useEffect(() => {
+  setVisible(tasks.filter((t) => t.done === (filter === "done")));
+}, [tasks, filter]);
+// Costs: an extra render with stale `visible`, a flicker, and the very bug class we're avoiding.
+```
+
+The effect version renders once with the stale list, then again with the right list. The derived version renders once, correctly. [Chapter 44](/chapter/44) explains when effects *are* the right tool (synchronizing with something outside React), and "computing a value from state" isn't one of them.
+
+> 💡 **Tip.** If the computation is genuinely expensive, you can cache it with `useMemo` ([Chapter 47](/chapter/47)). But measure first: filtering a few hundred items on each render is effectively free.
+
+## 42.3 Principles of state structure
+
+Once you know *what* to store, shape it well. Five principles cover most situations.
+
+**1. Group related state.** If two variables always change together, merge them into one. Two separate values for the coordinates of a drag can fall out of step:
+
+```tsx
+// ❌ Two separate updates that must always travel together
+const [x, setX] = useState(0);
+const [y, setY] = useState(0);
+
+// ✅ One value, one update
+const [position, setPosition] = useState({ x: 0, y: 0 });
+```
+
+**2. Avoid contradictions.** State like `isSending` plus `isSent` allows `{ true, true }`, which means nothing. Use one variable with a union ([Chapter 34](/chapter/34)):
+
+```tsx
+type SaveStatus = "idle" | "saving" | "saved" | "error";
+const [status, setStatus] = useState<SaveStatus>("idle"); // impossible combinations are unrepresentable
+```
+
+**3. Avoid duplication.** If the same data appears in two places, you must update both. The classic case is storing the *selected object* as well as the list that contains it:
+
+```tsx
+// ❌ `selected` is a copy: edit the task in `tasks` and `selected` is now stale
+const [tasks, setTasks] = useState<Task[]>(initialTasks);
+const [selected, setSelected] = useState<Task | null>(null);
+
+// ✅ Store the id; look the object up. One copy of each task, always current.
+const [selectedId, setSelectedId] = useState<string | null>(null);
+const selected = tasks.find((t) => t.id === selectedId) ?? null;
+```
+
+**4. Avoid deeply nested state.** Updating `project.sections[2].tasks[5].done` requires copying four levels of objects. **Flatten** it: keep tasks in one array with a `sectionId` on each, and group during render.
+
+```tsx
+// ✅ Flat state, grouped when displayed
+const [tasks, setTasks] = useState<Task[]>([]);       // each task has a projectId
+const byProject = Object.groupBy(tasks, (t) => t.projectId); // derived: Partial<Record<string, Task[]>>
+```
+
+**5. Avoid redundant state.** (That's 42.1 again, and it's the one that matters most.)
+
+## 42.4 Controlled and uncontrolled inputs
+
+A form input has its own memory: the browser tracks what the user typed. So there are two designs for who "owns" the text.
+
+An **uncontrolled** input lets the DOM keep the value. You give it only a starting point with `defaultValue`, and read the value when you need it (on submit, say):
+
+```tsx
+function QuickAdd({ onAdd }: { onAdd: (title: string) => void }) {
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        const title = new FormData(e.currentTarget).get("title");
+        if (typeof title === "string" && title.trim()) onAdd(title.trim());
+        e.currentTarget.reset();
+      }}
+    >
+      <input name="title" defaultValue="" />
+      <button>Add</button>
+    </form>
+  );
+}
+```
+
+A **controlled** input makes React state the single source of truth. You pass `value`, and a handler that updates it on every keystroke:
+
+```tsx
+function SearchBox({ onSearch }: { onSearch: (q: string) => void }) {
+  const [query, setQuery] = useState("");
+
+  return (
+    <input
+      value={query}                                   // what the input shows comes from state…
+      onChange={(e) => {
+        setQuery(e.target.value);                     // …and every edit goes through state
+        onSearch(e.target.value);
+      }}
+    />
+  );
+}
+```
+
+Because the text is in state, other parts of the UI can *react* to it (live search, validation messages, a "characters left" counter), and you can change it programmatically (clear it, force upper case). That's why controlled inputs are the default for anything interactive.
+
+```tsx
+<input value={query} />   // ⚠️ React warns: "You provided a `value` prop to a form field without an `onChange` handler…"
+                          // The field becomes read-only: the DOM can't change it, only state can.
+```
+
+| | Controlled | Uncontrolled |
+|---|---|---|
+| Source of truth | React state | The DOM |
+| Props | `value` + `onChange` | `defaultValue` (and a `name` for `FormData`) |
+| Best for | Live validation, dependent UI, formatting | Simple submit-only forms, file inputs |
+| Cost | A re-render per keystroke | Can't react to changes as they happen |
+
+> ⚠️ **Common mistake.** Switching an input between uncontrolled and controlled, for example `value={undefined}` initially and a string later. React warns, because the input changes ownership mid-life. Always initialise controlled state with a string (`""`), never `undefined`.
+
+## 42.5 Lifting state up
+
+Suppose the filter tabs and the "N left" counter both need to know the active filter. Each one keeping its own copy is the duplication problem again:
+
+```tsx
+function FilterTabs() {
+  const [filter, setFilter] = useState<Filter>("all");  // owned here…
+  /* … */
+}
+function Counter({ tasks }: { tasks: Task[] }) {
+  // …but the counter needs it too, and has no way to see it
+}
+```
+
+The fix is to find the **closest common parent** of everything that needs the data, and move the state there. This is called **lifting state up**. The parent owns the state and passes it *down* as props, along with callbacks to *request* changes.
+
+```tsx
+function TaskApp() {
+  const [tasks, setTasks] = useState<Task[]>(initialTasks);
+  const [filter, setFilter] = useState<Filter>("all");        // lifted: both children need it
+
+  const visible = tasks.filter((t) => filter === "all" || (filter === "done") === t.done);
+  const remaining = tasks.filter((t) => !t.done).length;
+
+  return (
+    <>
+      <FilterTabs active={filter} onChange={setFilter} />      {/* data down, requests up */}
+      <Counter remaining={remaining} filter={filter} />
+      <TaskList tasks={visible} />
+    </>
+  );
+}
+
+function FilterTabs({ active, onChange }: { active: Filter; onChange: (f: Filter) => void }) {
+  return (
+    <nav>
+      {(["all", "active", "done"] as const).map((f) => (
+        <button key={f} aria-pressed={f === active} onClick={() => onChange(f)}>{f}</button>
+      ))}
+    </nav>
+  );
+}
+```
+
+`FilterTabs` is now a **controlled component**, in the same sense as the input in 42.4: its value comes from props and its changes go out through a callback. It has no memory of its own and is trivial to test and reuse.
+
+The mechanical steps: **(1)** remove state from the children, **(2)** pass the data down as props, **(3)** pass change handlers down, **(4)** add the state to the common parent.
+
+> 🔗 **Connection.** This is the "props down, events up" shape from [Chapter 36](/chapter/36) in action, and the same idea as the single-owner rule: one fact, one home.
+
+## 42.6 Sharing state between siblings
+
+Two components that are *siblings* (neither contains the other) can't talk to each other directly. They communicate **through their parent**: one calls a callback to change the parent's state, and the other receives the result as a prop. That's lifting, applied to a classic case: a list and a detail pane.
+
+```tsx
+function Inbox({ messages }: { messages: Message[] }) {
+  const [selectedId, setSelectedId] = useState<string | null>(null); // owned by the parent of both panes
+  const selected = messages.find((m) => m.id === selectedId) ?? null; // derived (42.3)
+
+  return (
+    <div className="split">
+      <MessageList messages={messages} selectedId={selectedId} onSelect={setSelectedId} />
+      <MessageDetail message={selected} />
+    </div>
+  );
+}
+```
+
+`MessageList` never imports `MessageDetail`, and neither knows the other exists. They agree only on the *shape of the contract* with `Inbox`, and each can be developed and tested separately.
+
+```tsx
+function MessageDetail({ message }: { message: Message | null }) {
+  if (message === null) return <p>Select a message.</p>;  // narrowing, again
+  return <article><h2>{message.subject}</h2><p>{message.body}</p></article>;
+}
+```
+
+Notice how the state holds an **id**, not the message (principle 3 of 42.3), so if the messages list refreshes, `selected` is recomputed from the fresh data.
+
+> 🚫 **When not to.** Don't lift state "just in case". If only one component uses a piece of state, leave it there. The next section is the counterweight to this one.
+
+## 42.7 State colocation
+
+Lifting has a failure mode: lift too eagerly, and everything ends up in `App`. Then every keystroke in a search box re-renders the whole application, every component is wired to every other, and nobody can tell which parts of the state are used where.
+
+The counter-principle is **colocation**: *keep state as low in the tree as possible, and as high as necessary.* State belongs in the lowest component that contains everything that needs it.
+
+```tsx
+// ❌ The draft text of a rarely-used comment box lives in App.
+function App() {
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [commentDraft, setCommentDraft] = useState("");   // only CommentBox ever uses this
+  /* … every keystroke in the comment box re-renders the entire app … */
+}
+
+// ✅ Colocated: the draft lives where it's used.
+function CommentBox({ onPost }: { onPost: (text: string) => void }) {
+  const [draft, setDraft] = useState("");
+  return (
+    <form onSubmit={(e) => { e.preventDefault(); onPost(draft); setDraft(""); }}>
+      <textarea value={draft} onChange={(e) => setDraft(e.target.value)} />
+      <button disabled={draft.trim() === ""}>Post</button>
+    </form>
+  );
+}
+```
+
+Think of it as a ladder. Start with state in the component that uses it. When a *second* component needs it, lift to their closest common parent, and not a step further. When lifting would pass props through many layers that don't care, that's the signal to consider composition or context ([Chapter 46](/chapter/46)).
+
+| Question | Answer |
+|---|---|
+| Does only this component use the state? | Keep it here |
+| Do two siblings use it? | Lift to their parent |
+| Does a distant subtree use it? | Lift higher, or use context |
+| Is it the same on the server, shared by many users? | It isn't UI state: see server state ([Chapter 62](/chapter/62)) |
+
+> ⚠️ **Common mistake.** Lifting everything to `App` "to be safe". Each lift widens the blast radius of every change, so lift only when a second consumer actually exists.
+
+## 42.8 Preserving and resetting state
+
+State is not stored *in* your component function. React stores it, keyed by the component's **position in the tree**. This explains two behaviors that otherwise feel mysterious.
+
+**State is preserved** as long as the same component stays at the same position:
+
+```tsx
+function Profile({ isEditing }: { isEditing: boolean }) {
+  return isEditing ? <NameField /> : <NameField />;  // same type, same position
+}
+// `NameField` keeps its internal state when isEditing flips. React sees the same component in the same slot.
+```
+
+**State is reset** when the component at that position changes type, or disappears from the tree and comes back:
+
+```tsx
+{isOn ? <Counter /> : <p>off</p>}  // Counter's state is destroyed each time it's removed, fresh at 0 when it returns
+```
+
+So what if you *want* a reset while the position stays the same? For example, a `TaskEditor` that shows task A, then the user selects task B. The editor's draft text from A would leak into B. The tool for this is **`key`**. A key is not only for lists: giving a component a different `key` tells React "this is a different instance", so it discards the old state.
+
+```tsx
+function TaskPane({ task }: { task: Task }) {
+  // ❌ Same position, same type: the draft typed for task A is still there when task B is selected
+  return <TaskEditor task={task} />;
+}
+
+function TaskPane2({ task }: { task: Task }) {
+  // ✅ A new key means a new instance: fresh state for every task
+  return <TaskEditor key={task.id} task={task} />;
+}
+```
+
+```tsx
+function TaskEditor({ task }: { task: Task }) {
+  const [draft, setDraft] = useState(task.title); // initial value is read only when this instance is created
+  /* … */
+}
+```
+
+This is also the *correct* fix for "state initialised from a prop goes stale": rather than an effect that copies the prop into state whenever it changes, give the component a `key` and let React recreate it.
+
+> 🆕 **Modern note.** A new `key` is cheaper and clearer than an effect-based reset in almost every case. If you find yourself writing `useEffect(() => setDraft(task.title), [task.id])`, switch to `key={task.id}`.
+
+## 42.9 Thinking in React, end to end
+
+Finally, here's the process that ties it together, for any UI you're asked to build. React's own docs call it "Thinking in React", and it has five steps. We'll apply it to the TaskFlow board with a search box, status filter, and list.
+
+**Step 1. Break the UI into a component hierarchy.** Draw boxes around what you see and name them; each box is a candidate component.
+
+```text
+TaskBoard
+├── SearchBox
+├── FilterTabs
+├── TaskList
+│   └── TaskRow  (× n)
+└── Counter
+```
+
+**Step 2. Build a static version with props.** Write the components using only props and no state. Hard-code the data, and get the markup right first.
+
+**Step 3. Find the minimal state.** List every changing piece of data, then apply the tests of 42.1:
+
+```text
+tasks            changes, can't be computed        → STATE
+query (search)   changes, can't be computed        → STATE
+filter           changes, can't be computed        → STATE
+visible tasks    computed from tasks+query+filter  → derived
+remaining count  computed from tasks              → derived
+```
+
+**Step 4. Decide where state lives.** Which components use each piece? `query` is used by `SearchBox` (display and edit) and `TaskList` (via the filtered list), so its closest common parent is `TaskBoard`. Same for `filter` and `tasks`.
+
+**Step 5. Add inverse data flow.** Children can't write to the parent's state, so pass callbacks: `onQueryChange`, `onFilterChange`, `onToggle`.
+
+```tsx
+export function TaskBoard({ initialTasks }: { initialTasks: Task[] }) {
+  const [tasks, setTasks] = useState(initialTasks);
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState<Filter>("all");
+
+  const visible = tasks
+    .filter((t) => filter === "all" || (filter === "done") === t.done)
+    .filter((t) => t.title.toLowerCase().includes(query.toLowerCase()));
+
+  function toggle(id: string) {
+    setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, done: !t.done } : t)));
+  }
+
+  return (
+    <>
+      <SearchBox value={query} onChange={setQuery} />
+      <FilterTabs active={filter} onChange={setFilter} />
+      <TaskList tasks={visible} onToggle={toggle} />
+      <Counter remaining={tasks.filter((t) => !t.done).length} />
+    </>
+  );
+}
+```
+
+Count the pieces of state: three. Count the derived values: two. Count the places that must be updated by hand when a task is toggled: one. Compare that to your pain log.
+
+## Common mistakes
+
+> ⚠️ **Syncing derived state with effects.** `useEffect(() => setVisible(...), [tasks])` creates an extra render and a window of inconsistency. Compute during render instead.
+
+> ⚠️ **Duplicating server data into local state.** Copying a fetched list into `useState` creates a second copy that goes stale. Keep it as the source of truth (or use a data-fetching library, [Chapter 62](/chapter/62)), and store only the *selection* or *draft* locally.
+
+> ⚠️ **Lifting everything to `App`.** Lift only when a second consumer needs the state.
+
+> ⚠️ **Storing a selected object instead of its id.** The copy goes stale when the list changes. Store the id and derive the object.
+
+> ⚠️ **Initialising state from props and expecting it to follow.** The initial value is read once. Use the prop directly, or reset with `key`.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** designing any component with more than one piece of state. Run the 42.1 questions *before* adding each `useState`. They take ten seconds and prevent the most common category of React bug.
+
+> 🚫 **When not to.** Don't over-apply "derive everything". A value that is *expensive* to compute and rarely changes may deserve memoization ([Chapter 47](/chapter/47)). And data that is genuinely independent (a draft that should survive a filter change) is state, even if it looks similar to something else.
+
+## How it connects
+
+> 🔗 **Connection.** Updating state immutably comes from [Chapter 41](/chapter/41), and the union-based state modelling from [Chapter 34](/chapter/34). The decision of when to use an effect versus a derived value continues in [Chapter 44](/chapter/44). When lifting means props pass through many layers, [Chapter 46](/chapter/46) offers context, and [Chapter 60](/chapter/60) covers where state lives in a large application. Typing these patterns deeply is the job of [Chapter 52](/chapter/52).
+
+## Exercises
+
+### Level 1 — Recall
+
+For each component, list the **redundant** state and say how to derive it:
+
+```tsx
+// A
+const [items, setItems] = useState<Task[]>([]);
+const [count, setCount] = useState(0);
+// B
+const [firstName, setFirst] = useState("");
+const [lastName, setLast] = useState("");
+const [fullName, setFull] = useState("");
+// C
+const [tasks, setTasks] = useState<Task[]>([]);
+const [selectedTask, setSelectedTask] = useState<Task | null>(null);
+// D
+const [isLoading, setIsLoading] = useState(false);
+const [isError, setIsError] = useState(false);
+const [isSuccess, setIsSuccess] = useState(false);
+```
+
+### Level 2 — Application
+
+Your P09 app has `FilterTabs` and `Counter` as siblings, each with their own copy of the filter. Lift the filter state so both use one copy, convert `FilterTabs` into a controlled component, and verify that selecting a tab updates the counter's label.
+
+### Level 3 — Challenge
+
+Refactor this "state soup" component to minimal state with derived values. You should end up with three `useState` calls or fewer, and no `useEffect`:
+
+```tsx
+function Board() {
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [visible, setVisible] = useState<Task[]>([]);
+  const [filter, setFilter] = useState<Filter>("all");
+  const [doneCount, setDoneCount] = useState(0);
+  const [isEmpty, setIsEmpty] = useState(true);
+  useEffect(() => { /* updates visible, doneCount, isEmpty whenever tasks or filter change */ }, [tasks, filter]);
+}
+```
+
+### Level 4 — Real-world
+
+**Ticket TF-430: Two-pane task inbox.** Build an email-style UI: a list of tasks on the left, the selected task's details and an editable title on the right.
+
+- State ownership is documented in a comment: which component owns the tasks, the selection, and the draft title, and why.
+- Selecting a different task never shows the previous task's unsaved draft (fix with `key`, not an effect).
+- Deleting the selected task shows an empty detail pane without errors (store the id, not the object).
+- No derived value is stored in state.
+
+## Key takeaways
+
+- **Store the minimum; derive the rest.** If you can compute it from state or props, it isn't state.
+- Redundant, duplicated, or contradictory state lets copies disagree. Prefer one source of truth and unions over boolean piles.
+- Controlled inputs keep their value in React state (`value` + `onChange`). Uncontrolled inputs leave it with the DOM (`defaultValue`).
+- **Lift state up** to the closest common parent, then pass data down and callbacks up. **Colocate** it as low as possible otherwise.
+- State belongs to a **position in the tree**: the same component in the same place keeps its state, and a different `key` resets it.
+- Store ids rather than objects when selecting from a list.
+
+## What comes next
+
+You now know what state is and where it should live. But *how* does a function component remember anything between renders, and why must hooks be called in a strict order? [Chapter 43: Hooks: The Mental Model](/chapter/43) answers that, and then frames each hook as the answer to a question.
+
+

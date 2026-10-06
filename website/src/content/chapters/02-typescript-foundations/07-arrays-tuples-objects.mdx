@@ -1,0 +1,346 @@
+> 📖 **The problem.** TaskFlow imports a CSV export. Each row is parsed into `["Ada", "ada@example.com", 36]`: a name, an email, and an age. A teammate types the result as `string[]` because "it's an array", and then writes `row[2].toFixed(0)`. It doesn't compile, so they cast it away, and the code ships. Meanwhile, a different function builds a `user` object that is missing its `email`, and nobody notices until a welcome email goes to `undefined`.
+
+Real data is rarely a single value. It's lists of things, fixed sequences of different things, and records with named fields. This chapter gives you the vocabulary for all three: **arrays**, **tuples**, and **object types**. It also covers the modifiers that make them precise (`readonly` and optional properties) and the one compiler flag that makes array indexing honest.
+
+By the end, you'll be able to type any JSON-shaped data by hand, and you'll know when a tuple is a smart choice and when an object would be clearer.
+
+> 🧠 **Mental model.** **Arrays describe "many of the same". Tuples describe "a fixed sequence of specific things". Object types describe "a shape with named slots".** When you describe data, first ask which of the three it is.
+
+## 7.1 Array types
+
+An array type says "any number of elements, all of this type". There are two spellings, and they mean exactly the same thing:
+
+```ts
+const titles: string[] = ["Write docs", "Fix bug"];       // the everyday form
+const scores: Array<number> = [90, 72, 85];                // the generic form
+```
+
+`string[]` is shorter, and most code uses it. `Array<string>` is the first time you see **generic syntax**: angle brackets that pass a type *into* another type, as if the type were a function taking an argument. The idea gets a full chapter in [Chapter 16](/chapter/16). For now, read `Array<number>` as "an array of number".
+
+Arrays of objects are the most common shape in real code. Name the element type first, then say "list of that":
+
+```ts
+interface Task {
+  id: string;
+  title: string;
+  done: boolean;
+}
+
+const tasks: Task[] = [
+  { id: "t1", title: "Write docs", done: false },
+  { id: "t2", title: "Fix bug", done: true },
+];
+
+tasks.push({ id: "t3", title: "Ship", done: false });   // ✅
+tasks.push("Ship");   // ❌ Argument of type 'string' is not assignable to parameter of type 'Task'.
+```
+
+Two details to watch. First, a union element type needs parentheses, because `[]` binds tighter than `|`:
+
+```ts
+const mixed: (string | number)[] = [1, "a"];  // ✅ an array whose elements are string OR number
+const oops: string | number[] = ["a"];       // ❌ Type 'string[]' is not assignable to type 'string | number[]'.
+                                              //    this means "a string, or an array of numbers"
+```
+
+Second, nested arrays just stack the brackets: `number[][]` is "an array of arrays of number", which is how a grid or matrix is typed.
+
+> 💡 **Tip.** Most of the time you won't annotate arrays at all. `const tags = ["ui", "docs"]` already infers `string[]`. Annotate when the array starts empty (`const selected: Task[] = []`).
+
+## 7.2 Readonly arrays
+
+A function that receives an array can change it, and the caller often doesn't expect that. A `readonly` array type removes the mutating methods (`push`, `pop`, `splice`, `sort`, and so on) and forbids assigning to an index:
+
+```ts
+const days: readonly string[] = ["Mon", "Tue", "Wed"];
+// equivalent spelling: ReadonlyArray<string>
+
+days.push("Thu");   // ❌ Property 'push' does not exist on type 'readonly string[]'.
+days[0] = "Sun";    // ❌ Index signature in type 'readonly string[]' only permits reading.
+days.map((d) => d.toUpperCase());   // ✅ non-mutating methods still work
+```
+
+The rule of thumb: **functions should accept `readonly` arrays when they only read**. A mutable array is assignable to a readonly one, so every caller can still use your function. The reverse isn't true:
+
+```ts
+function totalScore(scores: readonly number[]): number {
+  return scores.reduce((sum, n) => sum + n, 0);   // reads only
+}
+
+const mine: number[] = [1, 2, 3];
+totalScore(mine);          // ✅ mutable → readonly is fine
+totalScore([4, 5]);        // ✅
+
+const fixed: readonly string[] = ["a"];
+const editable: string[] = fixed;
+// ❌ The type 'readonly string[]' is 'readonly' and cannot be assigned to the mutable type 'string[]'.
+```
+
+That asymmetry is deliberate. A `readonly` parameter is a **promise from your function** that it won't mutate the caller's data. It documents intent and stops accidental mutation, which matters in React, where mutating state is a bug ([Chapter 41](/chapter/41)).
+
+> ⚠️ **Common mistake.** Taking `string[]` when you only read. It forces callers who hold a `readonly string[]` to copy their data just to call you.
+
+## 7.3 Tuples
+
+A **tuple** is an array with a fixed length where each position has its own type. It's the right type for the CSV row in our opening story:
+
+```ts
+const row: [string, string, number] = ["Ada", "ada@example.com", 36];
+
+const [name, email, age] = row;     // name: string, email: string, age: number
+row[2].toFixed(0);                   // ✅ position 2 is known to be a number
+row[3];                              // ❌ Tuple type '[string, string, number]' of length '3' has no element at index '3'.
+
+const short: [string, string, number] = ["Ada", "ada@example.com"];
+// ❌ Type '[string, string]' is not assignable to type '[string, string, number]'.
+//    Source has 2 element(s) but target requires 3.
+```
+
+Plain `string[]` would have lost everything: the length, and the fact that position 2 is a number.
+
+Tuples can have **labels** (documentation only, for readable hovers), **optional** elements, and a **rest** element:
+
+```ts
+type Range = [start: number, end: number];            // labels show up in editor hovers
+type Point = [x: number, y: number, z?: number];      // optional third coordinate
+type Log = [level: string, ...messages: string[]];    // one level, then any number of messages
+
+const range: Range = [0, 10];
+const log: Log = ["warn", "disk almost full", "retry in 5s"];
+```
+
+Tuples return in React. `useState` returns a tuple, `[value, setValue]`, which is why you can name the two parts whatever you like when destructuring ([Chapter 41](/chapter/41)).
+
+> 🚫 **When not to.** A tuple's meaning lives in *position*, and position is easy to forget. For two values, a tuple is fine. Beyond three, or whenever readers must remember "which one was the email?", use an object type (next section). `{ name, email, age }` documents itself and can't be reordered by accident.
+
+> ⚠️ **Common mistake.** Assuming a tuple's length is enforced everywhere. TypeScript still lets `row.push(1)` compile, since `push` is on every array. Use `readonly [string, string, number]` when the tuple must stay fixed.
+
+## 7.4 Object types
+
+An **object type** lists property names and the type of each. You can write it inline, right where it's used, or name it (naming is the subject of [Chapter 8](/chapter/8)):
+
+```ts
+const user: { name: string; age: number } = { name: "Ada", age: 36 };
+
+function greet(u: { name: string }): string {
+  return `Hello, ${u.name}`;
+}
+greet(user);   // ✅ user has a name (extra properties are fine for a variable)
+```
+
+Property access is checked against the type, so typos become errors:
+
+```ts
+user.name.toUpperCase();   // ✅
+user.email;                // ❌ Property 'email' does not exist on type '{ name: string; age: number; }'.
+user.age.toUpperCase();    // ❌ Property 'toUpperCase' does not exist on type 'number'.
+```
+
+Objects nest, and every level is typed. Hovering shows the whole structure, and each access is checked all the way down:
+
+```ts
+const project = {
+  name: "TaskFlow",
+  owner: { id: "u1", name: "Ada" },
+  settings: { theme: "dark", notifications: { email: true, push: false } },
+};
+
+project.settings.notifications.email;   // boolean
+project.owner.id;                       // string
+```
+
+One check surprises beginners. When you write an **object literal** directly where a type is expected, TypeScript rejects properties it doesn't know about, since a literal with an unknown key is almost always a typo:
+
+```ts
+interface Task { id: string; title: string; done: boolean }
+
+const t: Task = { id: "t1", title: "Docs", done: false, priorty: 1 };
+// ❌ Object literal may only specify known properties, and 'priorty' does not exist in type 'Task'.
+```
+
+This *excess property check* applies only to fresh literals, not to variables that already exist. [Chapter 12](/chapter/12) explains why.
+
+## 7.5 Optional properties
+
+A property followed by `?` may be left out entirely. Reading it gives `T | undefined`, so TypeScript makes you handle the missing case:
+
+```ts
+interface Task {
+  id: string;
+  title: string;
+  dueDate?: string;   // may be absent
+}
+
+const a: Task = { id: "t1", title: "Docs" };               // ✅ no dueDate
+const b: Task = { id: "t2", title: "Ship", dueDate: "2026-12-01" };
+
+function label(task: Task): string {
+  return task.dueDate.toUpperCase();   // ❌ 'task.dueDate' is possibly 'undefined'.
+}
+function safeLabel(task: Task): string {
+  return task.dueDate?.toUpperCase() ?? "no due date";   // ✅
+}
+```
+
+Optional (`dueDate?: string`) and `dueDate: string | undefined` look alike but differ in one way: the second **must be present**, even if its value is `undefined`.
+
+```ts
+type A = { nick?: string };
+type B = { nick: string | undefined };
+
+const a1: A = {};                   // ✅ the key can be omitted
+const b1: B = {};                   // ❌ Property 'nick' is missing in type '{}' but required in type 'B'.
+const b2: B = { nick: undefined };  // ✅ present, with the value undefined
+```
+
+Use `?` for "this may not exist" (an optional setting). Use `T | undefined` when the key must always be present and "no value" is a real state you want callers to write down explicitly.
+
+> 🆕 **Modern note.** The `exactOptionalPropertyTypes` flag goes further: with it, `nick?: string` forbids assigning `undefined` explicitly. It is not part of `strict`, and most projects leave it off.
+
+## 7.6 Readonly properties
+
+Put `readonly` before a property name and TypeScript refuses to assign to it after creation:
+
+```ts
+interface Task {
+  readonly id: string;   // identity should never change
+  title: string;
+}
+
+const task: Task = { id: "t1", title: "Docs" };
+task.title = "Better docs";   // ✅
+task.id = "t2";               // ❌ Cannot assign to 'id' because it is a read-only property.
+```
+
+The crucial caveat: `readonly` is **shallow** and **compile-time only**. It protects the property slot itself, not what the property points to, and it vanishes at runtime ([Chapter 3](/chapter/3)).
+
+```ts
+interface Project {
+  readonly name: string;
+  readonly tasks: Task[];
+}
+
+const p: Project = { name: "TaskFlow", tasks: [] };
+p.tasks = [];                                    // ❌ Cannot assign to 'tasks' because it is a read-only property.
+p.tasks.push({ id: "t3", title: "New" });        // ✅ compiles: the array itself is still mutable!
+```
+
+To make the contents immutable too, say so at each level: `readonly tasks: readonly Task[]`. Prefer this for data that should not change. A utility type, `Readonly<T>`, applies one level of `readonly` to every property at once ([Chapter 21](/chapter/21)).
+
+> ⚠️ **Common mistake.** Assuming `readonly` is deep, or that it protects data at runtime. JavaScript's `Object.freeze` enforces at runtime (also shallowly). `readonly` is a statement for the compiler and for readers.
+
+## 7.7 Indexing safely
+
+Here is a question the type system has to answer: what is `tasks[5]` when the array only has two items? At runtime it's `undefined`. By default, TypeScript ignores that and pretends every index holds an element:
+
+```ts
+const tasks: Task[] = [];
+const first = tasks[0];   // first: Task   (a lie: it is actually undefined)
+first.title;              // compiles, then 💥 TypeError: Cannot read properties of undefined
+```
+
+Turn on **`noUncheckedIndexedAccess`** in `tsconfig.json`, and every index access picks up `| undefined`:
+
+```json
+{ "compilerOptions": { "strict": true, "noUncheckedIndexedAccess": true } }
+```
+
+```ts
+const first = tasks[0];   // first: Task | undefined
+first.title;              // ❌ 'first' is possibly 'undefined'.
+
+if (first) {
+  first.title;            // ✅ narrowed to Task
+}
+tasks[0]?.title;          // ✅ optional chaining
+tasks.at(0);              // ✅ Task | undefined: always honest
+```
+
+This book enables the flag everywhere. The noise is small, because the patterns that avoid indexing are better anyway: loop with `for...of`, use `find`, `map`, and `filter`, and destructure with a guard.
+
+```ts
+for (const task of tasks) {
+  task.title;                            // ✅ task: Task, no undefined
+}
+
+for (let i = 0; i < tasks.length; i++) {
+  tasks[i].title;                        // ❌ Object is possibly 'undefined'.
+}
+
+const lookup: Record<string, number> = {};
+const n = lookup["missing"];             // n: number | undefined
+```
+
+The flag isn't perfect: it can't know that `i < tasks.length` makes `tasks[i]` safe, so use `for...of` in cases like that rather than fighting it.
+
+> 💡 **Tip.** Treat `undefined` from an index as a *real* possibility, because it is. A short `if` or a default value is cheaper than an incident.
+
+## Common mistakes
+
+> ⚠️ **Tuples where an object would be clearer.** `[string, string, number, boolean]` forces readers to count positions. If the parts have different meanings and there are more than two or three, name them with an object type.
+
+> ⚠️ **Assuming `readonly` is deep.** `readonly tasks: Task[]` stops reassignment, not `push`. Write `readonly Task[]` to protect the contents too.
+
+> ⚠️ **Trusting `arr[i]` without a bounds check.** Without `noUncheckedIndexedAccess`, TypeScript reports `Task` for an index that may not exist. Turn the flag on and handle the `undefined`.
+
+> ⚠️ **Confusing `string | number[]` with `(string | number)[]`.** The first is "a string, or an array of numbers". The parentheses matter.
+
+> ⚠️ **Using `?` and `| undefined` interchangeably.** One lets the key be absent; the other requires the key to be present.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** modeling collections (`T[]`), fixed pairs and triples whose positions are obvious (`[x, y]`, `[value, setValue]`), and records with named fields (object types). Prefer `readonly` for parameters you only read.
+
+> 🚫 **When not to.** Don't use a tuple for a record with many parts. Don't type a function parameter as a mutable array if you only read it. Don't write `Array<Task>` and `Task[]` in the same codebase, since consistency helps readers; pick `T[]`.
+
+## How it connects
+
+> 🔗 **Connection.** Naming object types is [Chapter 8](/chapter/8); the full story of interfaces versus aliases is [Chapter 12](/chapter/12). Tuples reappear as React hooks' return values ([Chapter 41](/chapter/41) and [Chapter 56](/chapter/56)), and `readonly` arrays return in [Chapter 77](/chapter/77) when we talk about variance. `Array<string>` is your first generic; the idea is generalized in [Chapter 16](/chapter/16).
+
+> 🌍 **Real world.** Type definitions for API responses are mostly nested object types and arrays of them. Hand-typing one real JSON response (exercise Level 4) is the fastest way to build the skill.
+
+## Exercises
+
+### Level 1 — Recall
+
+Write a type for each sample. Decide whether it is an array, a tuple, or an object type, and say why.
+
+```ts
+const coordinates = [59.91, 10.75];
+const color = [255, 128, 0];                      // red, green, blue
+const product = { sku: "A-1", name: "Mug", price: 12.5, tags: ["kitchen"] };
+const cart = [{ sku: "A-1", quantity: 2 }, { sku: "B-9", quantity: 1 }];
+const entry = ["2026-01-01", "login", true];      // date, event, success
+```
+
+### Level 2 — Application
+
+Type a function `withDone(tasks, id)` that returns a **new** array in which the task with the given `id` has `done: true`. It must accept `readonly` input and must not mutate it. Write the call site, and confirm that passing a `readonly Task[]` compiles but calling `tasks.push` inside the function doesn't.
+
+### Level 3 — Challenge
+
+Model a chessboard **square** and a **move** as types. Decide: is a square a tuple like `[file, rank]` or an object like `{ file, rank }`? Is a move two squares, or an object with a piece, a `from`, and a `to`? Write down your reasoning in two or three sentences each: what does each choice make easier to read, and what does it make easier to get wrong?
+
+*Hint: compare how `move[0][1]` and `move.from.rank` read in code review.*
+
+### Level 4 — Real-world
+
+**Ticket TF-007: Type the weather API.** The dashboard will show forecasts from a public weather service, and the response is currently treated as `any`.
+
+- Take a real JSON response from a public weather API (a saved sample file is fine) and write the types for it by hand: nested objects, arrays of objects, optional fields, and at least one tuple (for example coordinates).
+- Mark fields that never change as `readonly`, and arrays you only read as `readonly`.
+- Write a function `describeToday(response)` that returns a one-line summary. Compile with `noUncheckedIndexedAccess` on and deal with every `undefined` it reports.
+- List any field where you were unsure whether it was optional, and how you decided.
+
+## Key takeaways
+
+- **Arrays** are "many of the same" (`T[]`); **tuples** are "a fixed sequence of specific things"; **object types** are "a shape with named slots".
+- Accept `readonly` arrays when you only read; mutable arrays are assignable to them, not the other way round.
+- Prefer an object type over a tuple once the positions stop being obvious.
+- `prop?: T` means the key may be absent; `prop: T | undefined` means it must be present.
+- `readonly` is shallow and compile-time only.
+- Turn on `noUncheckedIndexedAccess` so that `arr[i]` admits it might be `undefined`.
+
+## What comes next
+
+You've now written the same inline object type in more than one place, and you can feel it: copy a six-property type into eight function signatures and one copy is bound to drift. The fix is to **give types names**. [Chapter 8](/chapter/8) covers type aliases, interfaces, literal types, and the enum debate.

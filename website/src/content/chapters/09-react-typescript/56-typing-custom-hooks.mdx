@@ -1,0 +1,403 @@
+> 📖 **The problem.** You write a tiny, friendly hook: `useToggle()` returns `[value, toggle]`. A teammate uses it as `const [open, toggleOpen] = useToggle()` and then writes `<button onClick={toggleOpen}>`. TypeScript objects: `open` is typed `boolean | (() => void)`, and so is `toggleOpen`. Both variables have *both* types. What happened to the tuple?
+
+TypeScript saw an array literal `[value, toggle]` and did what it always does: widened it to an **array** (`(boolean | (() => void))[]`), forgetting which position held what. The fix is one keyword, but the lesson is bigger: a custom hook is a function other people will call, so its *public types* deserve the same care as any library API. This chapter covers typing parameters and return values, deciding between tuples and objects, writing generic hooks that don't lie, and testing a hook's types. By the end, you'll write hooks whose signatures are easy to use correctly and hard to use wrong.
+
+> 🧠 **Mental model.** **A custom hook is a function, so type it like a public function:** precise parameters, deliberate return types, and generics only where a caller's type must flow through.
+
+## 56.1 Typed parameters
+
+Hooks take parameters like any function, and the same advice applies: keep them few, and use an **options object** once there are more than two or any are optional. An options object gives names to arguments at the call site and lets you add settings later without breaking callers.
+
+```tsx
+type UseDebouncedValueOptions = {
+  delayMs?: number;      // default 300
+  disabled?: boolean;    // default false: when true, the value passes through immediately
+};
+
+function useDebouncedValue<T>(value: T, { delayMs = 300, disabled = false }: UseDebouncedValueOptions = {}): T {
+  const [debounced, setDebounced] = useState(value);
+
+  useEffect(() => {
+    if (disabled) return;
+    const id = setTimeout(() => setDebounced(value), delayMs);
+    return () => clearTimeout(id);
+  }, [value, delayMs, disabled]);
+
+  return disabled ? value : debounced;
+}
+
+const query = useDebouncedValue(searchText);                   // ✅ defaults
+const slow = useDebouncedValue(searchText, { delayMs: 1000 }); // ✅ named option
+const bad = useDebouncedValue(searchText, 1000);
+// ❌ Argument of type 'number' is not assignable to parameter of type 'UseDebouncedValueOptions'.
+```
+
+Two defaults deserve attention. Destructuring defaults (`delayMs = 300`) make the property optional *in the type* and fill it in at runtime, so the body sees a plain `number`. And the trailing `= {}` lets the caller omit the options entirely.
+
+The type parameter `T` earns its place by appearing twice, in the input and the output ([Chapter 16](/chapter/16)): pass a `string`, and get a `string` back.
+
+## 56.2 Typed return values
+
+A hook usually returns more than one thing. There are two good shapes, and one trap. A **tuple** keeps names free for the caller, like `useState` does. An **object** gives names to the fields, like most data-fetching hooks. The trap is returning an array literal and letting TypeScript widen it:
+
+```tsx
+function useToggle(initial = false) {
+  const [value, setValue] = useState(initial);
+  const toggle = useCallback(() => setValue((v) => !v), []);
+  return [value, toggle]; // inferred: (boolean | (() => void))[], the tuple fell apart
+}
+
+const [open, toggleOpen] = useToggle();
+// open: boolean | (() => void)       ← both variables get the union
+// toggleOpen: boolean | (() => void)
+toggleOpen();
+// ❌ This expression is not callable. Not all constituents of type 'boolean | (() => void)' are callable.
+```
+
+`as const` freezes the literal into a **readonly tuple**, so each position keeps its own type:
+
+```tsx
+function useToggle(initial = false) {
+  const [value, setValue] = useState(initial);
+  const toggle = useCallback(() => setValue((v) => !v), []);
+  return [value, toggle] as const; // readonly [value: boolean, toggle: () => void]
+}
+
+const [open, toggleOpen] = useToggle(); // open: boolean, toggleOpen: () => void  ✅
+```
+
+Choose by this rule:
+
+| Return | Use when | Why |
+|---|---|---|
+| Tuple `as const` | One or two values, and callers will want to **rename** them | Mirrors `useState`: `[open, toggleOpen]`, `[muted, toggleMuted]` |
+| Object | Three or more values, or some are optional | Callers pick only what they need; adding a field breaks nobody |
+
+```tsx
+function useTaskList() {
+  // …
+  return { tasks, isLoading, error, add, remove, refresh }; // ✅ an object: callers destructure what they use
+}
+```
+
+> ⚠️ **Common mistake.** Returning a tuple with five elements. Nobody remembers the order, and inserting one in the middle breaks every caller. Past two, return an object.
+
+## 56.3 Inferred vs explicit return types
+
+Should you write the return type, or let TypeScript infer it? For **application-internal** hooks, inference is fine: it's less to maintain, and a wrong return type shows up at the call site anyway. For hooks that are a **public API** (shared across teams, exported from a package), write it down, for three reasons: it documents the contract, it stops an accidental change in the body from silently changing the contract, and it gives better error messages.
+
+```tsx
+// Explicit: the contract is visible without reading the body
+type UseToggleResult = readonly [value: boolean, toggle: () => void];
+
+function useToggle(initial = false): UseToggleResult {
+  const [value, setValue] = useState(initial);
+  const toggle = useCallback(() => setValue((v) => !v), []);
+  return [value, toggle]; // ✅ checked against UseToggleResult; no `as const` needed
+}
+```
+
+With a declared return type, the array literal is *contextually typed* as a tuple, so `as const` isn't needed. A mistake inside the body gets caught right there:
+
+```tsx
+function useToggle(initial = false): UseToggleResult {
+  // …
+  return [toggle, value];
+  // ❌ Type '() => void' is not assignable to type 'boolean'.
+}
+```
+
+Labeled tuple elements (`value: boolean`) cost nothing and show up in editor tooltips, so the caller sees `useToggle(): [value: boolean, toggle: () => void]`.
+
+> 💡 **Tip.** A good rule of thumb: infer in the app, annotate at the boundary. If a hook is imported from another package or feature folder, annotate it.
+
+## 56.4 Generic custom hooks
+
+Some hooks work for *any* kind of value: a localStorage-backed state, a "previous value" tracker, a debounced value. The type of the value must flow through, in and out. That's the signal for a generic hook ([Chapter 16](/chapter/16)). The classic example is `useLocalStorage<T>`, where `T` is inferred from the initial value, just like `useState`:
+
+```tsx
+import { useState, type Dispatch, type SetStateAction } from "react";
+
+function useLocalStorage<T>(key: string, initial: T): readonly [T, Dispatch<SetStateAction<T>>] {
+  const [value, setValue] = useState<T>(() => {
+    const raw = localStorage.getItem(key);
+    return raw === null ? initial : (JSON.parse(raw) as T); // ⚠️ an unchecked assertion: see 56.5
+  });
+
+  function update(next: SetStateAction<T>) {
+    setValue((prev) => {
+      const resolved = typeof next === "function" ? (next as (p: T) => T)(prev) : next;
+      localStorage.setItem(key, JSON.stringify(resolved));
+      return resolved;
+    });
+  }
+  return [value, update];
+}
+
+const [pageSize, setPageSize] = useLocalStorage("pageSize", 20);
+// pageSize: number, setPageSize: Dispatch<SetStateAction<number>>
+setPageSize("big"); // ❌ Argument of type 'string' is not assignable to parameter of type 'SetStateAction<number>'.
+```
+
+`T` is inferred from `initial`, so most callers write no angle brackets. And since inference *widens* literals (like `useState`), a narrower type needs the type argument:
+
+```tsx
+const [status, setStatus] = useLocalStorage("lastStatus", "todo");
+// status: string: too wide
+
+const [status2, setStatus2] = useLocalStorage<TaskStatus>("lastStatus", "todo");
+// status2: TaskStatus ✅
+```
+
+Notice the return type, written out as `readonly [T, Dispatch<SetStateAction<T>>]`. This hook is a public API (see 56.3), so the type is written out. `Dispatch<SetStateAction<T>>` is exactly the type of a `useState` setter, so consumers can pass it anywhere a setter is expected.
+
+## 56.5 Parsers instead of lies
+
+Look at the line marked ⚠️ above. `JSON.parse` returns `any`, and `as T` tells TypeScript "trust me": but the string in storage could be anything, from an older app version, from another tab, or from a user poking at devtools. The type parameter `T` appears in the output but nothing *produces* a `T`. That's a **lying generic** ([Chapter 16](/chapter/16)): an assertion dressed up as a type.
+
+The same trap appears even more often in data fetching:
+
+```tsx
+function useFetch<T>(url: string): { data: T | null; error: Error | null } {
+  // fetch(url).then(r => r.json()) returns any; T is whatever the caller claimed
+  // …
+}
+
+const { data } = useFetch<User>("/api/me");
+data?.name.toUpperCase(); // compiles. If the server returns { fullName: "…" }, it crashes at runtime
+```
+
+The fix is to make the type *earned*: require the caller to pass a **parser**, a function that takes `unknown` and either returns a `T` or throws. Now `T` is inferred from the parser, and it's checked at runtime.
+
+```tsx
+function useFetch<T>(url: string, parse: (data: unknown) => T): AsyncState<T> {
+  const [state, setState] = useState<AsyncState<T>>({ status: "loading" });
+  useEffect(() => {
+    let cancelled = false;
+    fetch(url)
+      .then((r) => r.json() as Promise<unknown>)
+      .then(parse)                                                     // unknown → T, or throws
+      .then((data) => !cancelled && setState({ status: "success", data }))
+      .catch((e: unknown) => !cancelled && setState({ status: "error", error: e instanceof Error ? e : new Error(String(e)) }));
+    return () => { cancelled = true; };
+  }, [url, parse]);
+  return state;
+}
+
+function parseUser(data: unknown): User {
+  if (typeof data === "object" && data !== null && "id" in data && "name" in data
+      && typeof data.id === "string" && typeof data.name === "string") {
+    return { id: data.id, name: data.name };
+  }
+  throw new Error("Invalid user payload");
+}
+
+const state = useFetch("/api/me", parseUser); // T inferred as User, from the parser
+```
+
+A schema library (Zod, Valibot) fits the same slot: `useFetch(url, UserSchema.parse)` has `T` inferred from the schema. The same pattern fixes `useLocalStorage`: add a `parse: (raw: unknown) => T` parameter and fall back to `initial` when it throws. [Chapter 32](/chapter/32) covers validation at the boundary in depth.
+
+> ⚠️ **Common mistake.** Keeping the angle-bracket signature "for convenience". `useFetch<User>(url)` looks cleaner at the call site, which is exactly why it spreads. If a generic parameter appears only in the return type, ask where the proof comes from.
+
+## 56.6 Reusable hook APIs
+
+A reusable hook is a small product: callers should be able to guess how to use it, and not be surprised by its behavior. Four habits make that likely.
+
+**1. Return stable references.** If a hook returns a function, wrap it in `useCallback`, so callers can put it in dependency arrays without re-running effects on every render. When a hook *accepts* a callback, don't force the caller to memoize it. Store the latest one in a ref:
+
+```tsx
+import { useEffect, useRef } from "react";
+
+function useInterval(callback: () => void, delayMs: number | null): void {
+  const latest = useRef(callback);
+  useEffect(() => {
+    latest.current = callback; // always call the newest callback…
+  });
+
+  useEffect(() => {
+    if (delayMs === null) return;                  // null pauses the interval
+    const id = setInterval(() => latest.current(), delayMs); // …without restarting the timer
+    return () => clearInterval(id);
+  }, [delayMs]);
+}
+
+useInterval(() => refetch(), 5000);       // ✅ no useCallback needed by the caller
+useInterval(() => refetch(), paused ? null : 5000);
+```
+
+**2. Use an options object** for anything optional (56.1), and give every option a documented default.
+
+**3. Document with TSDoc.** Editors show the doc comment on hover, so it becomes the manual:
+
+```ts
+/**
+ * Persists state in localStorage under `key`.
+ * @param parse Validates stored data. If it throws, `initial` is used instead.
+ */
+function useLocalStorage<T>(key: string, initial: T, parse: (raw: unknown) => T): readonly [T, Dispatch<SetStateAction<T>>];
+```
+
+**4. Name for what it returns.** `useX` is a hook; `useToggle` returns a toggle; `useMediaQuery(query)` returns a boolean. If the name doesn't predict the return type, rename it.
+
+## 56.7 Typing hooks that wrap libraries
+
+Many hooks are thin wrappers around a function or class from elsewhere. Rather than copying the library's types by hand (and letting them drift), **derive** them with `Parameters`, `ReturnType`, and `Awaited` ([Chapter 21](/chapter/21)). When the library changes, your hook's types change with it.
+
+```ts
+import { searchTasks } from "./api"; // (query: SearchQuery, signal?: AbortSignal) => Promise<TaskPage>
+
+type SearchArgs = Parameters<typeof searchTasks>;      // [query: SearchQuery, signal?: AbortSignal]
+type SearchQuery = SearchArgs[0];                      // SearchQuery
+type TaskPage = Awaited<ReturnType<typeof searchTasks>>; // TaskPage (the promise unwrapped)
+
+function useTaskSearch(query: SearchQuery): AsyncState<TaskPage> {
+  // …calls searchTasks(query, signal) in an effect
+}
+```
+
+The same trick types a **generic wrapper** around any callback. Here is a debounced-callback hook that preserves the exact argument list of whatever function it wraps, using a tuple type parameter instead of `any`:
+
+```tsx
+import { useEffect, useMemo, useRef } from "react";
+
+function useDebouncedCallback<Args extends unknown[]>(
+  fn: (...args: Args) => void,
+  delayMs: number,
+): (...args: Args) => void {
+  const latest = useRef(fn);
+  useEffect(() => { latest.current = fn; });
+
+  const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  useEffect(() => () => clearTimeout(timer.current), []);
+
+  return useMemo(
+    () => (...args: Args) => {
+      clearTimeout(timer.current);
+      timer.current = setTimeout(() => latest.current(...args), delayMs);
+    },
+    [delayMs],
+  );
+}
+
+const save = useDebouncedCallback((id: string, title: string) => api.rename(id, title), 400);
+save("t1", "New title"); // ✅
+save("t1");              // ❌ Expected 2 arguments, but got 1.
+```
+
+`Args extends unknown[]` captures the parameter list as a tuple, and `(...args: Args) => void` re-applies it to the returned function. Compare with the lazy alternative, `fn: (...args: any[]) => void`, which accepts anything and returns a function that also accepts anything.
+
+> ⏭ **Safe to skip.** Typing wrappers around overloaded or heavily generic library functions can get hard, because `Parameters` only sees the *last* overload. If derivation fights you, define a small explicit interface for what *your* hook needs, and make the library satisfy it.
+
+## 56.8 Type tests for hooks
+
+A hook's types are part of its contract, so they should be tested like behavior. If someone "simplifies" `useToggle` and the return type quietly widens to `(boolean | (() => void))[]`, no runtime test fails, but every caller breaks. Type tests catch this. Vitest ships `expectTypeOf`, which runs under `vitest --typecheck`:
+
+```ts
+import { describe, expectTypeOf, it } from "vitest";
+import { useToggle } from "./useToggle";
+import { useLocalStorage } from "./useLocalStorage";
+
+describe("useToggle types", () => {
+  it("returns a labeled tuple, not an array", () => {
+    expectTypeOf(useToggle).returns.toEqualTypeOf<readonly [value: boolean, toggle: () => void]>();
+  });
+  it("accepts an optional boolean", () => {
+    expectTypeOf(useToggle).parameter(0).toEqualTypeOf<boolean | undefined>();
+  });
+});
+
+describe("useLocalStorage types", () => {
+  it("infers T from the initial value", () => {
+    const [value] = useLocalStorage("n", 0, (raw) => Number(raw));
+    expectTypeOf(value).toBeNumber();
+  });
+});
+```
+
+For things that **must not compile**, use `// @ts-expect-error`. It passes only while the next line is an error, and *fails* the build if the error ever disappears:
+
+```ts
+it("rejects a setter value of the wrong type", () => {
+  const [, setPageSize] = useLocalStorage("pageSize", 20, Number);
+  // @ts-expect-error: a string is not a number
+  setPageSize("big");
+});
+```
+
+> 💡 **Tip.** You don't need a type test for every hook. Write them for hooks other people import, and for the specific bugs you've already hit (like the tuple that fell apart).
+
+## Common mistakes
+
+> ⚠️ **Returning an untyped array.** `return [a, b]` infers an array of the union, and both variables get both types. Use `as const` or declare a tuple return type.
+
+> ⚠️ **Lying generics.** `useFetch<T>(url)` and `useLocalStorage<T>(key)` with `as T` casts claim types nobody checked. Require a parser or schema that produces `T`.
+
+> ⚠️ **Tuples with too many elements.** Past two, positions are hard to remember and brittle. Return an object.
+
+> ⚠️ **Over-constraining with `any`.** `fn: (...args: any[]) => any` throws away what callers passed. Use `Args extends unknown[]` and `Parameters`.
+
+> ⚠️ **Unstable returned functions.** Returning a new function every render makes callers' effects re-run. Wrap callbacks in `useCallback`, or store the latest in a ref.
+
+## When to use it, and when not to
+
+> ✅ **Use it when** several components share the same stateful logic (toggling, persistence, debouncing, subscriptions), or when you want logic testable apart from any component. Make the hook generic only if a caller's type must flow through.
+
+> 🚫 **When not to.** Don't extract a hook for one use, or for something with no state or effects (that's a plain function). Don't make a hook generic "just in case". And don't wrap `useState` in a hook that adds nothing. A hook named `useTitle` that returns `useState("")` is noise.
+
+## How it connects
+
+> 🔗 **Connection.** Generic functions ([Chapter 16](/chapter/16) and [Chapter 17](/chapter/17)), utility types ([Chapter 21](/chapter/21)), and parsing unknown data ([Chapter 32](/chapter/32)) all show up here. The status union is from [Chapter 52](/chapter/52), and the debounced hook uses the ref patterns from [Chapter 53](/chapter/53). Next, [Chapter 57](/chapter/57) applies generics to *components*, so a `List<T>` can pass the right type to its callbacks.
+
+> 🌍 **Real world.** `useQuery<TData, TError>` in TanStack Query, `useForm<TFieldValues>` in React Hook Form, and `useSWR` are all generic custom hooks. Their trick is the one you just learned: infer the type from something the caller already supplied (a query function, a schema, default values), instead of asking for it twice.
+
+## Exercises
+
+### Level 1 — Recall
+
+Fix the tuple inference in each hook so the caller gets properly typed variables, and write the type of each result:
+
+```tsx
+function useCounter(start = 0) {
+  const [n, setN] = useState(start);
+  return [n, () => setN(n + 1), () => setN(0)];
+}
+function useBoolean(initial = false) {
+  const [v, setV] = useState(initial);
+  return [v, { on: () => setV(true), off: () => setV(false) }];
+}
+function usePair<A, B>(a: A, b: B) {
+  return [a, b];
+}
+```
+
+### Level 2 — Application
+
+Write `useLocalStorage<T>(key, initial, parse)` with a parser parameter. If the stored JSON is missing, throws in `JSON.parse`, or fails `parse`, fall back to `initial`. Show it working with a hand-written parser and with a schema's `parse` method. It must return a `useState`-compatible setter that supports the updater-function form.
+
+### Level 3 — Challenge
+
+Write `useAsync<T>(fn)` that runs `fn: () => Promise<T>` and returns a **discriminated union** (`idle`, `loading`, `success` with `data`, `error` with `error`), with an extra `run()` function for manual retries. Reading `data` without checking `status` must not compile, and the hook must ignore results from a stale call.
+
+*Hint: a `useRef` counter can identify "the latest call".*
+
+### Level 4 — Real-world
+
+**Ticket TF-355: Keyboard shortcuts hook.** Build `useKeyboardShortcuts(map)` for TaskFlow's board.
+
+- `map` is a typed object whose keys come from a union (`"n" | "/" | "Escape"`) and whose values are handlers. An unsupported key is a compile error.
+- The listener is added once, cleaned up on unmount, and always calls the *latest* handlers.
+- Shortcuts are ignored when focus is inside an input, textarea, or select.
+- Include behavior tests and `expectTypeOf` tests for the map type.
+
+## Key takeaways
+
+- A returned array literal widens to an array of the union. Use `as const` or a declared tuple type, or return an object.
+- Tuples for one or two values callers will rename, objects for three or more.
+- Infer in the app, and annotate at the boundary: a hook other people import deserves an explicit return type.
+- Make a hook generic only when a caller's type must flow through, and infer `T` from something the caller passed.
+- `useFetch<T>(url)` lies. Require a parser or schema so `T` is earned.
+- Derive types from libraries with `Parameters`, `ReturnType`, and `Awaited`, and test public hook types with `expectTypeOf` and `@ts-expect-error`.
+
+## What comes next
+
+Everything so far typed *behavior*. The next step is to type reusable *UI*: a component that works for tasks, projects, and users while keeping each one's type. A `Select` whose `onChange` hands back a `string` forces every caller to look up the object it already had. [Chapter 57: Generic Components](/chapter/57) fixes that, by treating a component as a generic function that returns UI.

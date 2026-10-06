@@ -1,0 +1,473 @@
+> 📖 **The problem.** The TaskFlow dashboard has four widgets: KPI cards, a status chart, recent activity, and team workload. One morning a manager deletes a user account. The activity feed still contains that user's old entries, and the API now sends `assignee: null` for them. The `ActivityItem` component reads `activity.assignee.name`, throws `TypeError: Cannot read properties of null (reading 'name')`, and **the entire dashboard goes blank**. The KPI cards were fine. The chart was fine. The sidebar and the header were fine. One `null` in one row of one widget took down everything, and the user sees a white page with no explanation and no way forward.
+
+Bugs like this will reach production no matter how good your types and tests are. This chapter is about deciding, in advance, **how much of the UI a failure is allowed to destroy**. By the end, you'll be able to write and type an error boundary, use the standard library for them, choose where boundaries go, handle the errors boundaries *can't* catch, wire route-level errors and error reporting, and design fallback screens that keep users oriented.
+
+> 🧠 **Mental model.** An error boundary is a **`try/catch` for a subtree's rendering**. Whatever throws while rendering below it is caught there, and the boundary shows a fallback in place of that subtree. Place boundaries so a failure takes down the **smallest useful piece of UI**, like the watertight compartments in a ship's hull.
+
+## 71.1 What happens when a component throws
+
+When a component throws during rendering (or in an effect or a lifecycle method) and nothing catches it, React **unmounts the whole tree** below the root. That sounds drastic, and it's deliberate. A component that threw has no valid output, and React can't know whether the rest of the screen is still consistent with it. Showing a half-broken UI (a task list where the "done" count is wrong, a form whose submit button points at the wrong record) is worse than showing nothing. So React removes everything, and leaves recovery to *you*.
+
+```tsx
+type Activity = {
+  id: string;
+  action: "created" | "completed" | "commented";
+  taskTitle: string;
+  assignee: { name: string }; // the type says always present; the API disagrees
+};
+
+function ActivityItem({ activity }: { activity: Activity }) {
+  return (
+    <li>
+      {activity.assignee.name} {activity.action} “{activity.taskTitle}”
+    </li>
+  ); // 💥 TypeError: Cannot read properties of null (reading 'name')
+}
+```
+
+Your first instinct may be to wrap the JSX in `try/catch`. It doesn't work, and the reason is worth understanding. Writing `<ActivityItem />` doesn't *call* `ActivityItem`; it creates a description of what to render ([Chapter 37](/chapter/37)). React calls the component later, after your function has already returned, so your `try` block has long finished:
+
+```tsx
+function RecentActivity({ items }: { items: Activity[] }) {
+  try {
+    return <ul>{items.map((a) => <ActivityItem key={a.id} activity={a} />)}</ul>;
+  } catch {
+    return <p>Couldn't show activity.</p>; // never runs: ActivityItem renders after this returns
+  }
+}
+```
+
+To catch an error in a child's rendering, you need something React itself consults while rendering. That's an error boundary.
+
+> ⚠️ **Common mistake.** Treating the boundary as the fix. The real bug is a type that lied: `assignee` should be `{ name: string } | null`, and the response should be validated at the boundary ([Chapter 32](/chapter/32), [Chapter 61](/chapter/61)). Boundaries are the safety net for the bugs you *haven't* found yet.
+
+## 71.2 Error boundaries
+
+An **error boundary** is a component that catches errors thrown while rendering its descendants and renders a fallback instead. It's the one place where modern React still requires a **class component**, because the two methods involved have no hook equivalent. `static getDerivedStateFromError(error)` runs during rendering and returns the state that switches the boundary into "show the fallback" mode; it must be pure. `componentDidCatch(error, info)` runs after the fallback is committed, and it's where side effects like logging go; `info.componentStack` tells you which components were rendering when the error happened.
+
+Here is a complete, typed boundary for TaskFlow. Two typing details matter. First, JavaScript can throw *anything* (`throw "oops"` is legal), so the boundary treats the caught value as `unknown` and normalizes it, as in [Chapter 33](/chapter/33). Second, the `fallback` prop accepts either plain UI or a function that receives the error and a `reset` callback:
+
+```tsx
+// src/shared/errors/ErrorBoundary.tsx
+import { Component, type ErrorInfo, type ReactNode } from "react";
+
+type ErrorBoundaryProps = {
+  children: ReactNode;
+  fallback: ReactNode | ((error: Error, reset: () => void) => ReactNode);
+  onError?: (error: Error, info: ErrorInfo) => void;
+};
+
+type ErrorBoundaryState = { error: Error | null };
+
+const toError = (value: unknown): Error =>
+  value instanceof Error ? value : new Error(String(value));
+
+export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  state: ErrorBoundaryState = { error: null };
+
+  static getDerivedStateFromError(error: unknown): ErrorBoundaryState {
+    return { error: toError(error) }; // render phase: just compute state
+  }
+
+  componentDidCatch(error: unknown, info: ErrorInfo): void {
+    this.props.onError?.(toError(error), info); // commit phase: side effects allowed
+  }
+
+  reset = (): void => this.setState({ error: null });
+
+  render(): ReactNode {
+    const { error } = this.state;
+    if (error === null) return this.props.children;
+    const { fallback } = this.props;
+    return typeof fallback === "function" ? fallback(error, this.reset) : fallback;
+  }
+}
+```
+
+Using it looks like using any other component. The `typeof fallback === "function"` check narrows the union, because `ReactNode` never includes functions:
+
+```tsx
+<ErrorBoundary
+  fallback={(error, reset) => (
+    <div role="alert">
+      <p>Recent activity couldn't be shown.</p>
+      <button onClick={reset}>Try again</button>
+    </div>
+  )}
+>
+  <RecentActivity items={activity} />
+</ErrorBoundary>
+```
+
+> 💡 **Tip.** In development, React still logs caught errors to the console, and your dev tooling may show an overlay. That's expected; it doesn't mean the boundary failed. Check what the *page* shows, or run `npm run build && npm run preview`.
+
+## 71.3 Using a boundary library
+
+You'll write the class above once, to understand it, and then most teams reach for **`react-error-boundary`**. It's a small, well-typed package that adds what a production boundary needs: three ways to render a fallback, an `onReset` callback, `resetKeys` for automatic resets, and a hook for errors that happen outside rendering (71.5). The fallback component receives typed props, `FallbackProps`, with `error` and `resetErrorBoundary`:
+
+```tsx
+// src/shared/errors/WidgetFallback.tsx
+import type { FallbackProps } from "react-error-boundary";
+
+export function WidgetFallback({ error, resetErrorBoundary }: FallbackProps) {
+  // The library types `error` loosely; narrow it before use.
+  const detail = error instanceof Error ? error.message : "Unknown error";
+  return (
+    <div role="alert" className="widget-error">
+      <p>This widget couldn't load.</p>
+      {import.meta.env.DEV && <pre className="error-detail">{detail}</pre>}
+      <button type="button" onClick={() => resetErrorBoundary()}>
+        Try again
+      </button>
+    </div>
+  );
+}
+```
+
+**Resetting** means clearing the boundary's error so it tries to render its children again. That only helps if whatever caused the error has changed, so the library gives you two hooks into it. `onReset` runs when someone presses "Try again", and it's where you clear the cause (refetch data, reset a store). `resetKeys` is an array of values; when any of them changes, the boundary resets itself. It's ideal for "the user navigated to a different project, so give it a fresh chance":
+
+```tsx
+import { ErrorBoundary } from "react-error-boundary";
+
+function ProjectPanel({ projectId }: { projectId: string }) {
+  return (
+    <ErrorBoundary
+      FallbackComponent={WidgetFallback}
+      resetKeys={[projectId]}                  // new project → automatic reset
+      onReset={() => refetchProject(projectId)} // manual retry → fix the cause first
+      onError={(error, info) => captureError(error, { handled: true, componentStack: info.componentStack })}
+    >
+      <ProjectSummary projectId={projectId} />
+    </ErrorBoundary>
+  );
+}
+```
+
+> 🌍 **Real world.** Use `FallbackComponent` when the fallback is reusable, `fallbackRender` when it needs local variables, and `fallback` for static UI. The library's boundary is still a class internally; it just packages the class you wrote in 71.2.
+
+## 71.4 Where to place boundaries
+
+A boundary replaces its whole subtree with the fallback, so **placement decides the blast radius**. Think in three levels. An **app-level** boundary at the root is the last resort: if everything else fails, show a branded "Something went wrong" screen with a reload button, instead of a white page. **Route-level** boundaries wrap each page's content, so a broken page still leaves the navigation working and the user can go elsewhere. **Widget-level** boundaries wrap independent regions inside a page (dashboard cards, side panels, comment threads), so one failure leaves the rest of the page usable.
+
+```tsx
+// src/main.tsx: the last line of defense
+createRoot(document.getElementById("root")!).render(
+  <ErrorBoundary FallbackComponent={AppCrashScreen}>
+    <QueryClientProvider client={queryClient}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>
+  </ErrorBoundary>,
+);
+```
+
+The widget level is where the opening story gets fixed. Put the boundary **inside** the card, below its title, so a failed widget still shows *which* widget failed. Pair it with `Suspense`, and you have one reusable component that handles loading and failure for any region. The error boundary goes outside `Suspense`, so it also catches a lazy chunk that fails to download ([Chapter 70](/chapter/70)):
+
+```tsx
+// src/features/dashboard/Widget.tsx
+type WidgetProps = { title: string; children: ReactNode };
+
+export function Widget({ title, children }: WidgetProps) {
+  const headingId = useId();
+  return (
+    <section className="widget" aria-labelledby={headingId}>
+      <h2 id={headingId}>{title}</h2>
+      <ErrorBoundary FallbackComponent={WidgetFallback}>
+        <Suspense fallback={<WidgetSkeleton />}>{children}</Suspense>
+      </ErrorBoundary>
+    </section>
+  );
+}
+
+// src/pages/DashboardPage.tsx
+export function DashboardPage() {
+  return (
+    <div className="dashboard-grid">
+      <Widget title="Open tasks"><KpiCards /></Widget>
+      <Widget title="Status"><StatusChart /></Widget>
+      <Widget title="Recent activity"><RecentActivity /></Widget>
+      <Widget title="Team workload"><WorkloadTable /></Widget>
+    </div>
+  );
+}
+```
+
+How small should you go? Wrap a piece of UI when it can **fail independently** and the user can **still do something useful without it**. Wrapping every button is too fine: the fallbacks become clutter, and a broken button inside a form leaves the form meaningless anyway. Wrapping only the root is too coarse, as you've seen.
+
+## 71.5 What boundaries don't catch
+
+Boundaries catch errors thrown while React is **rendering**: inside component functions, inside effects, and inside class lifecycle methods. They don't catch errors that happen *outside* rendering, because by then React isn't in the middle of producing UI and there's nothing to replace. That covers **event handlers**, **asynchronous code** (a `setTimeout` callback, the part of an async function after an `await`, a promise's `.then`), and errors thrown by the boundary itself, which go to the next boundary up.
+
+| Where the error is thrown | Caught by the nearest boundary? |
+|---|---|
+| A component's render (function body, JSX expressions) | Yes |
+| A `useEffect` or `useLayoutEffect` body | Yes |
+| An `onClick` or other event handler | No |
+| A `setTimeout` callback or code after `await` | No |
+| The boundary's own render | No, the next boundary up catches it |
+
+Event-handler errors are usually **expected** failures (the network dropped, the server said no), so handle them where they happen and turn them into state, using the UI-state unions from [Chapter 52](/chapter/52):
+
+```tsx
+function DeleteTaskButton({ taskId }: { taskId: string }) {
+  const [error, setError] = useState<string | null>(null);
+
+  async function handleDelete() {
+    setError(null);
+    try {
+      await api.deleteTask(taskId);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.userMessage : "Couldn't delete the task. Try again.");
+    }
+  }
+
+  return (
+    <>
+      <button type="button" onClick={handleDelete}>Delete</button>
+      {error && <p role="alert">{error}</p>}
+    </>
+  );
+}
+```
+
+For **unexpected** async failures that should take over a region, hand the error to the nearest boundary yourself. `react-error-boundary`'s `useErrorBoundary` hook gives you `showBoundary`, which re-throws the error during the next render, where a boundary *can* catch it:
+
+```tsx
+function WorkloadTable({ projectId }: { projectId: string }) {
+  const { showBoundary } = useErrorBoundary();
+  const [rows, setRows] = useState<WorkloadRow[] | null>(null);
+
+  useEffect(() => {
+    let ignore = false;
+    loadWorkload(projectId)
+      .then((data) => { if (!ignore) setRows(data); })
+      .catch((err: unknown) => { if (!ignore) showBoundary(err); }); // async → boundary
+    return () => { ignore = true; };
+  }, [projectId, showBoundary]);
+
+  return rows ? <Table rows={rows} /> : <WidgetSkeleton />;
+}
+```
+
+> 🆕 **Modern note.** In React 19, an error thrown inside an **Action** (an async function passed to `startTransition`, or the action of `useActionState`) *is* shown by the nearest error boundary. TanStack Query can also route fetch errors to boundaries with `throwOnError: true`, and `useSuspenseQuery` does so by default ([Chapter 62](/chapter/62)).
+
+## 71.6 Route-level errors
+
+React Router's data router ([Chapter 59](/chapter/59)) has error handling built in. Give a route an `ErrorBoundary` component (or an `errorElement`), and the router renders it whenever that route's **loader**, **action**, or **rendering** throws. The error bubbles up to the nearest route that has one. Because a child route renders inside its parent's `Outlet`, a failing page shows its error screen *inside* the app layout: the sidebar and header stay, and the user can navigate away.
+
+Loaders can also throw on purpose to signal an HTTP-style outcome. `throw data(…, { status: 404 })` says "this project doesn't exist", which is different from "the code crashed", and the error screen can tell them apart:
+
+```tsx
+// src/pages/project.tsx
+import { data, type LoaderFunctionArgs } from "react-router";
+
+export async function loader({ params }: LoaderFunctionArgs) {
+  const project = await api.findProject(params.projectId ?? "");
+  if (project === null) throw data("Project not found", { status: 404 });
+  return project;
+}
+```
+
+Inside the error component, `useRouteError()` returns `unknown`, because anything could have been thrown. Narrow it: `isRouteErrorResponse` recognizes thrown responses (with `status` and `data`), and everything else is a real crash:
+
+```tsx
+import { isRouteErrorResponse, useRouteError } from "react-router";
+
+export function RouteErrorPage() {
+  const error = useRouteError(); // error: unknown
+
+  if (isRouteErrorResponse(error) && error.status === 404) {
+    return <NotFound title="We couldn't find that project" backTo="/projects" />;
+  }
+  return <PageError onRetry={() => window.location.reload()} />;
+}
+
+const router = createBrowserRouter([
+  {
+    path: "/",
+    Component: AppLayout,
+    ErrorBoundary: AppErrorPage, // catches anything a child route doesn't
+    children: [
+      { index: true, Component: BoardPage, ErrorBoundary: RouteErrorPage },
+      { path: "projects/:projectId", lazy: () => import("./pages/project"), ErrorBoundary: RouteErrorPage },
+    ],
+  },
+]);
+```
+
+> ⚠️ **Common mistake.** Leaving out the root route's error component. React Router then shows its built-in developer screen ("Unexpected Application Error!") to real users. And note that the router *handles* route errors itself, so they never reach a `react-error-boundary` placed above `RouterProvider`.
+
+## 71.7 Reporting errors
+
+A boundary that shows a friendly fallback and tells no one is a bug-hiding machine: users see "Try again", and your team never learns the activity feed is broken. Every caught error should be **reported** to an error tracker with enough context to act on it. [Chapter 75](/chapter/75) builds the tracker integration; here you'll connect the boundaries to it.
+
+React 19 gives you one place to hear about every rendering error in the app: options on `createRoot`. `onCaughtError` fires when a boundary caught something, `onUncaughtError` when nothing did, and `onRecoverableError` when React recovered automatically. Each receives the error and its component stack:
+
+```tsx
+// src/main.tsx
+import { captureError } from "./shared/observability/errors";
+
+const root = createRoot(document.getElementById("root")!, {
+  onCaughtError(error, info) {
+    captureError(error, { handled: true, componentStack: info.componentStack });
+  },
+  onUncaughtError(error, info) {
+    captureError(error, { handled: false, componentStack: info.componentStack });
+  },
+});
+```
+
+That covers rendering. For the errors from 71.5 that nobody catches, add browser-level listeners, so nothing fails silently:
+
+```ts
+// src/shared/observability/errors.ts
+export type ErrorContext = {
+  handled: boolean;
+  componentStack?: string | null; // React's ErrorInfo allows null here
+  route?: string;
+};
+
+export function captureError(error: unknown, context: ErrorContext): void {
+  // Chapter 75 replaces this with a real tracker (release version, source maps, user-safe context).
+  console.error("[captured]", error, { ...context, route: context.route ?? location.pathname });
+}
+
+window.addEventListener("unhandledrejection", (event) => {
+  captureError(event.reason, { handled: false });
+});
+```
+
+> 💡 **Tip.** Report from **one** place. If the root's `onCaughtError` reports and every boundary's `onError` also reports, each error arrives twice and your error counts are wrong. Use per-boundary `onError` only to add context the root can't know, such as which widget failed.
+
+## 71.8 Designing fallback UI
+
+A fallback is a piece of product design, not an afterthought. A good one does four things. It **keeps the user oriented**: the page frame, the navigation, and the widget's title stay, so they know *where* the failure is. It **says what happened in human terms**: "Recent activity couldn't load", never a stack trace or a raw `error.message` (which may leak internals). It **offers a way forward**: try again, go back to the board, or reload. And it **degrades gracefully**: if you still have older data, show it with a notice instead of a blank box.
+
+A retry button must actually change something; otherwise the boundary resets, the child throws again, and the user is stuck in a loop. With TanStack Query, `QueryErrorResetBoundary` provides a `reset` function that clears failed queries, so "Try again" really refetches:
+
+```tsx
+import { QueryErrorResetBoundary } from "@tanstack/react-query";
+import { ErrorBoundary } from "react-error-boundary";
+
+export function Widget({ title, children }: WidgetProps) {
+  return (
+    <section className="widget">
+      <h2>{title}</h2>
+      <QueryErrorResetBoundary>
+        {({ reset }) => (
+          <ErrorBoundary onReset={reset} FallbackComponent={WidgetFallback}>
+            <Suspense fallback={<WidgetSkeleton />}>{children}</Suspense>
+          </ErrorBoundary>
+        )}
+      </QueryErrorResetBoundary>
+    </section>
+  );
+}
+```
+
+Graceful degradation often means *not* throwing at all. When a background refresh fails but you still have the previous data, the honest UI is "here's what we had, and it may be stale":
+
+```tsx
+function WorkloadTable({ projectId }: { projectId: string }) {
+  const { data, isError, dataUpdatedAt, refetch } = useQuery(workloadQuery(projectId));
+
+  if (data === undefined) return isError ? <WidgetFallbackInline onRetry={refetch} /> : <WidgetSkeleton />;
+
+  return (
+    <>
+      {isError && (
+        <p role="status" className="stale-notice">
+          Showing data from {new Date(dataUpdatedAt).toLocaleTimeString()}. Couldn't refresh.{" "}
+          <button type="button" onClick={() => refetch()}>Retry</button>
+        </p>
+      )}
+      <Table rows={data} />
+    </>
+  );
+}
+```
+
+Match the fallback to its level. A widget fallback is compact and inline. A route fallback is a page-sized message with a link back to somewhere safe. The app-level fallback is a full screen with a reload button, the release version, and a support link, because by the time it shows, nothing else works.
+
+## Common mistakes
+
+> ⚠️ **One boundary at the root, and nothing else.** That's only slightly better than none: any failure still replaces the whole app. Add route and widget boundaries where failures are independent.
+
+> ⚠️ **Expecting boundaries to catch event-handler and async errors.** They catch rendering errors only. Use `try/catch` plus state for expected failures, and `showBoundary` (or a React 19 Action) to send unexpected async errors to a boundary.
+
+> ⚠️ **A retry that changes nothing.** Resetting a boundary without clearing the cause (the failed query, the bad state) just throws again. Wire `onReset` to the thing that actually needs refreshing.
+
+> ⚠️ **Catching without reporting.** A friendly fallback hides the bug from your team. Report every caught error, once.
+
+> ⚠️ **Showing `error.message` to users.** Messages are written for developers and may expose internals. Show a human sentence; send the details to your tracker.
+
+```tsx
+// ❌ the cause is still there: the boundary resets, the child throws again
+<ErrorBoundary FallbackComponent={WidgetFallback}>
+// ✅ clear the failed queries first, then re-render
+<ErrorBoundary FallbackComponent={WidgetFallback} onReset={reset}>
+```
+
+## When to use it, and when not to
+
+> ✅ **Use it when** a region can fail independently and the rest of the page is still useful without it (dashboard widgets, side panels, comment threads, embedded charts), at every route, and once at the root as the last resort. Pair boundaries with `Suspense` so each region handles its own loading and failure.
+
+> 🚫 **When not to.** Don't use a boundary as the answer to an *expected* failure. "The save request failed" is a normal state to render, not an exception to catch. Don't wrap tiny elements whose failure makes the surrounding UI meaningless anyway. And never use a boundary instead of fixing the bug: validate the data, correct the type, and keep the boundary as the net underneath.
+
+## How it connects
+
+> 🔗 **Connection.** The idea that thrown values are `unknown` comes from [Chapter 33](/chapter/33), and modeling failure as state comes from [Chapter 52](/chapter/52). The class syntax is from [Chapter 15](/chapter/15). Route error components extend the not-found routes from [Chapter 59](/chapter/59), and `throwOnError` with `QueryErrorResetBoundary` builds on [Chapter 62](/chapter/62). Lazy chunks that fail to load ([Chapter 70](/chapter/70)) land in these boundaries. The `captureError` stub becomes a real error tracker in [Chapter 75](/chapter/75).
+
+> 🌍 **Real world.** Production dashboards typically use a three-level layout: a root boundary with a full-page crash screen, the router's error components per route, and a shared `Widget` or `Panel` component with a built-in boundary, so every new card gets isolation for free.
+
+## Exercises
+
+### Level 1 — Recall
+
+For each snippet, decide whether the nearest error boundary catches the error, and explain why in one sentence:
+
+```tsx
+// 1
+function A() { const t = useTask(); return <p>{t.assignee.name}</p>; } // assignee is null
+// 2
+function B() { return <button onClick={() => { throw new Error("boom"); }}>Go</button>; }
+// 3
+function C() { useEffect(() => { throw new Error("boom"); }, []); return null; }
+// 4
+function D() { useEffect(() => { setTimeout(() => { throw new Error("boom"); }, 100); }, []); return null; }
+// 5
+function E() { const [, start] = useTransition(); return <button onClick={() => start(async () => { await save(); throw new Error("boom"); })}>Save</button>; }
+// 6
+function F() { useEffect(() => { fetch("/api/x").then(() => { throw new Error("boom"); }); }, []); return null; }
+```
+
+### Level 2 — Application
+
+Write a typed `ErrorBoundary` class from scratch (without looking at 71.2). It must accept a `fallback` that is either `ReactNode` or a function of `(error: Error, reset: () => void)`, normalize non-`Error` thrown values, call an optional `onError`, and support a `resetKeys` array that resets the boundary when any key changes. Write one component test proving each behavior.
+
+### Level 3 — Challenge
+
+Add widget-level boundaries to every widget in your [P12](/projects/p12) dashboard. Each failed widget must keep its title, show a compact fallback with a working "Try again", and leave the other widgets interactive. Prove it by making one widget's data source fail on purpose.
+
+*Hint: a retry that works needs to clear the cause. Make the failure switchable from a query param or a dev-only toggle, so you can watch "Try again" actually recover.*
+
+### Level 4 — Real-world
+
+**Ticket TF-327: Error-handling map for TaskFlow Web.** Today, error handling is ad hoc. Write a one-page design document (a table is fine) and implement it.
+
+- Lists every failure category (render bug, failed query, failed mutation, missing route/resource, failed chunk download, unhandled rejection), with **where it's caught** and **what the user sees** for each.
+- Every route has an error component; the root route's error component never shows React Router's default screen.
+- Every caught error is reported exactly once, with the route and (for widgets) the widget name.
+- No fallback anywhere shows a raw `error.message` to users.
+
+## Key takeaways
+
+- An uncaught rendering error **unmounts the whole app**. React prefers a blank screen to a corrupted one; recovery is your job.
+- An error boundary is a class with `static getDerivedStateFromError` (render the fallback) and `componentDidCatch` (side effects). Type the caught value as `unknown` and normalize it.
+- `react-error-boundary` adds typed `FallbackProps`, `onReset`, `resetKeys`, and `useErrorBoundary`.
+- Place boundaries at the **app**, **route**, and **widget** levels, so failures take down the smallest useful piece.
+- Boundaries **don't** catch event-handler or async errors. Handle expected failures as state; send unexpected ones to a boundary with `showBoundary`.
+- Report every caught error once, and design fallbacks that keep users oriented and give them a way forward.
+
+## What comes next
+
+Your app now survives failures. But surviving isn't the same as feeling good to use. Open the task table with 2,000 rows and type in the filter box: every keystroke lags by a third of a second. Before reaching for `useMemo` everywhere, you need to learn to **measure** what's slow and why. That's [Chapter 72: Rendering Performance](/chapter/72).
